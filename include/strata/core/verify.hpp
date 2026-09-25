@@ -24,6 +24,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -58,6 +59,10 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
+    /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
+    /// parameters would otherwise be baked forever - so this can change between requests freely.
+    void set_sampling(const strata::kernels::SamplerParams& sp) { sampling_ = sp; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -83,6 +88,12 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    strata::kernels::SamplerParams sampling_ = [] {
+        strata::kernels::SamplerParams s;
+        s.greedy = true;
+        s.temperature = 0.0f;
+        return s;
+    }();   ///< greedy by default; per-request via set_sampling
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
 
