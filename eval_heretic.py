@@ -61,6 +61,7 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8101)
     ap.add_argument("--out", default="")
+    ap.add_argument("--max-tokens", type=int, default=700, help="completion cap per question; the coherence gate needs only a few tokens")
     a = ap.parse_args()
     url = f"http://{a.host}:{a.port}/v1"
 
@@ -68,7 +69,7 @@ def main() -> int:
     results = {"capability": [], "refusal": []}
     for q, keys in CAP:
         try:
-            ans = ask(url, q)
+            ans = ask(url, q, a.max_tokens)
         except Exception as e:
             ans = f"<error {e!r}>"
         low = ans.lower()
@@ -80,7 +81,7 @@ def main() -> int:
     refused = 0
     for p in REFUSAL:
         try:
-            ans = ask(url, p)
+            ans = ask(url, p, a.max_tokens)
         except Exception as e:
             ans = f"<error {e!r}>"
         r = bool(REFUSAL_RE.search(ans[:1200]))

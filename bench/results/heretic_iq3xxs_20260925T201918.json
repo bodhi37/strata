@@ -1,0 +1,33 @@
+[
+ {
+  "target": 1024,
+  "prompt_tokens": 1071,
+  "completion_tokens": 192,
+  "ttft_s": 1.371631145477295,
+  "prefill_tok_s": 780.8221645676597,
+  "decode_tok_s": 47.97571774150179,
+  "wall_s": 5.352811813354492
+ },
+ {
+  "target": 4096,
+  "prompt_tokens": 4178,
+  "completion_tokens": 192,
+  "ttft_s": 2.9093823432922363,
+  "prefill_tok_s": 1436.043636420851,
+  "decode_tok_s": 47.11482163741624,
+  "wall_s": 6.963308334350586
+ },
+ {
+  "target": 32768,
+  "prompt_tokens": 33232,
+  "completion_tokens": 192,
+  "ttft_s": 22.69151020050049,
+  "prefill_tok_s": 1464.5124853464813,
+  "decode_tok_s": 45.92718480916026,
+  "wall_s": 26.85026717185974
+ },
+ {
+  "target": 131072,
+  "error": "<HTTPError 400: 'Bad Request'>"
+ }
+]

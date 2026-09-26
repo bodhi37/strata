@@ -1,0 +1,11 @@
+[
+ {
+  "target": 129000,
+  "prompt_tokens": 130735,
+  "completion_tokens": 2,
+  "ttft_s": 3425.760754108429,
+  "prefill_tok_s": 38.16232638056023,
+  "decode_tok_s": 0.18823416212294075,
+  "wall_s": 3431.0732860565186
+ }
+]

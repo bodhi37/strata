@@ -460,6 +460,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         });
                     }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    // R7: warm the page cache for the WHOLE layer before the first staging read.  The staging
+                    // stream is QD1 on the host thread, so without this a 33k-token prompt read 330 GB at
+                    // 0.67 GB/s - the drive's per-request latency, not its bandwidth.  `order` is already in
+                    // file-offset order (R6), so the WILLNEEDs coalesce into near-sequential readahead.
+                    if (!order.empty()) m.src->prefetch(l, order.data(), (int64_t) order.size());
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
                     std::vector<int> stage_of(order.size(), -1);

@@ -23,7 +23,12 @@ BASE = ("def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n\n"
 def make_prompt(target_tokens: int) -> str:
     approx = max(64, target_tokens) * 4
     body = (BASE * (approx // len(BASE) + 1))[:approx]
-    return ("Read the material below, then reply with the single word OK.\n\n" + body)
+    # The suffix must FORCE a long generation.  "reply with the single word OK" makes a *correct* model
+    # stop after two tokens, which turns `decode tok/s` into 1/(time to say OK) - and it is also why the
+    # pre-R7 runs reported 45-48 tok/s: their output was `!!!!!!`, never hit EOS, and always ran the
+    # full 192.  A decode number is only meaningful against a completion the model did not want to stop.
+    return ("Read the material below.  Then, in your own words, explain what it says and why it matters, "
+            "at length, covering every point in order.  Do not summarise briefly; be thorough.\n\n" + body)
 
 
 def one(url: str, model: str, prompt: str, max_tokens: int, effort: str, timeout: float):
