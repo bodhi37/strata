@@ -66,6 +66,17 @@ public:
     /// `pread` (the drive's own throughput) or a memcpy when the hot tier holds the blob; a resident arena
     /// memcpy's.  Returns the bytes read, or -1 when the source cannot (the caller then uses `blob()`).
     virtual int64_t read_blob(int64_t layer, int64_t expert, void* dst) { (void) expert; (void) dst; (void) layer; return -1; }
+    /// **R7: SPLIT THE WAIT FROM THE READ SO IT CAN BE HIDDEN.**  `begin_layer` used to submit the layer's
+    /// whole-blob reads AND block until they landed, which put the drive's latency on the critical path in front
+    /// of the CPU's own drain - measured on the IQ3_XXS pack, 176 ms of a 272 ms window where the CPU had 57 ms
+    /// of work it could have been doing.  A source that prefetches now returns from `begin_layer` with the reads
+    /// IN FLIGHT, answers `ring_pending` for the entries that are still coming, and blocks in `wait_layer`.
+    /// Callers that cannot interleave anything (`expert_pool_dispatch`'s single-token path) simply call
+    /// `wait_layer` immediately, which is exactly the old behaviour.
+    virtual void wait_layer() {}
+    /// True when `(layer, expert)`'s bytes are being read and are NOT yet valid.  A source with no prefetch
+    /// answers false for everything, so the split reduces to the old code path.
+    virtual bool ring_pending(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
 };
@@ -215,7 +226,7 @@ struct ExpertDispatch {
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
-    double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0, ms_wait = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
@@ -360,9 +371,35 @@ public:
     /// Whether the tier is doing anything: served / total `blob()` calls since startup.
     int64_t hot_hits() const { return hot_hits_; }
     int64_t hot_lookups() const { return hot_lookups_; }
+
+    /// R7: **WHERE THE EXPERT BYTES ACTUALLY CAME FROM.**  The old pair above counts only the lookups that
+    /// reached the HOT-TIER CHECK, so a blob answered from the pread ring or straight out of the mapping was
+    /// invisible - which is how "100% hot tier" coexisted with a disk-bound run.  These counters are inclusive
+    /// over every blob the engine asked for, whichever path answered, and `disk_bytes` is the number that says
+    /// whether the SSD is the wall.
+    struct BlobStats {
+        int64_t requests = 0;   ///< every blob() call that needed bytes for a routed expert
+        int64_t hot = 0;        ///< answered from the pinned host tier (RAM, no I/O)
+        int64_t ring = 0;       ///< answered from the pread ring (already read into RAM this layer)
+        int64_t map = 0;        ///< fell through to the file mapping: a fault, page cache or disk
+        int64_t disk = 0;       ///< whole-blob reads issued to the drive (ring jobs + staging preads)
+        int64_t disk_bytes = 0; ///< bytes those reads moved
+        // R7: the scheduling side of the same story.  `calls`/`entries` say how often begin_layer runs and
+        // with how many ids; `hot_skips` says how many of those were already resident; `jobs` is what it
+        // actually asked the drive for.  jobs >> (entries - hot_skips) means the ring is re-fetching.
+        int64_t calls = 0, entries = 0, hot_skips = 0, already = 0;
+        /// R7 prefetch study: of this run's disk misses, how many were ALSO a miss in the previous verify
+        /// window.  That number is the entire case for prefetching: the per-layer read costs ~2.9 ms of exposed
+        /// drive latency (measured, 2.08 MB at QD1 = 740 MB/s), so a prediction that covers even half of the
+        /// next window's misses would remove half of a 140 ms per-window cost.
+        int64_t win_misses = 0, win_repeat = 0, win_prefetched = 0, win_prefetch_used = 0;
+    };
+    BlobStats take_blob_stats();   ///< read and reset, so the caller reports per request
     /// R5-fetch: read the whole blob into `dst` - one sequential `pread` out of the file, or a memcpy when
     /// the hot tier holds it.  -1 when this source cannot (a resident arena has no file to read).
     int64_t read_blob(int64_t layer, int64_t expert, void* dst) override;
+    void wait_layer() override;                          ///< R7: block until this layer's submitted reads land
+    bool ring_pending(int64_t layer, int64_t expert) const override;   ///< R7: is this blob still in flight?
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -397,6 +434,8 @@ private:
     uint64_t hot_cap_ = 0, hot_used_ = 0;
     int64_t hot_count_ = 0;
     int64_t hot_hits_ = 0, hot_lookups_ = 0;
+    /// R7: inclusive source counters; see `BlobStats`.
+    BlobStats blob_stats_{};
     bool hot_locked_ = false;
     std::vector<int64_t> hot_slot_;  ///< per blob index: byte offset in hot_arena_, or -1 when not pinned
     int64_t prefetched_ = 0;         ///< R5-prefetch: whole-blob WILLNEED submissions since startup
@@ -404,7 +443,18 @@ private:
 
     // ---- R5-fetch: the pread ring + reader pool -------------------------------------------------------------
     static constexpr int kRingSlots = 64;
-    struct PfJob { int64_t idx; int slot; uint64_t off, len; };
+    /// R7: **CHUNKED READS - BUILT, MEASURED, REJECTED.**  The hypothesis was that one 2.08 MB random read
+    /// (2.8-2.9 ms at QD1) could be split into `kSplit` concurrent sub-reads to raise the queue depth, since
+    /// the engine only has 1-2 misses per layer.  Measured on the IQ3_XXS pack, 20 GiB hot tier, `--spec 4
+    /// --spec-min-p 0.8`: **kSplit 4 made it WORSE - 8.4 tok/s against 10.7 whole-blob, ring-wait 167 ms
+    /// against 113.**  The micro-benchmark already said why: 266 KiB reads at QD8 move only 682 MB/s while
+    /// 2.08 MiB reads at QD8 move 1000-1080 MB/s, so this drive's per-request overhead, not its queue depth,
+    /// dominates at small sizes.  Left at 1 (whole blob) and kept as the A/B arm so the next agent does not
+    /// re-derive it.
+    static constexpr int kSplit = 1;
+    static constexpr uint64_t kChunk = 512 * 1024;
+    static constexpr int kMaxChunks = 16;                  // (max_blob + kChunk - 1) / kChunk, bounded
+    struct PfJob { uint8_t* dst; uint64_t off, len; };     ///< one sub-read of one blob
     std::vector<std::vector<uint8_t>> ring_;   ///< per slot: one whole blob (largest layer's bytes)
     std::vector<int64_t> ring_of_;             ///< blob index -> ring slot for the CURRENT layer, else -1
     std::vector<PfJob> pf_jobs_;
@@ -417,6 +467,19 @@ private:
     std::condition_variable pf_cv_;
     int64_t ring_layer_ = -1;
     bool pf_started_ = false;
+    /// R7: the submitted batch is in flight until `wait_layer` has confirmed every job done.
+    bool ring_waiting_ = false;
+    int pf_jobs_active_ = 0;
+    // ---- R7 prefetch study: is the previous verify window a good predictor of this one's misses?
+    // `miss_epoch_[blob]` is the window number in which that blob was last a miss, so a miss whose epoch is
+    // `window_epoch_ - 1` is a REPEAT.  `last_misses_` is the previous window's miss list, used both to score
+    // the predictor and (when `prefetch_predict_`) to warm the page cache for the window that is starting.
+    std::vector<uint32_t> miss_epoch_;
+    std::vector<int32_t> last_misses_, cur_misses_;
+    uint32_t window_epoch_ = 0;
+    bool prefetch_predict_ = true;
+    void pf_window_start();
+    void pf_record_miss(int64_t idx);
     void pf_worker();              ///< R5-fetch: one of the four pread threads
 };
 

@@ -182,6 +182,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
     d.src->begin_layer(d.layers, ids, k);
+    // R7: this path has nothing to interleave - one token, one batch - so it takes the old single-phase shape.
+    d.src->wait_layer();
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
     // so anything cached against it would be layer 0's activation reused 48 times.
@@ -367,62 +369,87 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     else
         for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
     const auto c2 = std::chrono::steady_clock::now();
-    int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
-                if (kind[i] == 0) ++d.cache_hits;
-                std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
+    // ---- R7: TWO PASSES, SO THE DRIVE'S LATENCY HIDES BEHIND THE CPU'S OWN WORK.
+    //
+    // The layer's routed experts split into two sets that need nothing from each other:
+    //
+    //   * the ones whose bytes are ALREADY available - the host hot tier, or the mapping - and
+    //   * the ones `begin_layer` has put on the wire and that are still landing.
+    //
+    // Measured with the one-pass form on the IQ3_XXS pack, a 20 GiB host tier and `--spec 4`: of a 272 ms
+    // window, **176 ms was `begin_layer`'s blocking wait** while the CPU had **57 ms** of resident-expert work
+    // queued behind it, and the GPU sat idle through both.  Running pass 1 first puts that 57 ms inside the
+    // wait instead of after it.  Entries are consistent about which pass they belong to because `ring_pending`
+    // is a property of `(layer, expert)`, so an expert's rows never straddle the two pool calls.
+    auto dispatch_pass = [&](int pass) {
+        int njobs = 0;
+        for (int64_t t = 0; t < n_tok; ++t)
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t i = t * k + j;
+                const int64_t e = ids[i];
+                float* row = out + (size_t) i * H;
+                if (pass == 0 && (e < 0 || e >= d.n_expert)) {
                     d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
+                    d.fail = "a routed expert id is out of range";
                     d.fail_layer = d.layers;
                     d.fail_expert = e;
-                    ++d.missing;
-                    return;
+                    return false;
                 }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
+                if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
+                    if (pass == 0) {
+                        if (kind[i] == 0) ++d.cache_hits;
+                        std::memset(row, 0, (size_t) H * sizeof(float));
+                    }
+                    continue;
+                }
+                if (d.src->ring_pending(d.layers, e) != (pass == 1)) continue;
+                ++d.cache_refused;
+                int16_t& jo = d.job_of[(size_t) e];
+                if (jo < 0) {
+                    const uint8_t* b = d.src->blob(d.layers, e);
+                    if (b == nullptr) {
+                        d.failed = true;
+                        d.fail = "the expert source could not produce a blob";
+                        d.fail_layer = d.layers;
+                        d.fail_expert = e;
+                        ++d.missing;
+                        return false;
+                    }
+                    jo = (int16_t) njobs++;
+                    ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                    nj.blob = b;
+                    nj.nt = 0;
+                }
+                ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+                jb.act[jb.nt] = &d.act_multi[(size_t) t];
+                jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+                jb.out[jb.nt] = row;
+                ++jb.nt;
+                ++d.multi_entries;
             }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
-            ++jb.nt;
-            ++d.multi_entries;
+        if (njobs > 0) {
+            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+            else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
         }
+        return true;
+    };
+    if (!dispatch_pass(0)) return;
+    const auto c2b = std::chrono::steady_clock::now();
+    d.src->wait_layer();          // the reads submitted by `begin_layer` are awaited HERE, after the residents
+    const auto c2c = std::chrono::steady_clock::now();
+    if (!dispatch_pass(1)) return;
     const auto c3 = std::chrono::steady_clock::now();
-    if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-    else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    const auto c4 = std::chrono::steady_clock::now();
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
-    d.ms_run += ms(c3, c4);
+    d.ms_run += ms(c2, c2b);            // pass 0: the resident experts, computed while the reads are in flight
+    d.ms_wait += ms(c2b, c2c);          // the part of the drive's latency the resident work did NOT cover
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
-    d.multi_misses += njobs;
+    d.multi_misses += d.cache_refused;
     if (!d.usage_total.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) ++d.usage_total[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]];
@@ -838,17 +865,29 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
-    void* m = ::mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-    const bool huge = m != MAP_FAILED;
-    if (m == MAP_FAILED)
-        m = ::mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // R7: **MADV_HUGEPAGE, AND READING STRAIGHT INTO THE TIER.**  Two changes from the R5 form, both measured
+    // on the reason the tier exists:
+    //
+    //   * TLB.  The whole point of this tier is that a decode step walks ~460 two-megabyte blobs at random.
+    //     Through 4 KiB pages that is ~550,000 TLB entries of working set per window; through 2 MiB pages it is
+    //     ~460.  `MAP_HUGETLB` cannot be used - this box has 0 reserved hugepages and reserving GiB of them
+    //     would fight the kernel for the same RAM - but THP is `always` here with `defer+madvise` defrag, so
+    //     `MADV_HUGEPAGE` on the anonymous range is what actually gets the 2 MiB pages.  The mapping is sized
+    //     UP to a 2 MiB multiple and the blob starts are 256-byte aligned, so no blob straddles a boundary
+    //     that matters.
+    //   * I/O.  The R5 form memcpy'd out of the file MAPPING, so filling a 12-20 GiB tier faulted 4 KiB at a
+    //     time and left 12-20 GiB of useless page cache behind.  It now `pread`s whole blobs into the tier
+    //     directly: one syscall per blob at the drive's own rate, and nothing is left in the page cache for
+    //     the kernel to evict the hot set in favour of.
+    const uint64_t cap = (bytes + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+    void* m = ::mmap(nullptr, (size_t) cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) {
-        note_ += "; hot tier NOT allocated (mmap of " + std::to_string(bytes) + " B failed)";
+        note_ += "; hot tier NOT allocated (mmap of " + std::to_string(cap) + " B failed)";
         return;
     }
     hot_arena_ = (uint8_t*) m;
-    hot_cap_ = bytes;
+    hot_cap_ = cap;
+    const bool huge = (::madvise(m, (size_t) cap, MADV_HUGEPAGE) == 0);
     hot_slot_.assign((size_t) blobs_, -1);
     for (const auto& pr : ranked) {
         const int32_t l = pr.first, e = pr.second;
@@ -858,10 +897,28 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         const uint64_t len = lay.blob_bytes(l);
         const uint64_t off = lay.blob_offset(l, e);
         if (len == 0 || off + len > file_map_bytes_ || hot_used_ + len > hot_cap_) break;
-        std::memcpy(hot_arena_ + hot_used_, base_ + off, (size_t) len);
+        uint8_t* dst = hot_arena_ + hot_used_;
+        bool ok = false;
+        if (file_fd_ >= 0) {
+            uint64_t done = 0;
+            while (done < len) {
+                const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (len - done), (off_t) (off + done));
+                if (r <= 0) break;
+                done += (uint64_t) r;
+            }
+            ok = (done == len);
+        } else {
+            std::memcpy(dst, base_ + off, (size_t) len);
+            ok = true;
+        }
+        if (!ok) break;
         hot_slot_[(size_t) idx] = (int64_t) hot_used_;
         hot_used_ += len;
         ++hot_count_;
+        // **AND GIVE THE FILE PAGES BACK.**  A `pread` of a blob leaves that blob in the page cache, so filling
+        // a 20 GiB tier would otherwise leave 20 GiB of page cache behind - for pages this tier now serves from
+        // anonymous memory and will never read from the file again.  On a 30 GiB box that page cache is the
+        // difference between a hot tier that can be grown and one that cannot.
         if (file_fd_ >= 0) ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
     }
     if (hot_used_ == 0) {
@@ -870,12 +927,16 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         note_ += "; hot tier empty";
         return;
     }
+    if (hot_used_ < hot_cap_) {   // give the unused tail back to the kernel
+        ::munmap(hot_arena_ + hot_used_, (size_t) (hot_cap_ - hot_used_));
+        hot_cap_ = hot_used_;
+    }
     hot_locked_ = (::mlock(hot_arena_, (size_t) hot_used_) == 0);
 #endif
-    char buf[320];
-    std::snprintf(buf, sizeof buf, "; hot tier %.2f GiB in %lld blobs from the profile%s%s",
+    char buf[352];
+    std::snprintf(buf, sizeof buf, "; hot tier %.2f GiB in %lld blobs from the profile%s (THP %s)",
                   (double) hot_used_ / 1073741824.0, (long long) hot_count_,
-                  hot_locked_ ? " (mlocked)" : " (mlock FAILED - reclaimable)", huge ? " [2 MiB pages]" : "");
+                  hot_locked_ ? " (mlocked)" : " (mlock FAILED - reclaimable)", huge ? "on" : "off");
     note_ += buf;
 }
 
@@ -885,16 +946,33 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
     ++reads_;
+    ++blob_stats_.requests;
     // R5-fetch: the ring serves THIS layer's pread misses (see begin_layer); `ring_layer_` pins the validity
     // to the layer the reads were issued for, so a later `blob()` (the profile fill, prefill's staging) can
     // never see a previous layer's bytes.
-    if (layer == ring_layer_ && (int64_t) ring_of_.size() == blobs_ && ring_of_[(size_t) idx] >= 0)
+    if (layer == ring_layer_ && (int64_t) ring_of_.size() == blobs_ && ring_of_[(size_t) idx] >= 0) {
+        ++blob_stats_.ring;
         return ring_[(size_t) ring_of_[(size_t) idx]].data();
+    }
     if (!hot_slot_.empty()) {
         ++hot_lookups_;
-        if (hot_slot_[(size_t) idx] >= 0) { ++hot_hits_; return hot_arena_ + hot_slot_[(size_t) idx]; }
+        if (hot_slot_[(size_t) idx] >= 0) {
+            ++hot_hits_;
+            ++blob_stats_.hot;
+            return hot_arena_ + hot_slot_[(size_t) idx];
+        }
     }
+    // R7: the fall-through is a fault on the file mapping.  If the page is in the page cache it is a DRAM read;
+    // if not, the kernel goes to the drive for it, 4 KiB at a time.  This is the path the R5 pread ring exists
+    // to avoid, and counting it is how a run says whether it avoided it.
+    ++blob_stats_.map;
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+}
+
+ArenaExpertSource::BlobStats ArenaExpertSource::take_blob_stats() {
+    BlobStats s = blob_stats_;
+    blob_stats_ = BlobStats{};
+    return s;
 }
 
 // R5-fetch: read one whole blob into `dst`.  The hot tier memcpy's out of the locked arena; the file-backed
@@ -923,6 +1001,8 @@ int64_t ArenaExpertSource::read_blob(int64_t layer, int64_t expert, void* dst) {
         done += (uint64_t) r;
     }
     ++prefetched_;
+    ++blob_stats_.disk;
+    blob_stats_.disk_bytes += (int64_t) len;
     return (int64_t) len;
 }
 
@@ -948,10 +1028,9 @@ void ArenaExpertSource::pf_worker() {
             const uint32_t i = pf_head_.fetch_add(1, std::memory_order_relaxed);
             if (i >= pf_njobs_.load(std::memory_order_acquire)) break;
             const PfJob& j = pf_jobs_[(size_t) i];
-            uint8_t* dst = ring_[(size_t) j.slot].data();
             uint64_t done = 0;
             while (done < j.len) {
-                const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (j.len - done), (off_t) (j.off + done));
+                const ssize_t r = ::pread(file_fd_, j.dst + done, (size_t) (j.len - done), (off_t) (j.off + done));
                 if (r <= 0) break;
                 done += (uint64_t) r;
             }
@@ -974,10 +1053,12 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
     if ((int64_t) pf_seen_.size() != n_expert_) pf_seen_.assign((size_t) n_expert_, 0);
     else std::fill(pf_seen_.begin(), pf_seen_.end(), (uint8_t) 0);
     if (!pf_started_ && file_fd_ >= 0 && file_map_ != nullptr) {
+        // R7: the predictor is on by default; `STRATA_NO_PREDICT=1` is the A/B arm.
+        prefetch_predict_ = (std::getenv("STRATA_NO_PREDICT") == nullptr);
         ring_.assign(kRingSlots, {});
         for (auto& r : ring_) r.resize((size_t) lay.max_blob + 512);
         ring_of_.assign((size_t) blobs_, -1);
-        pf_jobs_.resize(kRingSlots);
+        pf_jobs_.resize((size_t) kRingSlots * (size_t) kMaxChunks);
         for (int i = 0; i < 10; ++i) pf_workers_.emplace_back([this] { pf_worker(); });
         pf_started_ = true;
     }
@@ -985,44 +1066,143 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
         // resident arena or no file: nothing to fetch, but keep the dedupe+stats behaviour
         return;
     }
-    // invalidate the previous layer's ring: `blob()` only serves ring slots for `ring_layer_`
+    // R7: a new pass starts at layer 0, and the previous pass's ring is not valid any more.  Without this the
+    // `layer == ring_layer_` gate in `blob()` would serve a stale blob to anything that asks for the last
+    // decode layer's index (the prefill suffix of a KEEP request is the caller that can reach it).
+    if (layer == 0) {
+        ring_layer_ = -1;
+        pf_window_start();
+    }
     ring_layer_ = layer;
-    int n = 0;
+    ring_waiting_ = false;
+    int n = 0, njobs = 0;                  // n = blobs claimed, njobs = sub-reads published
+    int64_t miss_bytes = 0;
+    ++blob_stats_.calls;
     for (int64_t i = 0; i < k && n < kRingSlots; ++i) {
         const int64_t e = ids[i];
         if (e < 0 || e >= n_expert_ || pf_seen_[(size_t) e]) continue;
         pf_seen_[(size_t) e] = 1;
+        ++blob_stats_.entries;
         const int64_t idx = layer * n_expert_ + e;
-        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;   // the hot tier answers this one
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) { ++blob_stats_.hot_skips; continue; }   // the hot tier answers this one
         const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
         if (len == 0 || off + len > file_map_bytes_) continue;
         const int slot = n++;
-        pf_jobs_[(size_t) slot] = {idx, slot, off, len};
+        // R7: publish the blob as `kSplit` concurrent sub-reads so the drive sees a real queue depth.  The
+        // chunks are appended in blob order, so the first blob's chunks claim the first workers and every blob
+        // gets its pieces in flight at once rather than behind the previous blob's.
+        uint8_t* dst = ring_[(size_t) slot].data();
+        // kSplit 1 must be exactly one read of the whole blob - `kChunk` only caps the SPLIT case.  Getting
+        // this wrong left the engine issuing five 512 KiB reads per blob, which measured 8.5 tok/s against
+        // 10.7 for the whole-blob form.
+        const uint64_t step = kSplit <= 1 ? len
+                              : std::min<uint64_t>(kChunk, (len + (uint64_t) kSplit - 1) / (uint64_t) kSplit);
+        for (uint64_t at = 0; at < len && njobs < kRingSlots * kMaxChunks; at += step) {
+            const uint64_t n = std::min<uint64_t>(step, len - at);
+            pf_jobs_[(size_t) njobs++] = {dst + at, off + at, n};
+        }
         ring_of_[(size_t) idx] = slot;
+        pf_record_miss(idx);
+        miss_bytes += (int64_t) len;
     }
-    if (n == 0) return;
-    for (int64_t i = 0; i < k; ++i) {   // the rest (ring full): readahead only
+    if (njobs == 0) return;
+    // The rest: entries that are NOT resident and did NOT get a ring slot - i.e. a layer whose distinct
+    // non-resident experts exceed `kRingSlots`.  They get one whole-blob WILLNEED each.
+    //
+    // **R7: THE HOT-TIER GUARD BELOW IS THE FIX FOR A 6.4x READ AMPLIFICATION.**  `pf_seen_[e]` is set to 1
+    // for EVERY deduped id above, hot ones included, so this loop walked all of them; the only filter was
+    // `ring_of_[idx] >= 0`, and a HOT expert never got a ring slot, so its test passed and the engine asked
+    // the kernel to read it off the SSD into the page cache.  Measured on the IQ3_XXS pack, `--hot-ram-gib
+    // 12`, one 150-token generation: 2,880 begin_layer calls, 67,748 ids seen, 52,741 hot-skipped, **96,231
+    // blobs fetched** - against the 15,007 that were actually missed.  The 81,224 extra blobs were 176.8 GB
+    // of readahead for experts already resident in RAM, and they were the whole of the decode time (209.4 GB
+    // in 62.5 s = 3.35 GB/s, exactly the window time).  A resident expert must not be re-read from the drive,
+    // whatever the reason.
+    for (int64_t i = 0; i < k; ++i) {
         const int64_t e = ids[i];
         if (e < 0 || e >= n_expert_ || !pf_seen_[(size_t) e]) continue;
         pf_seen_[(size_t) e] = 2;       // mark as handled; ring_of_ decides who is actually served
         const int64_t idx = layer * n_expert_ + e;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;   // RESIDENT: nothing to read, ever
         if (ring_of_[(size_t) idx] >= 0) continue;
         const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
         if (len == 0 || off + len > file_map_bytes_) continue;
         ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
         ++prefetched_;
+        ++blob_stats_.disk;
+        blob_stats_.disk_bytes += (int64_t) len;
+        pf_record_miss(idx);
     }
-    // publish the batch and wait for the reads.  The parked-count barrier (ExpertPool's protocol) guarantees
-    // every reader thread is parked before head_/done_/njobs_ are reset, so no thread can touch the previous
-    // batch's state while it is republished.
+    // publish the batch; the WAIT is now `wait_layer`, so the caller can put the hot tier's own expert work in
+    // front of it.  The parked-count barrier (ExpertPool's protocol) guarantees every reader thread is parked
+    // before head_/done_/njobs_ are reset, so no thread can touch the previous batch's state while it is
+    // republished.  `pf_njobs_` is published together with `pf_pending_`, and `ring_pending` reads that flag,
+    // so no entry can be observed as "still coming" after its bytes have landed.
     while (pf_parked_.load(std::memory_order_acquire) != (uint32_t) pf_workers_.size()) _mm_pause();
     pf_head_.store(0, std::memory_order_relaxed);
     pf_done_.store(0, std::memory_order_relaxed);
-    pf_njobs_.store((uint32_t) n, std::memory_order_release);
+    pf_jobs_active_ = njobs;
+    pf_njobs_.store((uint32_t) njobs, std::memory_order_release);
     pf_epoch_.fetch_add(1, std::memory_order_release);
     { std::lock_guard<std::mutex> lk(pf_mu_); pf_cv_.notify_all(); }
+    blob_stats_.disk += n;
+    blob_stats_.disk_bytes += miss_bytes;
+    ring_waiting_ = true;
+}
+
+// R7: the blocking half of `begin_layer`.  Same wait the old single-phase form did inline.
+// R7: a new verify window.  Score the previous window as a predictor of this one, then (optionally) ask the
+// kernel to start reading the predicted set NOW, so the per-layer `pread` finds it in the page cache instead of
+// paying the drive's QD1 latency 48 times.
+//
+// WHY THIS IS THE RIGHT LEVER.  Measured on this box's SNV2S1000G: one 2.08 MB random read costs **2.82 ms**
+// (740 MB/s) at QD1, and the same read at QD2+ costs 0.06 ms once the page is resident.  The engine needs ~1-2
+// such reads per layer and there are 48 layers, so the drive's LATENCY - not its bandwidth - sets the floor:
+// 48 x 2.9 ms = 139 ms per window.  `POSIX_FADV_WILLNEED` on the predicted blobs moves that work to the start
+// of the window where it can run at full queue depth beside the CPU, and the 106-odd syscalls cost microseconds.
+void ArenaExpertSource::pf_window_start() {
+    ++window_epoch_;
+    if (window_epoch_ > 1 && prefetch_predict_ && file_fd_ >= 0) {
+        for (const int32_t idx : last_misses_) {
+            if (idx < 0 || idx >= blobs_) continue;
+            const int64_t l = idx / n_expert_, e = idx % n_expert_;
+            if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;
+            const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+            const uint64_t off = lay.blob_offset(l, e), len = lay.blob_bytes(l);
+            if (len == 0 || off + len > file_map_bytes_) continue;
+            ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+            ++blob_stats_.win_prefetched;
+        }
+    }
+    last_misses_.swap(cur_misses_);
+    cur_misses_.clear();
+}
+
+void ArenaExpertSource::pf_record_miss(int64_t idx) {
+    if (idx < 0 || idx >= blobs_) return;
+    if (miss_epoch_.size() != (size_t) blobs_) miss_epoch_.assign((size_t) blobs_, 0);
+    if (miss_epoch_[(size_t) idx] == window_epoch_) return;              // already recorded this window
+    if (miss_epoch_[(size_t) idx] == window_epoch_ - 1) ++blob_stats_.win_repeat;
+    miss_epoch_[(size_t) idx] = window_epoch_;
+    cur_misses_.push_back((int32_t) idx);
+    ++blob_stats_.win_misses;
+}
+
+void ArenaExpertSource::wait_layer() {
+    if (!ring_waiting_) return;
+    const int n = pf_jobs_active_;
     while (pf_done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
     prefetched_ += n;
+    ring_waiting_ = false;
+}
+
+// R7: is `(layer, expert)`'s blob one of the reads that are still in flight?
+bool ArenaExpertSource::ring_pending(int64_t layer, int64_t expert) const {
+    if (!ring_waiting_ || layer != ring_layer_) return false;
+    if (expert < 0 || expert >= n_expert_) return false;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_ || (int64_t) ring_of_.size() != blobs_) return false;
+    return ring_of_[(size_t) idx] >= 0;
 }
 
 }  // namespace strata::core
