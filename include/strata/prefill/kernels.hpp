@@ -45,6 +45,9 @@ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void*
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
+/// R10 P-CHUNK: batch-mode combine pieces (see kernels.cu for the numerics).
+void moe_shared_into_bo(float* bo, const float* shared, const float* sg, int64_t t0, int64_t T, void* stream);
+void moe_scatter_batch(const float* Dm, const int32_t* src, const float* w, float* bo, int64_t n_ent, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 

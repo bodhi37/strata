@@ -287,6 +287,28 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
+
+// R10 P-CHUNK: the two batch-mode pieces of the MoE combine.  With expert-batch scratch (ENTRY_CAP
+// entries), a token's ten (token,k) entries can straddle batches, so the combine cannot stay a per-
+// token pass over a full-chunk Dm.  Instead: bo is INITIALISED with the shared expert's contribution
+// per tile, and each batch SCATTER-ADDS its entries' rows into bo (atomicAdd - a cell gets at most K
+// adds, from different batches).  Numerically identical to moe_combine_kernel up to fp add order.
+__global__ void moe_shared_into_bo_kernel(float* __restrict__ bo, const float* __restrict__ shared,
+                                           const float* __restrict__ sg, int64_t t0, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N;
+    bo[(t0 + t) * N + (i % N)] = shared[(t0 + t) * N + (i % N)] * sigm(sg[t0 + t]);
+}
+
+__global__ void moe_scatter_batch_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ src,
+                                          const float* __restrict__ w, float* __restrict__ bo, int64_t n_ent) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_ent * N) return;
+    const int64_t g = i / N, d = i % N;
+    atomicAdd(&bo[(int64_t) src[g] * N + d], w[g] * Dm[(int64_t) g * N + d]);
+}
+
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
@@ -459,6 +481,16 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                  int64_t T, void* stream) {
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
     check("moe_combine");
+}
+void moe_shared_into_bo(float* bo, const float* shared, const float* sg, int64_t t0, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_shared_into_bo_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(bo, shared, sg, t0, T);
+    check("moe_shared_into_bo");
+}
+void moe_scatter_batch(const float* Dm, const int32_t* src, const float* w, float* bo, int64_t n_ent, void* stream) {
+    if (n_ent <= 0) return;
+    moe_scatter_batch_kernel<<<blocks_for(n_ent * N), 256, 0, (cudaStream_t) stream>>>(Dm, src, w, bo, n_ent);
+    check("moe_scatter_batch");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
