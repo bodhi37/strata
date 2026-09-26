@@ -26,7 +26,9 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>

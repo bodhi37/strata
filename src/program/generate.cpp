@@ -1130,7 +1130,7 @@ int main(int argc, char** argv) {
         // R5c: with the host hot tier active, the VRAM tier takes the NEXT slice of the profile, not the same
         // top pairs the hot tier already holds - duplicated residents serve no extra routing traffic and the
         // card's slots are the scarcest tier on a 12 GiB card.
-        const int64_t skip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_count() : 0;
+        const int64_t skip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_blobs() : 0;
         const int64_t want = std::min<int64_t>((int64_t) profile.size() - skip, xcache.slots());
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
