@@ -120,6 +120,28 @@ class StrataEngine:
         tk = sampling.get("top_k")
         if isinstance(tk, int) and 1 <= tk <= 64:
             keys += f" top_k={tk}"        # the engine's sampled path takes 1..64; outside it keeps its 20
+        mp = sampling.get("min_p")
+        if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
+            keys += f" min_p={float(mp)!r}"
+        rp = sampling.get("repetition_penalty")
+        rp_on = isinstance(rp, (int, float)) and float(rp) != 1.0
+        pf = sampling.get("frequency_penalty")
+        pf_on = isinstance(pf, (int, float)) and float(pf) != 0.0
+        pp = sampling.get("presence_penalty")
+        pp_on = isinstance(pp, (int, float)) and float(pp) != 0.0
+        if rp_on:
+            keys += f" penalty_repeat={float(rp)!r}"
+        if pf_on:
+            keys += f" penalty_freq={float(pf)!r}"
+        if pp_on:
+            keys += f" penalty_present={float(pp)!r}"
+        if rp_on or pf_on or pp_on:
+            # a penalty without a window counts over nothing: the engine's default is the last 64 tokens
+            pln = sampling.get("penalty_last_n")
+            if isinstance(pln, int) and not isinstance(pln, bool) and pln > 0:
+                keys += f" penalty_last_n={pln}"
+            else:
+                keys += " penalty_last_n=64"
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
@@ -793,21 +815,18 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
-    """The run config's optional `sampling` block (temperature, top_p, top_k, seed): defaults for the fields a
-    request leaves out, so a plain client gets configured sampling instead of greedy.  The request's own fields
+    """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
+    a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
+    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
-    Keys the sampled path does not implement yet (min_p, presence_penalty, repetition_penalty, frequency_penalty)
-    are named at startup and ignored rather than silently dropped; a bad value refuses to start the server -
-    a typo'd config should not quietly change sampling."""
+    A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
+    are named at startup and ignored."""
     out = {}
     for key, value in (cfg.get("sampling") or {}).items():
         if value is None:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key in ("min_p", "presence_penalty", "repetition_penalty", "frequency_penalty"):
-            print(f"[strata] config sampling.{key}={value!r}: the engine's sampled path does not implement it "
-                  f"yet - ignored", flush=True)
-        elif key == "temperature":
+        if key == "temperature":
             if not number or value < 0:
                 raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
             out[key] = float(value)
@@ -815,9 +834,29 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not number or not 0 < value <= 1:
                 raise SystemExit(f"[strata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
+        elif key == "min_p":
+            if not number or not 0 <= value <= 1:
+                raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+            out[key] = float(value)
         elif key == "top_k":
             if not number or value != int(value) or not 1 <= value <= 64:
                 raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            out[key] = int(value)
+        elif key == "presence_penalty":
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+            out[key] = float(value)
+        elif key == "frequency_penalty":
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+            out[key] = float(value)
+        elif key == "repetition_penalty":
+            if not number or value <= 0:
+                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+            out[key] = float(value)
+        elif key == "penalty_last_n":
+            if not number or value != int(value) or value < 0:
+                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
