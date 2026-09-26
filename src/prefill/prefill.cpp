@@ -195,7 +195,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.borrow = borrow;
     m.borrow_bytes = borrow_bytes;
     m.rd_stop_ = false;
-    if (!alloc_all(err)) return false;
+    // R10: no alloc_all here - the buffers are per-run (see run), so the startup ordering cannot pin
+    // VRAM that the decode path's own lazy allocations (verify captures, sample buffers) need first.
     if (!init_readers()) { err = "prefill: the reader pool failed to start"; return false; }
     return true;
 }
@@ -222,7 +223,7 @@ bool Prefill::alloc_all(std::string& err) {
     m.emb = o.take<float>((size_t) m.tile * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>((size_t) m.tile * D, ok);
     m.xn16 = o.take<uint16_t>((size_t) m.tile * D, ok); m.lo = o.take<float>((size_t) m.tile * LR, ok); m.lo16 = o.take<uint16_t>((size_t) m.tile * LR, ok);
     m.gated = o.take<float>((size_t) m.tile * D, ok); m.inj = o.take<float>(T * HC, ok);
-    m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
+    m.mixed = o.take<float>((size_t) m.tile * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);   // R10: fp32 mixed is write-only -> tile-sized
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
     m.qkv = o.take<float>((size_t) m.tile * C, ok); m.z = o.take<float>((size_t) m.tile * ZV, ok); m.ab = o.take<float>((size_t) m.tile * 2 * HV, ok);
     m.gate = o.take<float>((size_t) m.tile * HV, ok); m.beta = o.take<float>((size_t) m.tile * HV, ok); m.hbuf = o.take<float>((size_t) m.tile * C, ok);
@@ -348,7 +349,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(TS * N); f(T * D); f(TS * D); o.take<uint16_t>(TS * D, ok); f(TS * LR); o.take<uint16_t>(TS * LR, ok);
-    f(TS * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
+    f(TS * D); f(T * HC); f(TS * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     f(TS * C); f(TS * ZV); f(TS * 2 * HV); f(TS * HV); f(TS * HV); f(TS * C); f(TS * ZV); o.take<uint16_t>(TS * ZV, ok);
     f(TS * 512); f(TS * 512); f(TS * 12288); f(TS * ZV); f(TS * 128); f(TS * 512); f(TS * ZV); o.take<uint16_t>(TS * ZV, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
