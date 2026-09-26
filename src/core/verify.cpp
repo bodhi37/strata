@@ -111,6 +111,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     hits_ = hits;
     head_ = head;
     max_t_ = max_t;
+    sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
+    sampling_.temperature = 0.0f;
+    draw_counter_ = 0;
     if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
@@ -595,10 +598,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
-        SamplerParams sp;
-        sp.greedy = true;
-        sp.temperature = 0.0f;
-        sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        // the sampling is NOT recorded here: it runs host-side after the graph (run()), because
+        // its parameters change per request and a captured kernel would bake them forever
     }
     return true;
 }
@@ -794,6 +795,18 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    // ---- the head's sampling, host-side so its parameters are this call's own (a captured kernel
+    // would replay the same draws forever).  The counter advances by the window's rows.
+    SamplerParams sp = sampling_;
+    sp.counter = draw_counter_;
+    draw_counter_ += (uint64_t) T;
+    sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
+    const cudaError_t sm = cudaMemcpyAsync(h_out_, m_out_, (size_t) T * sizeof(int32_t),
+                                           cudaMemcpyDeviceToHost, cs_);
+    if (sm != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: the head sampling failed";
+        return false;
+    }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     VDBG("window done\n");
     ++windows;

@@ -62,7 +62,10 @@ public:
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
-    void set_sampling(const strata::kernels::SamplerParams& sp) { sampling_ = sp; }
+    void set_sampling(const strata::kernels::SamplerParams& sp) {
+        sampling_ = sp;
+        draw_counter_ = 0;   // each request's sampling starts its own draw sequence
+    }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -94,6 +97,7 @@ private:
         s.temperature = 0.0f;
         return s;
     }();   ///< greedy by default; per-request via set_sampling
+    uint64_t draw_counter_ = 0;   ///< advanced by T on every sampled window; reset by set_sampling
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
 

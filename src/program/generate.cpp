@@ -2154,6 +2154,29 @@ int main(int argc, char** argv) {
             }
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+            // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N,
+            // seed=N (text requests only).  Absent keys keep today's behavior: greedy.
+            float req_temperature = 0.0f, req_top_p = 1.0f;
+            int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
+            unsigned long long req_seed = 0;
+            if (!geni && endp != nullptr) {
+                for (;;) {
+                    while (*endp == ' ') ++endp;
+                    const char* start = endp;
+                    while (*endp != '\0' && *endp != ' ') ++endp;
+                    if (endp == start) break;
+                    const std::string tok(start, (size_t) (endp - start));
+                    const size_t eq = tok.find('=');
+                    if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
+                    const std::string key = tok.substr(0, eq);
+                    const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
+                    if (key == "temperature") req_temperature = fv;
+                    else if (key == "top_p") req_top_p = fv;
+                    else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    // unknown keys are skipped: the ids start at the first token without '='
+                }
+            }
             std::string emb_path;
             if (geni && endp != nullptr) {
                 while (*endp == ' ') ++endp;
@@ -2386,6 +2409,16 @@ int main(int argc, char** argv) {
                 return true;
             };
             apply_pending(true);
+            // per-request sampling for the verify window's head (greedy when temperature is absent)
+            strata::kernels::SamplerParams req_sp;
+            req_sp.greedy = req_temperature <= 0.0f;
+            req_sp.temperature = req_temperature;
+            req_sp.top_p = req_top_p;
+            req_sp.top_k = req_top_k;
+            req_sp.seed = req_seed ? req_seed
+                                   : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+            req_sp.counter = 0;
+            ver.set_sampling(req_sp);
             bool cancelled = false;
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
