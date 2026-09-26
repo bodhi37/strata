@@ -67,6 +67,15 @@ public:
         draw_counter_ = 0;   // each request's sampling starts its own draw sequence
     }
 
+    /// The penalty-history row for `sampling_.penalty_last_n`: ONE row of `history_len` int32 slots, most
+    /// recent token LAST, unused front slots -1 (the kernel reads only the tail window).  Null disables the
+    /// penalties entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine
+    /// re-uploads the request's tail before every window; the pointer must stay alive across the request.
+    void set_history(const int32_t* history, int history_len) {
+        hist_d_ = history;
+        hist_len_ = history_len;
+    }
+
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
@@ -98,6 +107,8 @@ private:
         return s;
     }();   ///< greedy by default; per-request via set_sampling
     uint64_t draw_counter_ = 0;   ///< advanced by T on every sampled window; reset by set_sampling
+    const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
+    int hist_len_ = 0;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
 

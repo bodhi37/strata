@@ -1,6 +1,6 @@
 // src/kernels/cuda/sampler.cu - P2.S2: the sampler chain, in the order docs/sampling.md settles.
 //
-//     penalties  ->  top_k  ->  top_p  ->  temperature  ->  pick
+//     penalties -> top_k -> min_p -> top_p -> temperature -> penalties -> pick
 //
 // THE ORDER IS THE WHOLE CONTENT OF THIS FILE.  `docs/sampling.md` transcribes it from llama.cpp's own chain
 // (`common/sampling.cpp` L357/360/375/381/399) and the two facts that are easy to get backwards are that
@@ -217,22 +217,34 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         __syncthreads();
     }
 
+    // ---- min_p: keep the descending prefix whose probability is at least `min_p` of the top token's.  The
+    // kept list is in selection order (descending), so the survivors are a PREFIX and the cut composes with
+    // top_p's below.  In logit space the threshold is `sel_logit[0] + logf(min_p)` - equivalent to
+    // `p >= min_p * p_max` without the overflow an exp of raw logits risks.  0 disables, and the head itself
+    // always survives (`expf(0) == 1 >= min_p` for min_p in 0..1), so the count never reaches zero.
+    int n_minp = k;
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + logf(p.min_p);
+        for (int i = 0; i < k; ++i)
+            if (sel_logit[i] < thresh) { n_minp = i; break; }
+    }
+
     // ---- top_p over the survivors, in descending order (which the selection produced), then temperature and
     // one Philox draw.  Every thread computes the same chain redundantly over `sel_*` - the arithmetic is the
     // serial kernel's, instruction for instruction - so they agree on `pick` and thread 0 writes it.
-    int n_keep = k;
+    int n_keep = n_minp;
     float mx = sel_logit[0];
-    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
+    for (int i = 1; i < n_minp; ++i) mx = fmaxf(mx, sel_logit[i]);
     if (p.top_p < 1.0f) {
         double sum = 0.0;
-        for (int i = 0; i < k; ++i) sum += exp((double) sel_logit[i] - (double) mx);
+        for (int i = 0; i < n_minp; ++i) sum += exp((double) sel_logit[i] - (double) mx);
         double cum = 0.0;
-        int cut = k;
-        for (int i = 0; i < k; ++i) {
+        int cut = n_minp;
+        for (int i = 0; i < n_minp; ++i) {
             cum += exp((double) sel_logit[i] - (double) mx) / sum;
             if (cum >= (double) p.top_p) { cut = i + 1; break; }
         }
-        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        if (cut < p.min_keep) cut = p.min_keep < n_minp ? p.min_keep : n_minp;
         n_keep = cut;
     }
     auto scaled = [&](int i) {

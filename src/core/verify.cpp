@@ -800,7 +800,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     SamplerParams sp = sampling_;
     sp.counter = draw_counter_;
     draw_counter_ += (uint64_t) T;
-    sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs_);
+    sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
     const cudaError_t sm = cudaMemcpyAsync(h_out_, m_out_, (size_t) T * sizeof(int32_t),
                                            cudaMemcpyDeviceToHost, cs_);
     if (sm != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
