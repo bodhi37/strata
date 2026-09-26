@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -32,8 +33,15 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
-constexpr int STAGE = 12;          // host->device expert staging ring (R8: 12, so ~11 reads stay in flight)
+constexpr int STAGE = 48;          // host->device expert staging ring (R10: 48 - at 1.1 GB/s the drive needs
+                                    // ~100 MB of reads in flight to stay saturated; 12 slots = 26 MB measured 0.83 GB/s)
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+
+// R10: prefill LRU admissions are opt-in (see stage_consume).
+inline bool prefill_admit_on() {
+    static const bool v = std::getenv("STRATA_PREFILL_ADMIT") != nullptr;
+    return v;
+}
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -216,7 +224,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     // (Six measured 1.09 GB/s on a 2,232-token prompt; the drive has more queue depth to give.)
     {
         Impl* mm = impl_.get();
-        for (int i = 0; i < 12; ++i)
+        for (int i = 0; i < 16; ++i)
             m.rd_pool_.emplace_back([mm]() {
                 for (;;) {
                     Impl::RdJob j;
@@ -577,12 +585,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
                                 std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
                             }
-                            // R8b: **THE STAGED BLOB IS ADMITTED TO THE LRU TIER.**  The prompt's routed
-                            // experts are exactly what this turn's generation and every later turn's prompt
-                            // will route; without admission every turn sweeps ~20 GB of disk again
-                            // (measured).  The frequency-aware eviction keeps a one-prompt flood from
-                            // flushing the tier's protected content.
-                            m.src->stage_admit(l, e, m.stage_host[sl]);
+                            // R8b/R10: **THE STAGED BLOB IS ADMITTED TO THE LRU TIER** - but OFF BY DEFAULT now
+                            // (STRATA_PREFILL_ADMIT=1 re-enables).  Two measured problems with always-on: the
+                            // 2.18 MB admission memcpy runs on THIS consume thread (the pipeline's serializer),
+                            // ~6.6 s per chunk of pure host copy at sweep rates; and the flood of uniformly-hot
+                            // prompt experts evicts the frequency-ranked decode tier, so the generation after a
+                            // prefill starts from a poisoned tier (first-run decode fell from 10-11 to 3.6 tok/s).
+                            // A/B before flipping the default back.
+                            if (prefill_admit_on()) m.src->stage_admit(l, e, m.stage_host[sl]);
                             cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l),
                                             cudaMemcpyHostToDevice, m.copy);
                         }
