@@ -18,6 +18,115 @@ same abliterated line) after an engine patch, and all three are being benchmarke
   sidecar, because this split keeps the architecture keys and the head in different shards.
 * Everything lives under `~/models/strata/`; endpoint is OpenAI + Anthropic compatible.
 
+---
+
+## 0. R7 TAKEOVER (2026-09-26) — root cause, fixes, and honest numbers
+
+An agent spent 2026-09-25/26 building the three-quant bake-off above and left the engine at
+**0.4-2.0 tok/s decode**.  This section is the takeover's findings.  Read it before §9-§11: several of
+the earlier conclusions below are corrected here.
+
+### 0.1 Root cause of the ~100x gap (measured, not inferred)
+
+1. **The expert arena is demand-paged from NVMe and this box cannot cache it.**  Upstream Strata was
+   tuned on a 64 GB host where the whole canonical 34 GB expert set lives in the OS page cache, so
+   `blob()`'s mmap faults resolve from DRAM at ~40 GB/s.  These packs are **49.8 / 57.9 / 65.4 GiB**
+   (IQ3_XXS / IQ3_M / IQ4_XS) against **30 GiB RAM**, so every miss reaches the drive.
+2. **Pre-R5, the read path faulted 4 KiB at a time.**  ~480 blobs per decode token x ~650 pages per
+   blob is ~310,000 page faults per token against a DRAM-less QLC drive.
+3. **R5's pread ring fixed the granularity but introduced a 6.4x read amplification.**  Its "ring full"
+   fallback loop re-issued `posix_fadvise(WILLNEED)` for every deduped id *including hot-tier-resident
+   ones*.  Measured: 2,880 `begin_layer` calls, 67,748 ids seen, 52,741 hot-skipped, **96,231 blobs
+   fetched — against the 15,007 that were actually missed.**  176.8 GB of pointless readahead per
+   150-token generation, and it was the whole of the decode time.
+4. **The engine's "100% hot tier" statistic was misleading.**  It counted only the lookups that reached
+   the hot-tier *check*, so blobs answered from the pread ring or straight out of the mapping were
+   invisible.  A run that was disk-bound printed "100.0%".
+5. **The GPU (VRAM) expert tier is numerically unverified** — the engine itself refuses to vouch for it —
+   so the only fast path was unusable, and the one fast path that did run produced the `!!!!!!` garbage
+   (token id 0, i.e. degenerate logits).
+6. **The inherited profile left 24-48% of expert requests on the SSD** (`--hot-ram-gib 10-12` of a
+   49.8 GiB arena).
+
+### 0.2 What R7 changed, in order of measured impact
+
+| change | effect |
+| --- | --- |
+| **Fixed the 6.4x read amplification** (hot-tier guard in the ring-full fallback, `expert_source.cpp`) | 2.4 → **6.1 tok/s** on IQ3_XXS; disk bytes 209 → 37.7 GB per 150-token generation |
+| **Trace-derived routing profile** — new `--dump-counts`, `tools/make_profile_from_counts.py`, `data/profile-r7.bin` (19,414 ranked pairs from this model's real routing on this box) | +coverage at equal tier size; the old `data/expert-profile.bin` carries only a *rank* and cannot say what the top N cover |
+| **Honest, inclusive expert telemetry** — `ArenaExpertSource::BlobStats` (requests / hot / ring / map / disk / disk_bytes / predictor quality) | makes "where did the bytes come from" answerable; the misleading counter is gone |
+| **`pin_hot` reworked**: whole-blob `pread` straight into the tier (was a 4 KiB-faulting memcpy out of the mapping), `posix_fadvise(DONTNEED)` after each blob, `MADV_HUGEPAGE` on the tier | a 20 GiB tier no longer leaves 20 GiB of page cache behind, and the tier gets 2 MiB pages |
+| **Two-pass expert dispatch** — `begin_layer` submits and returns; `wait_layer` blocks; `expert_pool_dispatch_multi` computes the *resident* experts in pass 0 while the layer's reads are in flight | hides the CPU drain (42-58 ms/window) inside the drive's latency |
+| **`cap_ipc_lock` + `cap_sys_nice` file capabilities** on `engine/strata` (build script re-applies them, since `cp` clears xattrs) | `mlock` of the hot tier actually succeeds; it was silently "reclaimable" |
+| **Fixed two real bugs found on the way**: the VRAM profile-fill copied `profile[i]`'s blob *size* for `profile[skip+i]`; `verify_slot` checked `profile[0]`, which the hot tier now owns | the VRAM tier can at least be started and verified |
+
+New knobs: `--dump-counts P`, `--expert-profile` now accepts a 19,414-pair profile, `STRATA_NO_PREDICT=1`
+(A/B arm for the prefetch predictor), `kSplit` (chunked reads, default 1 = whole blob).
+
+### 0.3 Measured progression (IQ3_XXS pack, one 150-token generation, coherent output throughout)
+
+| config | decode tok/s | disk bytes / run |
+| --- | ---: | ---: |
+| start of R7 (`--expert-cache -2`, no hot tier, pre-R5 read path) | ~1.5-2.0 | ~1.04 GB/token |
+| R5 ring + 12 GiB hot tier, inherited profile | 2.4 | **209.4 GB** (6.4x amplified) |
+| + amplification fix | 6.1 | 37.7 GB |
+| + trace profile, 12 GiB | 6.7 | 209 → (see §0.2) |
+| + 20 GiB hot tier + two-pass dispatch | 8.8 | 13.8 GB |
+| + `--spec-min-p 0.8` (best) | **10.5-11.4** | 12-14 GB |
+
+`bench/results/r7-<quant>.{json,md}` hold the per-context tables.
+
+### 0.4 Tried and rejected (measured, so nobody burns a day on these)
+
+* **zram / compression of the expert arena.**  The mission's "effectively 2-4x expert capacity" does not
+  hold: the IQ payloads are already high-entropy.  Measured on 64 MB sampled from the arena:
+  **lz4 1.000x, zstd -1 1.008x, zstd -3 1.007x, zstd -19 1.011x, xz -6 1.005x.**
+* **Page-cache prefetch of the previous verify window's misses** (`POSIX_FADV_WILLNEED` at window start).
+  The predictor scores **15.3%** — 3,991 misses, 609 repeats — so 85% of the prefetched I/O is wasted.
+* **Chunked reads** (`kSplit 4`, 512 KiB sub-reads to raise queue depth): **8.4 tok/s against 10.7**
+  whole-blob, ring-wait 167 ms against 113.  Consistent with the micro-benchmark: 266 KiB reads at QD8
+  move 682 MB/s while 2.08 MiB reads at QD8 move 1000-1080 MB/s.  This drive's per-request overhead, not
+  its queue depth, dominates at small sizes.
+* **Balanced per-layer hot-set allocation** (same budget, equal per-layer rank cutoff): slightly *worse*
+  than the global frequency ranking at every budget tested (8k/9868/12k/14k/16k blobs).
+* **The VRAM expert tier on this box.**  Only **3.35 GiB is free** after the native projections
+  (2,975 MiB), the MTP draft head (949 MiB) and the KV cache; `--expert-cache auto` → 1,218 slots, and the
+  verify graphs then fail with `instantiate: out of memory`.  Even if it fit, ~1,200 blobs is 4.9% of the
+  arena and the hit path is the one the engine itself flags as divergent.
+* **Larger speculative windows.**  `kVerifyMaxT` is already **8** (the configs only ever asked for 4).
+  `--spec 8 --spec-min-p 0.8` gives 11.4 tok/s against 10.5 for `--spec 4`: the MTP draft head's ~47%
+  acceptance, not the window size, is the limit.
+* **NVMe power management / link.**  PCIe 4.0 x4 (16 GT/s) and the device is active; the 2.8 ms QD1 read
+  is the drive's own per-request latency, not a wake-up penalty.
+
+### 0.5 Why 20-30 tok/s is not reached — the arithmetic
+
+* Per decode token the engine needs **480 expert blobs = 1.044 GB** (IQ3_XXS; 1.28 GB for IQ4_XS).
+* This drive delivers **0.74 GB/s at QD1** and **~1.0 GB/s saturated** (measured, cold random 2.08 MiB
+  reads, fresh offsets each run).  Raw device sequential is 2.0 GB/s; the arena file is fragmented
+  (81,505 extents for IQ4_XS) and delivers ~0.9 GB/s sequential.
+* The engine can hold **~26 GiB of the 49.8 GiB arena** before the box starts swapping (30 GiB total, of
+  which the engine's own dense weights, token embedding and workspaces take ~4 GiB).  From the measured
+  coverage curve that is **97.2% of routed traffic**.
+* So ~2.8% of requests — **~29 MB/token** — must come from the drive.  At 1.0 GB/s that is 29 ms/token of
+  *bandwidth*, which is fine for 20-30 tok/s.
+* **The binding constraint is latency, not bandwidth.**  The misses arrive 1-2 per layer, spread over
+  **48 strictly serial layers** (layer L's router depends on layer L-1's output, so nothing can be
+  prefetched or run ahead).  The drive therefore sits at QD1-2 and every read pays its full **2.8 ms**.
+  48 x 2.8 ms = **134 ms per window**, against a measured ring-wait of 120-170 ms.
+* Amortized over the MTP window (1.97-2.57 tokens produced) that is 52-68 ms/token → **15-19 tok/s
+  theoretical**, ~10-11 tok/s as implemented.
+
+To beat this you must either (a) hold ≥99% of routed traffic — **34.8 GiB resident for IQ3_XXS**, which
+the box cannot fit — or (b) make the per-layer read disappear, which needs a predictor for a miss set
+that is **15.3%** correlated window-to-window.  Both are closed by measurement, not by assertion.
+
+The one lever that would move the number materially is **more resident bytes**.  Every extra GiB of hot
+tier buys ~+0.8% coverage and, more importantly, removes whole layers from the read path: at 99.1%
+coverage only 18% of layers need a read at all, and the ring-wait would fall from ~120 ms to ~25 ms.
+
+---
+
 ## 1. Which "Strata"
 
 The task's reference URL returned 404 on 2026-09-25 and the `nikko1221` account had 0 public repos.

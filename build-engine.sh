@@ -22,3 +22,6 @@ mkdir -p "$ROOT/engine"
 cp -f "$ROOT/build/strata" "$ROOT/engine/strata"
 chmod +x "$ROOT/engine/strata"
 echo "[build] done $(date -Is): $(ls -l "$ROOT/engine/strata")"
+# R7: cap_ipc_lock lets pin_hot actually mlock the host tier; `cp` clears file xattrs, so re-apply.
+if [ -n "${STRATA_SETCAP_PASS:-}" ]; then echo "$STRATA_SETCAP_PASS" | sudo -S setcap cap_ipc_lock,cap_sys_nice+ep "$ROOT/engine/strata" 2>/dev/null || true; fi
+getcap "$ROOT/engine/strata" || true

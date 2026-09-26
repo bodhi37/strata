@@ -1,12 +1,5 @@
 #!/bin/bash
-# Wrapper: raise RLIMIT_MEMLOCK (for the expert hot tier's mlock) via scoped sudo,
-# then drop back to the invoking user and exec the real engine.  The engine runs at
-# nice -5 (set as root before the UID drop) so the pool/reader threads are not starved
-# by the desktop under memory or CPU pressure.
-if [ "${STRATA_MEMLOCK_DONE}" != "1" ]; then
-  exec sudo -n /usr/bin/prlimit --memlock=unlimited:unlimited -- \
-    nice -n -5 \
-    setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups -- \
-    env STRATA_MEMLOCK_DONE=1 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" /home/bodhi/models/strata/engine/strata "$@"
-fi
-exec /home/bodhi/models/strata/engine/strata "$@"
+# Wrapper: the engine carries cap_ipc_lock + cap_sys_nice (file capabilities, so no sudo is needed at
+# run time), which is what lets `pin_hot` actually mlock the host tier instead of leaving it reclaimable.
+# nice -5 keeps the pool/reader threads from being starved by the desktop.
+exec nice -n -5 /home/bodhi/models/strata/engine/strata "$@"

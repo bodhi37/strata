@@ -176,6 +176,13 @@ struct Options {
     /// R5: write a STRP profile ranked by THIS run's actual routing counts to this path, at the end of the
     /// run (after the last request, before exit).  The profile the engine then loads via --expert-profile.
     std::string dump_profile;
+    /// R7: write the RAW per-(layer, expert) routing counts (uint64 x n_layers x n_expert) so the coverage
+    /// curve - how much traffic the top-N experts carry - can be computed for THIS model on THIS box instead of
+    /// inherited from a default profile.  A profile that only holds a RANK cannot say whether 52% of the arena
+    /// covers 90% of the traffic, which is the entire tiering question on a 30 GiB machine.  Distinct from
+    /// `dump_routing` above, which is a per-position TRACE (order preserved) rather than a histogram, and is
+    /// one-shot-only; this one works in `--serve` mode too.
+    std::string dump_counts;
     /// Small-RAM machines: GiB of the profile's hottest experts to hold in an anonymous, mLOCKED hot tier beside
     /// the file-backed arena.  See `ArenaExpertSource::pin_hot`.  0 = off (the mapped arena alone).
     double hot_ram_gib = 0.0;
@@ -320,6 +327,9 @@ void usage() {
                  "                       anonymous mLOCKED host tier, so the mapped arena's misses are only\n"
                  "                       the tail of the routing distribution and the page cache holds the\n"
                  "                       cold set for prefill.  Needs --mmap-experts and --expert-profile.\n"
+                 "  --dump-routing P     R7: write the RAW per-(layer, expert) routing counts (STRC) so the\n"
+                 "                       coverage curve can be derived from THIS model's real routing.  Works in\n"
+                 "                       --serve mode too, when the engine stops.\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -441,6 +451,53 @@ int argmax(const std::vector<float>& v) {
     return best;
 }
 
+/// R7: persist the RAW routing counts, and (optionally) the STRP profile ranked from them.  Called both by the
+/// one-shot path at exit and by the resident `--serve` path when it stops, because a serve run is exactly the
+/// workload the profile should be derived from.
+void dump_routing_files(const std::string& counts_path, const std::string& profile_path,
+                        const std::vector<uint64_t>& usage_total, int64_t n_layers, int64_t n_expert) {
+    if (counts_path.empty() && profile_path.empty()) return;
+    if ((int64_t) usage_total.size() != n_layers * n_expert) return;
+    std::vector<std::pair<uint64_t, int64_t>> rank;
+    rank.reserve(usage_total.size());
+    for (size_t i = 0; i < usage_total.size(); ++i)
+        if (usage_total[i] > 0) rank.emplace_back(usage_total[i], (int64_t) i);
+    std::sort(rank.begin(), rank.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (!counts_path.empty()) {
+        std::FILE* f = std::fopen(counts_path.c_str(), "wb");
+        if (f != nullptr) {
+            const uint32_t hdr[3] = {(uint32_t) n_layers, (uint32_t) n_expert, 0};
+            std::fwrite("STRC", 1, 4, f);
+            std::fwrite(hdr, 4, 3, f);
+            std::fwrite(usage_total.data(), 8, usage_total.size(), f);
+            std::fclose(f);
+            std::fprintf(stderr, "strata generate: dumped routing counts %s: %zu of %lld sampled\n",
+                         counts_path.c_str(), rank.size(), (long long) (n_layers * n_expert));
+        } else {
+            std::fprintf(stderr, "strata generate: cannot write --dump-routing %s\n", counts_path.c_str());
+        }
+    }
+    if (!profile_path.empty()) {
+        const uint32_t n_ranked = (uint32_t) std::min<size_t>(rank.size(), 24000);
+        std::FILE* f = std::fopen(profile_path.c_str(), "wb");
+        if (f != nullptr) {
+            const uint32_t hdr[5] = {0, (uint32_t) n_layers, (uint32_t) n_expert, n_ranked, n_ranked};
+            std::fwrite("STRP", 1, 4, f);
+            std::fwrite(hdr, 4, 5, f);
+            for (uint32_t i = 0; i < n_ranked; ++i) {
+                const uint16_t pair[2] = {(uint16_t) (rank[i].second / n_expert),
+                                          (uint16_t) (rank[i].second % n_expert)};
+                std::fwrite(pair, 2, 2, f);
+            }
+            std::fclose(f);
+            std::fprintf(stderr, "strata generate: dumped profile %s: %u ranked pairs of %zu touched\n",
+                         profile_path.c_str(), n_ranked, rank.size());
+        } else {
+            std::fprintf(stderr, "strata generate: cannot write --dump-profile %s\n", profile_path.c_str());
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -497,6 +554,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
+        else if (a == "--dump-counts") o.dump_counts = next("--dump-counts");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
@@ -572,6 +630,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--stats") o.stats = true;
         else if (a == "--dump-profile") o.dump_profile = next("--dump-profile");
+        else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
+        else if (a == "--dump-counts") o.dump_counts = next("--dump-counts");
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
@@ -1136,8 +1196,13 @@ int main(int argc, char** argv) {
             const int32_t slot = xcache.admit(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
             if (slot == strata::core::kNotResident) break;
             const uint8_t* b = srcp->blob(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
+            // R7: the byte count must come from the SAME pair the blob did.  This read `profile[i].first` while
+            // the blob came from `profile[skip + i]`, so with the host hot tier active the fill copied layer
+            // `i`'s blob size for layer `skip + i`'s expert - right for IQ4_XS (every blob is 2,662,400 B) and
+            // WRONG for IQ3_M, whose blob sizes differ (2,329,600 vs 2,534,400) - a short slot that verifies
+            // clean and computes from stale bytes.
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) (skip + i)].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -1147,11 +1212,14 @@ int main(int argc, char** argv) {
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        // R5: skipped entirely when the VRAM tier is disabled (--expert-cache -2 -> xcache never opened);
-        // the profile then only drives the host hot tier, which needs no fill and no read-back.
-        if (xcache.slots() > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+        // R7: verify a pair the VRAM tier ACTUALLY holds.  With the host hot tier active the tier starts at
+        // `skip`, so `profile[0]` is a host-tier resident and `slot_of` answers -1 - and R5's own guard
+        // (`slots() > 0 && !verify_slot(...)`) then refused every such run with "slot outside the arena".
+        const int64_t vskip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_blobs() : 0;
+        if (xcache.slots() > 0 && prefilled > 0 &&
+            !xcache.verify_slot(xcache.slot_of(profile[(size_t) vskip].first, profile[(size_t) vskip].second),
+                                srcp->blob(profile[(size_t) vskip].first, profile[(size_t) vskip].second), err,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) vskip].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1880,7 +1948,8 @@ int main(int argc, char** argv) {
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        if (!o.dump_profile.empty()) drive.d.usage_total.assign((size_t) (g.n_layers * g.n_expert), 0ull);
+        if (!o.dump_profile.empty() || !o.dump_counts.empty())
+            drive.d.usage_total.assign((size_t) (g.n_layers * g.n_expert), 0ull);
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
@@ -2134,6 +2203,16 @@ int main(int argc, char** argv) {
             std::vector<float> dprob((size_t) S, 0.0f);
             bool first_window = true;
             int64_t produced_n = 0;
+            // R7: MTP acceptance, the amortisation factor for the expert fetches.  `tokens/round` is the number
+            // of decode steps each expert read is charged to, so it multiplies the effective expert bandwidth.
+            int64_t win_rounds = 0, win_tokens = 0, win_accepted = 0;
+            // R7: where the window time goes.  The verifier and the pool already time their own halves
+            // (`Verifier::ms_wait/ms_pool/ms_host/ms_commit`, `ExpertDispatch::ms_plan/ms_run`); snapshot them
+            // so the per-request delta can be printed.  `ms_plan` contains `begin_layer`, i.e. the blocking
+            // disk wait, and `ms_run` contains the CPU expert drain.
+            const double v0[4] = {ver.ms_wait, ver.ms_pool, ver.ms_host, ver.ms_commit};
+            const double d0p[4] = {drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs, drive.d.ms_run};
+            double mtp_ms = 0.0;
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             while (produced_n < max_new) {
@@ -2165,6 +2244,9 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                ++win_rounds;
+                win_tokens += T;
+                win_accepted += a;
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
@@ -2183,8 +2265,10 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 ++rounds;
+                const auto mt0 = Clock::now();
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                mtp_ms += std::chrono::duration<double, std::milli>(Clock::now() - mt0).count();
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
                     request_failed("an adaptive refill failed");
@@ -2200,14 +2284,59 @@ int main(int argc, char** argv) {
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             sess_len = n + produced_n;   // the live state now covers prompt + accepted tokens
-            // R5: the two numbers that say where the expert bytes came from.  hot = hot-tier hits of hot-tier
-            // lookups (RAM tier); pf = whole-blob readaheads submitted at doorbell time (the SSD misses).
-            if (srcp == &arena_src)
-                std::fprintf(stderr, "strata serve: hot %lld/%lld (%.1f%%), prefetched %lld\n",
-                             (long long) arena_src.hot_hits(), (long long) arena_src.hot_lookups(),
-                             arena_src.hot_lookups() > 0
-                                 ? 100.0 * (double) arena_src.hot_hits() / (double) arena_src.hot_lookups() : 0.0,
-                             (long long) arena_src.prefetched());
+            // ---- R7: WHERE THE EXPERT BYTES CAME FROM, AND WHAT THEY COST.  The R5 line below reported only
+            // the lookups that REACHED the hot-tier check, so a blob answered from the pread ring or from the
+            // file mapping was invisible and a disk-bound run could print "100% hot".  These figures are
+            // inclusive over every routed expert, so `disk` is the honest SSD miss count and `disk/s` is the
+            // number the tier sizes must beat.
+            if (srcp == &arena_src) {
+                const auto bs = arena_src.take_blob_stats();
+                const double den = decode_ms > 0 ? decode_ms / 1000.0 : 1.0;
+                std::fprintf(stderr,
+                             "strata serve: experts: %lld requests (%.1f/token) = RAM %lld hot + %lld ring, "
+                             "MAP %lld, DISK %lld blobs / %.2f GB (%.2f GB/s) | hot tier %.2f GiB (%lld blobs)\n",
+                             (long long) bs.requests, produced_n > 0 ? (double) bs.requests / produced_n : 0.0,
+                             (long long) bs.hot, (long long) bs.ring, (long long) bs.map, (long long) bs.disk,
+                             (double) bs.disk_bytes / 1e9, (double) bs.disk_bytes / 1e9 / den,
+                             (double) arena_src.hot_bytes() / 1073741824.0, (long long) arena_src.hot_blobs());
+                std::fprintf(stderr,
+                             "strata serve: ring: %lld begin_layer calls, %lld ids seen, %lld hot-skipped, "
+                             "%lld fresh fetches, %lld already-in-ring\n",
+                             (long long) bs.calls, (long long) bs.entries, (long long) bs.hot_skips,
+                             (long long) bs.disk, (long long) bs.already);
+                std::fprintf(stderr,
+                             "strata serve: prefetch: %lld misses this run, %lld were also last window's "
+                             "(%.1f%% predictor), %lld issued\n",
+                             (long long) bs.win_misses, (long long) bs.win_repeat,
+                             bs.win_misses > 0 ? 100.0 * (double) bs.win_repeat / (double) bs.win_misses : 0.0,
+                             (long long) bs.win_prefetched);
+                if (win_rounds > 0)
+                    std::fprintf(stderr,
+                                 "strata serve: mtp: %lld windows, %.2f tokens/window (%.1f%% of %d drafts "
+                                 "accepted), %.1f ms/window\n",
+                                 (long long) win_rounds, (double) win_tokens / win_rounds,
+                                 win_tokens > 0 ? 100.0 * win_accepted / win_tokens : 0.0, o.spec,
+                                 decode_ms / win_rounds);
+                if (win_rounds > 0) {
+                    const double per = 1.0 / win_rounds;
+                    std::fprintf(stderr,
+                                 "strata serve: phases/win ms: ver[wait %.1f pool %.1f host %.1f commit %.1f] "
+                                 "dispatch[plan+disk-issue %.1f actq %.1f jobs %.1f run %.1f ringwait %.1f] "
+                                 "mtp %.1f\n",
+                                 (ver.ms_wait - v0[0]) * per, (ver.ms_pool - v0[1]) * per,
+                                 (ver.ms_host - v0[2]) * per, (ver.ms_commit - v0[3]) * per,
+                                 (drive.d.ms_plan - d0p[0]) * per, (drive.d.ms_actq - d0p[1]) * per,
+                                 (drive.d.ms_jobs - d0p[2]) * per, (drive.d.ms_run - d0p[3]) * per,
+                                 drive.d.ms_wait * per, mtp_ms * per);
+                    double wp = 0, dr = 0, rp = 0;
+                    pool.phase_ms(wp, dr, rp);
+                    std::fprintf(stderr,
+                                 "strata serve: pool/win ms: wait_park %.1f drain %.1f repark %.1f | native "
+                                 "gu %.1f q %.1f down %.1f\n",
+                                 wp * per, dr * per, rp * per, pool.ms_multi_gu * per, pool.ms_multi_q * per,
+                                 pool.ms_multi_down * per);
+                }
+            }
             std::printf("DONE %lld %lld %.1f %.1f %s %lld\n", (long long) produced_n, (long long) n, prompt_ms,
                         decode_ms, finish, (long long) sess_len);
             std::fflush(stdout);
@@ -2215,12 +2344,17 @@ int main(int argc, char** argv) {
                                  "(%.1f tok/s)\n", (long long) n, prompt_ms, prompt_ms > 0 ? 1000.0 * n / prompt_ms : 0.0,
                          (long long) produced_n, decode_ms, decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0);
             if (srcp == &arena_src && arena_src.hot_lookups() > 0)
-                std::fprintf(stderr, "strata serve: hot tier served %lld of %lld blob requests (%.1f%%), "
-                                     "%d MiB of experts resident\n",
+                std::fprintf(stderr, "strata serve: hot-tier lookup coverage %lld/%lld (%.1f%%)\n",
                              (long long) arena_src.hot_hits(), (long long) arena_src.hot_lookups(),
-                             100.0 * (double) arena_src.hot_hits() / (double) arena_src.hot_lookups(),
-                             (int) (arena_src.hot_bytes() >> 20));
+                             100.0 * (double) arena_src.hot_hits() / (double) arena_src.hot_lookups());
+            // R7: re-dump the routing histogram after every request.  A resident engine that is killed rather
+            // than quit never reaches the exit hook, and the routing trace is the most expensive datum to
+            // re-collect - so it is checkpointed where losing it is cheap.
+            dump_routing_files(o.dump_counts, "", drive.d.usage_total, g.n_layers, g.n_expert);
         }
+        // R7: a resident run is exactly the workload a profile should be derived from, so the one-shot path's
+        // dump is available here too - this is where `--dump-routing` earns its keep.
+        dump_routing_files(o.dump_counts, o.dump_profile, drive.d.usage_total, g.n_layers, g.n_expert);
         return 0;
     }
 
@@ -2576,7 +2710,8 @@ int main(int argc, char** argv) {
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        if (!o.dump_profile.empty()) drive.d.usage_total.assign((size_t) (g.n_layers * g.n_expert), 0ull);
+        if (!o.dump_profile.empty() || !o.dump_counts.empty())
+            drive.d.usage_total.assign((size_t) (g.n_layers * g.n_expert), 0ull);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;
@@ -2957,34 +3092,9 @@ int main(int argc, char** argv) {
 
     if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
 
-    // ---- R5: rank THIS run's actual routing into a STRP profile (read_expert_profile's format).  The
-    // cumulative counters were filled by the dispatchers whenever `usage_total` was sized below.
-    if (!o.dump_profile.empty() && (int64_t) drive.d.usage_total.size() == g.n_layers * g.n_expert) {
-        std::vector<std::pair<uint64_t, int64_t>> rank;
-        rank.reserve(drive.d.usage_total.size());
-        for (size_t i = 0; i < drive.d.usage_total.size(); ++i)
-            if (drive.d.usage_total[i] > 0) rank.emplace_back(drive.d.usage_total[i], (int64_t) i);
-        std::sort(rank.begin(), rank.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-        const uint32_t n_ranked = (uint32_t) std::min<size_t>(rank.size(), 24000);
-        std::FILE* f = std::fopen(o.dump_profile.c_str(), "wb");
-        if (f != nullptr) {
-            const uint32_t hdr[5] = {0, (uint32_t) g.n_layers, (uint32_t) g.n_expert,
-                                     n_ranked,   // built for as many slots as it ranks
-                                     n_ranked};
-            std::fwrite("STRP", 1, 4, f);
-            std::fwrite(hdr, 4, 5, f);
-            for (uint32_t i = 0; i < n_ranked; ++i) {
-                const uint16_t pair[2] = {(uint16_t) (rank[i].second / g.n_expert),
-                                          (uint16_t) (rank[i].second % g.n_expert)};
-                std::fwrite(pair, 2, 2, f);
-            }
-            std::fclose(f);
-            std::fprintf(stderr, "strata generate: dumped profile %s: %u ranked pairs of %zu touched\n",
-                         o.dump_profile.c_str(), n_ranked, rank.size());
-        } else {
-            std::fprintf(stderr, "strata generate: cannot write --dump-profile %s\n", o.dump_profile.c_str());
-        }
-    }
+    // ---- R5/R7: rank THIS run's actual routing into a STRP profile, and/or persist the raw counts.
+    // The cumulative counters were filled by the dispatchers whenever `usage_total` was sized below.
+    dump_routing_files(o.dump_counts, o.dump_profile, drive.d.usage_total, g.n_layers, g.n_expert);
 
     strata::core::session_graphs_free(gr);
     strata::core::doorbell_free(db);
