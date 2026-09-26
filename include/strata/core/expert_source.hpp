@@ -25,8 +25,10 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::core {
@@ -57,6 +59,11 @@ public:
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
+    /// R5-fetch: read the whole blob for `(layer, expert)` into `dst` (which the caller sizes to at least
+    /// `blob_bytes(layer)`), by-passing the mapped pointer.  A file-backed arena answers with one sequential
+    /// `pread` (the drive's own throughput) or a memcpy when the hot tier holds the blob; a resident arena
+    /// memcpy's.  Returns the bytes read, or -1 when the source cannot (the caller then uses `blob()`).
+    virtual int64_t read_blob(int64_t layer, int64_t expert, void* dst) { (void) expert; (void) dst; (void) layer; return -1; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
 };
@@ -210,6 +217,9 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// R5: cumulative routed counts per (layer, expert), never decayed - what `--dump-profile` ranks into a
+    /// STRP profile built from THIS model's actual routing on THIS machine.
+    std::vector<uint64_t> usage_total;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
@@ -323,6 +333,34 @@ public:
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err);
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
+    /// R5-prefetch: called with a layer's routing ids before the pool drains.  For every requested blob that
+    /// the hot tier does not already hold, submit one whole-blob readahead (`posix_fadvise WILLNEED`) so the
+    /// pages stream in at the drive's sequential rate while the GPU runs this layer's hits - instead of the
+    /// pool faulting 4 KiB at a time from a cold drive inside the drain.
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// Blobs the prefetch has submitted since startup.
+    int64_t prefetched() const { return prefetched_; }
+    /// Small-RAM machines: back the native-pack arena with `<pack_dir>/experts-native.bin` (mmap, MAP_SHARED).
+    /// The first run materializes the blobs from the GGUF shards into the file; later runs page in lazily
+    /// and the kernel's page cache holds whatever fits.  No cudaHostRegister (the PCIe alias path is off).
+    void set_file_backing(bool on) { file_backing_ = on; }
+    /// **SMALL-RAM MACHINES: PIN THE HOT EXPERTS IN RAM.**  A file-backed arena cannot hold tens of GiB of
+    /// experts on a 30 GiB box, and the docs above say exactly why the mapped form is the A/B arm: file-backed
+    /// pages are the first thing the OS reclaims, so the expert stream keeps re-faulting from disk.  This gives
+    /// the tier the machine CAN afford: an anonymous arena holding the `ranked` profile's hottest blobs,
+    /// `mlock`ed so neither reclaim nor a prompt's full pass over the expert set can evict them.  Routing is
+    /// heavily skewed (`--expert-cache-per-layer` measures 21.4% hits in 8 slots/layer, 70.4% in 64), so the
+    /// top slice carries most of the traffic and the residual SSD reads are what is left.  Call after `open`.
+    void pin_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t bytes);
+    /// Bytes actually pinned by `pin_hot`, and how many blobs that is.
+    uint64_t hot_bytes() const { return hot_used_; }
+    int64_t hot_blobs() const { return hot_count_; }
+    /// Whether the tier is doing anything: served / total `blob()` calls since startup.
+    int64_t hot_hits() const { return hot_hits_; }
+    int64_t hot_lookups() const { return hot_lookups_; }
+    /// R5-fetch: read the whole blob into `dst` - one sequential `pread` out of the file, or a memcpy when
+    /// the hot tier holds it.  -1 when this source cannot (a resident arena has no file to read).
+    int64_t read_blob(int64_t layer, int64_t expert, void* dst) override;
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -349,6 +387,35 @@ private:
     double gib_per_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
+    bool file_backing_ = false;
+    void* file_map_ = nullptr;       ///< the mmap of experts-native.bin (file_backing_ path)
+    uint64_t file_map_bytes_ = 0;
+    int file_fd_ = -1;
+    uint8_t* hot_arena_ = nullptr;   ///< the anonymous pinned arena for the profile's hottest blobs
+    uint64_t hot_cap_ = 0, hot_used_ = 0;
+    int64_t hot_count_ = 0;
+    int64_t hot_hits_ = 0, hot_lookups_ = 0;
+    bool hot_locked_ = false;
+    std::vector<int64_t> hot_slot_;  ///< per blob index: byte offset in hot_arena_, or -1 when not pinned
+    int64_t prefetched_ = 0;         ///< R5-prefetch: whole-blob WILLNEED submissions since startup
+    std::vector<uint8_t> pf_seen_;   ///< per-call dedupe scratch, sized n_expert_
+
+    // ---- R5-fetch: the pread ring + reader pool -------------------------------------------------------------
+    static constexpr int kRingSlots = 64;
+    struct PfJob { int64_t idx; int slot; uint64_t off, len; };
+    std::vector<std::vector<uint8_t>> ring_;   ///< per slot: one whole blob (largest layer's bytes)
+    std::vector<int64_t> ring_of_;             ///< blob index -> ring slot for the CURRENT layer, else -1
+    std::vector<PfJob> pf_jobs_;
+    std::vector<std::thread> pf_workers_;
+    std::atomic<uint32_t> pf_epoch_{0}, pf_done_{0}, pf_head_{0}, pf_njobs_{0}, pf_parked_{0};
+    std::atomic<bool> pf_stop_{false};
+    // R5b: parked readers BLOCK on this condvar instead of spinning - ten threads spinning PAUSE on a
+    // 12-core part steal SMT issue slots from the twelve compute workers and measurably slow the drain.
+    std::mutex pf_mu_;
+    std::condition_variable pf_cv_;
+    int64_t ring_layer_ = -1;
+    bool pf_started_ = false;
+    void pf_worker();              ///< R5-fetch: one of the four pread threads
 };
 
 }  // namespace strata::core

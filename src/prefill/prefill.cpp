@@ -458,18 +458,30 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
-                        const uint8_t* b = m.src->blob(l, e);
-                        if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (m.src->pinned(l, e)) {
-                            // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
-                            cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                            ++stats_.experts_dma;
-                        } else {
-                            if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
+                        // R5-fetch: take the blob WHOLE into the staging buffer with one sequential read out
+                        // of the source's file (or a memcpy out of its hot tier).  The old path memcpy'd from
+                        // the mapped pointer, which faults the blob 4 KiB at a time and measured ~23 ms per
+                        // blob on this class of drive - the pipeline here was staging-bound, not drive-bound.
+                        // `blob()` (and its faulting) is now only the fallback for sources without a file.
+                        if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
+                        if (m.src->read_blob(l, e, m.stage_host[sl]) < 0) {
+                            const uint8_t* b = m.src->blob(l, e);
+                            if (!b) { err = "prefill: expert source has no blob"; return false; }
+                            if (m.src->pinned(l, e)) {
+                                // DMA straight from the page-locked arena: the copy stream only waits for the slot
+                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                ++stats_.experts_dma;
+                                cudaEventRecord(m.copied[sl], m.copy);
+                                m.stage_live[sl] = true;
+                                stage_of[j] = sl;
+                                stats_.ms_experts_host += ms_since(th);
+                                ++stats_.experts_streamed;
+                                return true;
+                            }
                             std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
-                            cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                         }
+                        cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                         cudaEventRecord(m.copied[sl], m.copy);
                         m.stage_live[sl] = true;
                         stage_of[j] = sl;
