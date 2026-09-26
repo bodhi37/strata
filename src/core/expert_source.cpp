@@ -796,7 +796,7 @@ void ArenaExpertSource::close() {
     ring_layer_ = -1;
     if (hot_arena_ != nullptr) {
 #if !defined(_WIN32)
-        if (hot_locked_ && hot_used_ > 0) ::munlock(hot_arena_, (size_t) hot_used_);
+        if (hot_locked_ && hot_cap_ > 0) ::munlock(hot_arena_, (size_t) hot_cap_);
         ::munmap(hot_arena_, (size_t) hot_cap_);
 #endif
         hot_arena_ = nullptr;
@@ -804,6 +804,12 @@ void ArenaExpertSource::close() {
         hot_count_ = 0;
         hot_locked_ = false;
         hot_slot_.clear();
+        dc_slot_bytes_ = 0;
+        dc_slots_ = 0;
+        dc_head_ = dc_tail_ = -1;
+        dc_prev_.clear(); dc_next_.clear(); dc_idx_.clear(); dc_epoch_.clear();
+        dc_free_.clear(); dc_admit_list_.clear();
+        dc_admits_ = dc_evicts_ = dc_fallbacks_ = 0;
     }
     if (file_map_ != nullptr) {
 #if !defined(_WIN32)
@@ -861,6 +867,8 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         return;
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (lay.n_expert <= 0 || lay.n_layers <= 0) return;
+    // R8: the tier is dynamic (LRU with profile-seeded contents) unless the A/B arm asks for the static form.
+    dynamic_tier_ = (std::getenv("STRATA_STATIC_TIER") == nullptr);
 #if !defined(_WIN32)
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
@@ -879,7 +887,14 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
     //     time and left 12-20 GiB of useless page cache behind.  It now `pread`s whole blobs into the tier
     //     directly: one syscall per blob at the drive's own rate, and nothing is left in the page cache for
     //     the kernel to evict the hot set in favour of.
-    const uint64_t cap = (bytes + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+    //
+    // R8: the arena is carved into FIXED SLOTS of the largest blob (4 KiB-rounded).  Blob sizes are uniform
+    // across this pack's layers to ~1% (measured: 5,318 disk blobs / 11.57 GB = 2.176 MB average against a
+    // 2.18 MB max), so the per-slot waste is negligible, and fixed slots make admission, eviction and the LRU
+    // O(1) array walks - no allocator, no fragmentation, and a freed slot holds any layer's next blob.
+    const uint64_t slot = ((uint64_t) lay.max_blob + 4095u) / 4096u * 4096u;
+    const uint64_t cap = bytes / slot * slot;
+    if (cap == 0) { note_ += "; hot tier skipped (bytes below one slot)"; return; }
     void* m = ::mmap(nullptr, (size_t) cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) {
         note_ += "; hot tier NOT allocated (mmap of " + std::to_string(cap) + " B failed)";
@@ -888,16 +903,22 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
     hot_arena_ = (uint8_t*) m;
     hot_cap_ = cap;
     const bool huge = (::madvise(m, (size_t) cap, MADV_HUGEPAGE) == 0);
+    dc_init((int64_t) slot);
     hot_slot_.assign((size_t) blobs_, -1);
+    // R8: lock the WHOLE arena up front, not just the filled part: pages faulted later by an LRU admission
+    // inherit VM_LOCKED from the VMA, but only if the range was mlocked - locking after the fill (the R7
+    // order) would leave every admission page reclaimable, exactly what the tier exists to prevent.
+    if (dynamic_tier_) hot_locked_ = (::mlock(hot_arena_, (size_t) hot_cap_) == 0);
     for (const auto& pr : ranked) {
+        if (hot_count_ >= dc_slots_) break;   // the arena is full of whole slots
         const int32_t l = pr.first, e = pr.second;
         if (l < 0 || e < 0 || l >= lay.n_layers || e >= lay.n_expert) continue;
         const int64_t idx = (int64_t) l * n_expert_ + (int64_t) e;
         if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] >= 0) continue;
         const uint64_t len = lay.blob_bytes(l);
         const uint64_t off = lay.blob_offset(l, e);
-        if (len == 0 || off + len > file_map_bytes_ || hot_used_ + len > hot_cap_) break;
-        uint8_t* dst = hot_arena_ + hot_used_;
+        if (len == 0 || off + len > file_map_bytes_ || len > dc_slot_bytes_) break;
+        uint8_t* dst = hot_arena_ + (uint64_t) hot_count_ * dc_slot_bytes_;
         bool ok = false;
         if (file_fd_ >= 0) {
             uint64_t done = 0;
@@ -912,8 +933,16 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
             ok = true;
         }
         if (!ok) break;
-        hot_slot_[(size_t) idx] = (int64_t) hot_used_;
-        hot_used_ += len;
+        // R8: rank order IS the initial LRU order - rank 0 at the head (evicted last), the rank cutoff at
+        // the tail, so a domain shift evicts the coldest profile blobs first.
+        const int32_t s = (int32_t) hot_count_;
+        dc_idx_[(size_t) s] = (int32_t) idx;
+        dc_epoch_[(size_t) s] = 0;
+        dc_prev_[(size_t) s] = dc_tail_;
+        dc_next_[(size_t) s] = -1;
+        if (dc_tail_ >= 0) dc_next_[(size_t) dc_tail_] = s; else dc_head_ = s;
+        dc_tail_ = s;
+        hot_slot_[(size_t) idx] = (int64_t) ((uint64_t) s * dc_slot_bytes_);
         ++hot_count_;
         // **AND GIVE THE FILE PAGES BACK.**  A `pread` of a blob leaves that blob in the page cache, so filling
         // a 20 GiB tier would otherwise leave 20 GiB of page cache behind - for pages this tier now serves from
@@ -921,23 +950,94 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         // difference between a hot tier that can be grown and one that cannot.
         if (file_fd_ >= 0) ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
     }
-    if (hot_used_ == 0) {
+    for (int64_t s = hot_count_; s < dc_slots_; ++s) dc_free_.push_back((int32_t) s);
+    if (hot_count_ == 0) {
         ::munmap(hot_arena_, (size_t) hot_cap_);
         hot_arena_ = nullptr; hot_cap_ = 0; hot_slot_.clear();
         note_ += "; hot tier empty";
         return;
     }
-    if (hot_used_ < hot_cap_) {   // give the unused tail back to the kernel
+    hot_used_ = (uint64_t) hot_count_ * dc_slot_bytes_;
+    if (!dynamic_tier_ && hot_used_ < hot_cap_) {   // static A/B: the free tail has no future, give it back
         ::munmap(hot_arena_ + hot_used_, (size_t) (hot_cap_ - hot_used_));
         hot_cap_ = hot_used_;
+        dc_slots_ = (int64_t) hot_count_;
     }
-    hot_locked_ = (::mlock(hot_arena_, (size_t) hot_used_) == 0);
+    if (!dynamic_tier_) hot_locked_ = (::mlock(hot_arena_, (size_t) hot_used_) == 0);
 #endif
-    char buf[352];
-    std::snprintf(buf, sizeof buf, "; hot tier %.2f GiB in %lld blobs from the profile%s (THP %s)",
+    char buf[420];
+    std::snprintf(buf, sizeof buf,
+                  "; hot tier %.2f GiB in %lld blobs from the profile%s%s (THP %s, slot %.2f MiB, %lld slots, %lld free)",
                   (double) hot_used_ / 1073741824.0, (long long) hot_count_,
-                  hot_locked_ ? " (mlocked)" : " (mlock FAILED - reclaimable)", huge ? "on" : "off");
+                  hot_locked_ ? " (mlocked)" : " (mlock FAILED - reclaimable)",
+                  dynamic_tier_ ? ", LRU adaptive" : ", static", huge ? "on" : "off",
+                  (double) dc_slot_bytes_ / 1048576.0, (long long) dc_slots_,
+                  (long long) dc_free_.size());
     note_ += buf;
+}
+
+// ---- R8: the adaptive LRU tier ---------------------------------------------------------------------------
+
+void ArenaExpertSource::dc_init(int64_t slot_bytes) {
+    dc_slot_bytes_ = (uint64_t) slot_bytes;
+    dc_slots_ = hot_cap_ > 0 ? (int64_t) (hot_cap_ / dc_slot_bytes_) : 0;
+    dc_prev_.assign((size_t) dc_slots_, -1);
+    dc_next_.assign((size_t) dc_slots_, -1);
+    dc_idx_.assign((size_t) dc_slots_, -1);
+    dc_epoch_.assign((size_t) dc_slots_, 0);
+    dc_free_.clear();
+    dc_head_ = dc_tail_ = -1;
+    dc_admit_list_.clear();
+    dc_admits_ = dc_evicts_ = dc_fallbacks_ = 0;
+}
+
+void ArenaExpertSource::dc_unlink(int32_t s) {
+    const int32_t p = dc_prev_[(size_t) s], n = dc_next_[(size_t) s];
+    if (p >= 0) dc_next_[(size_t) p] = n; else dc_head_ = n;
+    if (n >= 0) dc_prev_[(size_t) n] = p; else dc_tail_ = p;
+    dc_prev_[(size_t) s] = dc_next_[(size_t) s] = -1;
+}
+
+void ArenaExpertSource::dc_link_head(int32_t s) {
+    dc_prev_[(size_t) s] = -1;
+    dc_next_[(size_t) s] = dc_head_;
+    if (dc_head_ >= 0) dc_prev_[(size_t) dc_head_] = s;
+    dc_head_ = s;
+    if (dc_tail_ < 0) dc_tail_ = s;
+}
+
+void ArenaExpertSource::dc_touch(int32_t s) {
+    if (s < 0 || s >= (int32_t) dc_slots_) return;
+    if (dc_head_ == s) { dc_epoch_[(size_t) s] = window_epoch_; return; }
+    dc_unlink(s);
+    dc_link_head(s);
+    dc_epoch_[(size_t) s] = window_epoch_;
+}
+
+int32_t ArenaExpertSource::dc_alloc(int64_t idx) {
+    int32_t s;
+    if (!dc_free_.empty()) {
+        s = dc_free_.back();
+        dc_free_.pop_back();
+    } else {
+        // Evict from the LRU tail.  Slots touched in the CURRENT window are skipped: they are this window's
+        // own admissions and hits, and evicting one would drop bytes the same window is still using.
+        s = -1;
+        for (int32_t v = dc_tail_; v >= 0; v = dc_prev_[(size_t) v]) {
+            if (dc_epoch_[(size_t) v] != window_epoch_) { s = v; break; }
+        }
+        if (s < 0) return -1;   // every slot is in use by this window: fall back to the legacy ring
+        const int64_t vidx = dc_idx_[(size_t) s];
+        if (vidx >= 0 && vidx < (int64_t) hot_slot_.size()) hot_slot_[(size_t) vidx] = -1;
+        ++dc_evicts_;
+        // NO explicit unlink here: `dc_touch` below unlinks the victim (it is still in the list) and relinks
+        // it at the head.  Unlinking twice corrupts the intrusive list - the second unlink reads the -1
+        // sentinels and sets head = tail = -1, which silently collapses the LRU to one slot and every later
+        // allocation evicts nothing (measured: 394 admissions against 16,671 ring fallbacks).
+    }
+    dc_idx_[(size_t) s] = (int32_t) idx;
+    dc_touch(s);
+    return s;
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
@@ -947,20 +1047,22 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (idx < 0 || idx >= blobs_) return nullptr;
     ++reads_;
     ++blob_stats_.requests;
+    // R8: the hot tier is checked FIRST.  An admission is committed here in `wait_layer`, before the pass-1
+    // `blob()` calls run - and a committed blob must NOT fall through to the ring check, because its ring
+    // slot (when it has one at all) is the legacy staging buffer, not the memory its bytes were read into.
+    if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+        ++hot_lookups_;
+        ++hot_hits_;
+        ++blob_stats_.hot;
+        if (dc_slots_ > 0) dc_touch((int32_t) ((uint64_t) hot_slot_[(size_t) idx] / dc_slot_bytes_));
+        return hot_arena_ + hot_slot_[(size_t) idx];
+    }
     // R5-fetch: the ring serves THIS layer's pread misses (see begin_layer); `ring_layer_` pins the validity
     // to the layer the reads were issued for, so a later `blob()` (the profile fill, prefill's staging) can
     // never see a previous layer's bytes.
     if (layer == ring_layer_ && (int64_t) ring_of_.size() == blobs_ && ring_of_[(size_t) idx] >= 0) {
         ++blob_stats_.ring;
         return ring_[(size_t) ring_of_[(size_t) idx]].data();
-    }
-    if (!hot_slot_.empty()) {
-        ++hot_lookups_;
-        if (hot_slot_[(size_t) idx] >= 0) {
-            ++hot_hits_;
-            ++blob_stats_.hot;
-            return hot_arena_ + hot_slot_[(size_t) idx];
-        }
     }
     // R7: the fall-through is a fault on the file mapping.  If the page is in the page cache it is a DRAM read;
     // if not, the kernel goes to the drive for it, 4 KiB at a time.  This is the path the R5 pread ring exists
@@ -973,6 +1075,32 @@ ArenaExpertSource::BlobStats ArenaExpertSource::take_blob_stats() {
     BlobStats s = blob_stats_;
     blob_stats_ = BlobStats{};
     return s;
+}
+
+// R8: the stats-free core of `read_blob`, safe to call from several staging readers at once.  A tier-resident
+// blob memcpy's out of the locked arena (read-only); anything else is one whole-blob `pread` out of the file.
+int64_t ArenaExpertSource::read_blob_raw(int64_t layer, int64_t expert, void* dst) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return -1;
+    if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+        std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
+        return (int64_t) len;
+    }
+    if (file_fd_ < 0 || file_map_ == nullptr) return -1;
+    const uint64_t off = lay.blob_offset(layer, expert);
+    if (off + len > file_map_bytes_) return -1;
+    uint8_t* p = (uint8_t*) dst;
+    uint64_t done = 0;
+    while (done < len) {
+        const ssize_t r = ::pread(file_fd_, p + done, (size_t) (len - done), (off_t) (off + done));
+        if (r <= 0) return -1;
+        done += (uint64_t) r;
+    }
+    return (int64_t) len;
 }
 
 // R5-fetch: read one whole blob into `dst`.  The hot tier memcpy's out of the locked arena; the file-backed
@@ -990,20 +1118,12 @@ int64_t ArenaExpertSource::read_blob(int64_t layer, int64_t expert, void* dst) {
         ++prefetched_;
         return (int64_t) len;
     }
-    if (file_fd_ < 0 || file_map_ == nullptr) return -1;
-    const uint64_t off = lay.blob_offset(layer, expert);
-    if (off + len > file_map_bytes_) return -1;
-    uint8_t* p = (uint8_t*) dst;
-    uint64_t done = 0;
-    while (done < len) {
-        const ssize_t r = ::pread(file_fd_, p + done, (size_t) (len - done), (off_t) (off + done));
-        if (r <= 0) return -1;
-        done += (uint64_t) r;
-    }
+    const int64_t r = read_blob_raw(layer, expert, dst);
+    if (r < 0) return -1;
     ++prefetched_;
     ++blob_stats_.disk;
     blob_stats_.disk_bytes += (int64_t) len;
-    return (int64_t) len;
+    return r;
 }
 
 // R5-fetch: the persistent reader threads.  The protocol is ExpertPool's (pool.cpp): a worker counts itself
@@ -1075,6 +1195,7 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
     }
     ring_layer_ = layer;
     ring_waiting_ = false;
+    dc_admit_list_.clear();
     int n = 0, njobs = 0;                  // n = blobs claimed, njobs = sub-reads published
     int64_t miss_bytes = 0;
     ++blob_stats_.calls;
@@ -1084,14 +1205,31 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
         pf_seen_[(size_t) e] = 1;
         ++blob_stats_.entries;
         const int64_t idx = layer * n_expert_ + e;
-        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) { ++blob_stats_.hot_skips; continue; }   // the hot tier answers this one
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+            // R8: a resident expert must not keep a stale ring claim from an earlier window - with the
+            // dynamic tier an expert CAN become resident between windows, and a stale `ring_of_` would both
+            // misroute it to pass 1 and (once the slot is reused by another layer) serve the WRONG BYTES.
+            ring_of_[(size_t) idx] = -1;
+            ++blob_stats_.hot_skips;
+            continue;
+        }
         const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
         if (len == 0 || off + len > file_map_bytes_) continue;
         const int slot = n++;
-        // R7: publish the blob as `kSplit` concurrent sub-reads so the drive sees a real queue depth.  The
-        // chunks are appended in blob order, so the first blob's chunks claim the first workers and every blob
-        // gets its pieces in flight at once rather than behind the previous blob's.
+        // R8: **THE RING READ LANDS DIRECTLY IN AN LRU SLOT.**  A miss is admitted to the tier before the
+        // read is issued, so the commit in `wait_layer` is one pointer publish - not a 2.2 MB copy per miss
+        // per layer.  The LRU epoch is stamped at allocation, so a later claim in the SAME begin_layer call
+        // can never evict an earlier one, and no victim can be a blob this window is still using.
         uint8_t* dst = ring_[(size_t) slot].data();
+        if (dc_slots_ > 0) {
+            const int32_t dc = dc_alloc(idx);
+            if (dc >= 0) {
+                dst = hot_arena_ + (uint64_t) dc * dc_slot_bytes_;
+                dc_admit_list_.push_back(((int64_t) dc << 32) | (int64_t) (uint32_t) idx);
+            } else {
+                ++dc_fallbacks_;   // every slot touched this window: legacy ring, no admission
+            }
+        }
         // kSplit 1 must be exactly one read of the whole blob - `kChunk` only caps the SPLIT case.  Getting
         // this wrong left the engine issuing five 512 KiB reads per blob, which measured 8.5 tok/s against
         // 10.7 for the whole-blob form.
@@ -1210,11 +1348,25 @@ void ArenaExpertSource::pf_record_miss(int64_t idx) {
 }
 
 void ArenaExpertSource::wait_layer() {
-    if (!ring_waiting_) return;
-    const int n = pf_jobs_active_;
-    while (pf_done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
-    prefetched_ += n;
-    ring_waiting_ = false;
+    if (ring_waiting_) {
+        const int n = pf_jobs_active_;
+        while (pf_done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
+        prefetched_ += n;
+        ring_waiting_ = false;
+    }
+    // R8: commit this layer's admissions.  The reads are confirmed landed, so publishing the slot offsets
+    // now turns every one of them into a RAM hit for the rest of the session - and every `blob()` after
+    // this point (the pass-1 dispatch) serves the tier copy, never the ring.
+    if (!dc_admit_list_.empty()) {
+        for (const int64_t v : dc_admit_list_) {
+            const int32_t s = (int32_t) ((uint64_t) v >> 32);
+            const int64_t idx = (int64_t) (int32_t) ((uint64_t) v & 0xffffffffu);
+            if (s < 0 || s >= (int32_t) dc_slots_ || idx < 0 || idx >= (int64_t) hot_slot_.size()) continue;
+            hot_slot_[(size_t) idx] = (int64_t) ((uint64_t) s * dc_slot_bytes_);
+            ++dc_admits_;
+        }
+        dc_admit_list_.clear();
+    }
 }
 
 // R7: is `(layer, expert)`'s blob one of the reads this layer submitted to the ring?
