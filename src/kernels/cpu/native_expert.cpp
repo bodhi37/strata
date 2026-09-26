@@ -99,6 +99,15 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    // R10: IQ4_NL's down projection is the biggest shared cost across all three quants, and ggml-cpu's
+    // kernel re-decodes the nibble LUT once PER TOKEN.  The AVX-512 multi-token kernel decodes once per
+    // block and applies every token with one load/sign/maddubs/madd - measured 3x at nt=5 on the kernel
+    // bench, identical per-block integers, float-order-only differences (same class the gu path carries).
+    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    if (avx512 && nt >= 2 && f.d_type == 20) {   // GGML_TYPE_IQ4_NL
+        iq4nl_rows_multi(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {

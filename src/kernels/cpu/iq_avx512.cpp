@@ -96,6 +96,9 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
 template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-bit sign index + 4-bit scale)
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
+    // R10 note: a vpgatherdd variant of this decode was tried and REVERTED - neutral at nt<=3 and 15% SLOWER
+    // at nt=5 (register pressure against the five token accumulators).  Zen 5's gather does not beat 16
+    // scalar L1 lookups here.  Measured dead end; do not retry without a profiler saying otherwise.
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const uint8_t* q = b + 2 + 16 * j;
         g = _mm512_set_epi32((int) iq3xxs_grid[q[15]], (int) iq3xxs_grid[q[14]], (int) iq3xxs_grid[q[13]], (int) iq3xxs_grid[q[12]],
@@ -214,6 +217,53 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 }
 
 }  // namespace
+
+// ---- R10: multi-token IQ4_NL rows (the down projection of every native pack on this box) ----
+//
+// ggml-cpu's AVX2 kernel re-runs the nibble LUT for EVERY token: measured on this machine, one expert's
+// down projection costs 87 us at nt=2 and 212 us at nt=5 - the decode is re-done per token, which is the
+// whole difference.  Here one 32-value block decodes ONCE into |g| and sign(g), and every token costs one
+// load, one vpsignb, one maddubs, one madd.  The per-block integer sums are exact (the same values ggml
+// computes), so the only difference from ggml's kernel is the order of the float additions - the same
+// class of difference the AVX-512 gate/up kernels already carry (measured rel ~1e-7, see native_expert_parity).
+void iq4nl_rows_multi(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
+                      int r0, int r1) {
+    const int nb = n / 32;                 // block_q8_0 / block_iq4_nl: 32 values per block
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    const __m128i lut16 = _mm_loadu_si128((const __m128i*) (const void*) kvalues_iq4nl);
+    const __m256i lut = _mm256_broadcastsi128_si256(lut16);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* wrow = w + (size_t) r * row_bytes;
+        __m256 accv[8];
+        for (int t = 0; t < nt; ++t) accv[t] = _mm256_setzero_ps();
+        for (int ib = 0; ib < nb; ++ib) {
+            const uint8_t* wb = wrow + (size_t) ib * 18;   // block_iq4_nl: fp16 d + 16 packed nibbles
+            const __m128i q4 = _mm_loadu_si128((const __m128i*) (const void*) (wb + 2));
+            const __m128i lo = _mm_and_si128(q4, m4);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(q4, 4), m4);
+            const __m256i g = _mm256_shuffle_epi8(lut, _mm256_set_m128i(hi, lo));   // 32 int8 magnitudes
+            const __m256i ax = _mm256_abs_epi8(g);
+            const __m256i gs = _mm256_sign_epi8(g, g);                             // -1/0/+1 per byte
+            const float dx = h2f(u16(wb));
+            for (int t = 0; t < nt; ++t) {
+                const uint8_t* yb = (const uint8_t*) hq[t] + (size_t) ib * 34;   // block_q8_0: fp16 d + qs[32]
+                const __m256i yv = _mm256_loadu_si256((const __m256i*) (const void*) (yb + 2));
+                const __m256i sy = _mm256_sign_epi8(yv, gs);
+                const __m256i p16 = _mm256_maddubs_epi16(ax, sy);
+                const __m256i p32 = _mm256_madd_epi16(p16, ones);
+                const float dy = h2f(u16(yb));
+                accv[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * dy), _mm256_cvtepi32_ps(p32), accv[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            const __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(accv[t]), _mm256_extractf128_ps(accv[t], 1));
+            const __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            out[t][r] = _mm_cvtss_f32(_mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1)));
+        }
+    }
+}
+
 
 bool iq512_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
