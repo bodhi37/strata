@@ -32,7 +32,7 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
-constexpr int STAGE = 8;           // host->device expert staging ring
+constexpr int STAGE = 12;          // host->device expert staging ring (R8: 12, so ~11 reads stay in flight)
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -111,11 +111,30 @@ struct Prefill::Impl {
     std::vector<uint32_t> ple_rows;
     float* ple_norm = nullptr;
     PrefillStats* stats = nullptr;
+    // ---- R8: the staging reader pool.  Prefill used to pread one blob at a time on the host thread (QD1),
+    // which this drive serves at ~0.67 GB/s; the reads it needs are sequential (the experts are staged in
+    // file-offset order), so a small pool of pread threads at queue depth ~8 gets the drive's real rate.
+    struct RdJob { int64_t layer, expert; uint8_t* dst; std::atomic<bool>* done; std::atomic<int>* status; };
+    std::vector<std::thread> rd_pool_;
+    std::mutex rd_mu_;
+    std::condition_variable rd_cv_, rd_done_cv_;
+    std::vector<RdJob> rd_q_;
+    bool rd_stop_ = false;
+    std::atomic<bool> rd_done_[STAGE] = {};     // per staging slot: its read has landed
+    std::atomic<int> rd_status_[STAGE] = {};    // per staging slot: bytes read, or -1 (the pool cannot read it)
+    bool stage_dma_[STAGE] = {};                // consume H2D's straight from a pinned source pointer
+    const uint8_t* stage_dma_src_[STAGE] = {};
 };
 
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
     if (!impl_) return;
+    {   // R8: stop the reader pool first - its workers touch the source and the staging buffers
+        std::lock_guard<std::mutex> lk(impl_->rd_mu_);
+        impl_->rd_stop_ = true;
+    }
+    impl_->rd_cv_.notify_all();
+    for (auto& t : impl_->rd_pool_) t.join();
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     for (int i = 0; i < STAGE; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
@@ -192,6 +211,28 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(NE); m.off.resize(NE + 1);
     m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) { err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit"; return false; }
+    // R8: the staging readers.  Six pread threads against the staging ring: the submissions run ~11 slots
+    // ahead of the compute, so the drive sits at QD6-8 in file-offset order instead of QD1.
+    {
+        Impl* mm = impl_.get();
+        for (int i = 0; i < 6; ++i)
+            m.rd_pool_.emplace_back([mm]() {
+                for (;;) {
+                    Impl::RdJob j;
+                    {
+                        std::unique_lock<std::mutex> lk(mm->rd_mu_);
+                        mm->rd_cv_.wait(lk, [&] { return mm->rd_stop_ || !mm->rd_q_.empty(); });
+                        if (mm->rd_stop_ && mm->rd_q_.empty()) return;
+                        j = mm->rd_q_.back();
+                        mm->rd_q_.pop_back();
+                    }
+                    const int64_t r = mm->src->read_blob_raw(j.layer, j.expert, j.dst);
+                    j.status->store((int) r, std::memory_order_release);
+                    j.done->store(true, std::memory_order_release);
+                    mm->rd_done_cv_.notify_all();
+                }
+            });
+    }
     return true;
 }
 
@@ -468,6 +509,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
                     std::vector<int> stage_of(order.size(), -1);
+                    // R8: stage_one now only SUBMITS the read to the reader pool (or memcpy/DMA directly when
+                    // the source cannot raw-read); the H2D happens in the consume step below, once the bytes
+                    // for THIS expert have landed.  The loop keeps ~11 reads in flight against the drive
+                    // instead of one.
                     auto stage_one = [&](size_t j) -> bool {
                         const int32_t e = order[j];
                         const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0;
@@ -475,35 +520,60 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
+                        stage_of[j] = sl;
+                        if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
+                        m.rd_done_[sl].store(true, std::memory_order_relaxed);   // replaced below if pooled
+                        m.stage_dma_[sl] = false;
+                        m.stage_dma_src_[sl] = nullptr;
                         // R5-fetch: take the blob WHOLE into the staging buffer with one sequential read out
                         // of the source's file (or a memcpy out of its hot tier).  The old path memcpy'd from
                         // the mapped pointer, which faults the blob 4 KiB at a time and measured ~23 ms per
                         // blob on this class of drive - the pipeline here was staging-bound, not drive-bound.
                         // `blob()` (and its faulting) is now only the fallback for sources without a file.
-                        if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
-                        if (m.src->read_blob(l, e, m.stage_host[sl]) < 0) {
+                        if (m.src->read_blob_raw(l, e, m.stage_host[sl]) >= 0) {
+                            m.rd_done_[sl].store(false, std::memory_order_release);
+                            {
+                                std::lock_guard<std::mutex> lk(m.rd_mu_);
+                                m.rd_q_.push_back({l, e, m.stage_host[sl], &m.rd_done_[sl], &m.rd_status_[sl]});
+                            }
+                            m.rd_cv_.notify_one();
+                        } else {
                             const uint8_t* b = m.src->blob(l, e);
                             if (!b) { err = "prefill: expert source has no blob"; return false; }
                             if (m.src->pinned(l, e)) {
-                                // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                                ++stats_.experts_dma;
-                                cudaEventRecord(m.copied[sl], m.copy);
-                                m.stage_live[sl] = true;
-                                stage_of[j] = sl;
-                                stats_.ms_experts_host += ms_since(th);
-                                ++stats_.experts_streamed;
-                                return true;
+                                m.stage_dma_[sl] = true;                    // DMA straight from the pinned arena
+                                m.stage_dma_src_[sl] = b;
+                            } else {
+                                std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
                             }
-                            std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
                         }
-                        cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                        cudaEventRecord(m.copied[sl], m.copy);
-                        m.stage_live[sl] = true;
-                        stage_of[j] = sl;
                         stats_.ms_experts_host += ms_since(th);
                         ++stats_.experts_streamed;
+                        return true;
+                    };
+                    auto stage_consume = [&](size_t j) -> bool {
+                        const int32_t e = order[j];
+                        const int sl = stage_of[j];
+                        if (sl < 0) return true;   // resident: the device slot is the blob
+                        if (m.stage_dma_[sl]) {
+                            // the copy engine only waits for the slot's previous blob to be dequantized
+                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            cudaMemcpyAsync(m.stage_dev[sl], m.stage_dma_src_[sl], (size_t) lay.blob_bytes(l),
+                                            cudaMemcpyHostToDevice, m.copy);
+                            ++stats_.experts_dma;
+                        } else {
+                            if (!m.rd_done_[sl].load(std::memory_order_acquire)) {
+                                std::unique_lock<std::mutex> lk(m.rd_mu_);
+                                m.rd_done_cv_.wait(lk, [&] {
+                                    return m.rd_done_[sl].load(std::memory_order_acquire);
+                                });
+                            }
+                            if (m.rd_status_[sl].load(std::memory_order_acquire) < 0) return false;
+                            cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l),
+                                            cudaMemcpyHostToDevice, m.copy);
+                        }
+                        cudaEventRecord(m.copied[sl], m.copy);
+                        m.stage_live[sl] = true;
                         return true;
                     };
                     size_t staged = 0;
@@ -513,6 +583,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (!stage_one(staged)) return false;
                             ++staged;
                         }
+                        if (!stage_consume(j)) { err = "prefill: a staging read failed"; return false; }
                         const int32_t e = order[j];
                         const uint8_t* blob_dev = nullptr;
                         if (stage_of[j] < 0) {

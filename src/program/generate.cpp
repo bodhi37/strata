@@ -2310,6 +2310,14 @@ int main(int argc, char** argv) {
                              (long long) bs.win_misses, (long long) bs.win_repeat,
                              bs.win_misses > 0 ? 100.0 * (double) bs.win_repeat / (double) bs.win_misses : 0.0,
                              (long long) bs.win_prefetched);
+                if (arena_src.dynamic_tier() && arena_src.hot_blobs() > 0)
+                    std::fprintf(stderr,
+                                 "strata serve: lru: %lld admitted, %lld evicted, %lld ring-fallback, "
+                                 "%.1f%% of requests served from RAM (hot %lld / %lld)\n",
+                                 (long long) arena_src.dc_admits(), (long long) arena_src.dc_evicts(),
+                                 (long long) arena_src.dc_fallbacks(),
+                                 bs.requests > 0 ? 100.0 * (double) bs.hot / (double) bs.requests : 0.0,
+                                 (long long) bs.hot, (long long) bs.requests);
                 if (win_rounds > 0)
                     std::fprintf(stderr,
                                  "strata serve: mtp: %lld windows, %.2f tokens/window (%.1f%% of %d drafts "
