@@ -334,8 +334,9 @@ class Detokenizer:
 
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
-                 vision: Vision | None = None):
+                 vision: Vision | None = None, sampling_defaults: dict | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -415,6 +416,9 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+        if self.sampling_defaults:     # config defaults; the request's own fields win (explicit 0 stays greedy)
+            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
+            sampling = {**self.sampling_defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -788,6 +792,42 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
+def sampling_defaults_from_config(cfg: dict) -> dict:
+    """The run config's optional `sampling` block (temperature, top_p, top_k, seed): defaults for the fields a
+    request leaves out, so a plain client gets configured sampling instead of greedy.  The request's own fields
+    always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
+    Keys the sampled path does not implement yet (min_p, presence_penalty, repetition_penalty, frequency_penalty)
+    are named at startup and ignored rather than silently dropped; a bad value refuses to start the server -
+    a typo'd config should not quietly change sampling."""
+    out = {}
+    for key, value in (cfg.get("sampling") or {}).items():
+        if value is None:
+            continue
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if key in ("min_p", "presence_penalty", "repetition_penalty", "frequency_penalty"):
+            print(f"[strata] config sampling.{key}={value!r}: the engine's sampled path does not implement it "
+                  f"yet - ignored", flush=True)
+        elif key == "temperature":
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+            out[key] = float(value)
+        elif key == "top_p":
+            if not number or not 0 < value <= 1:
+                raise SystemExit(f"[strata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+            out[key] = float(value)
+        elif key == "top_k":
+            if not number or value != int(value) or not 1 <= value <= 64:
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            out[key] = int(value)
+        elif key == "seed":
+            if not number or value != int(value) or value <= 0:
+                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+            out[key] = int(value)
+        else:
+            print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -828,6 +868,10 @@ def main() -> int:
             ap.error("--engine strata needs --config")
         vision = None
         env = child_env(cfg)
+        sampling_defaults = sampling_defaults_from_config(cfg)
+        if sampling_defaults:
+            pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
+            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
@@ -835,11 +879,12 @@ def main() -> int:
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
     else:
-        engine, vision = MockEngine(tok, a.script), None
+        engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision)
+                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  sampling_defaults=sampling_defaults)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     httpd = serve(svc, host=a.host, port=a.port)
     print(f"ready: http://{a.host}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "

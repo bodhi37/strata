@@ -212,7 +212,9 @@ and pictures. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-ever
 re-reads the other one); images only when set up with them (below); no video. **Temperature / top_p / top_k / seed**
 are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result is not
 reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the engine
-arguments.
+arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
+(`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`); a request's own fields always win, and with no
+block at all a request without sampling keys decodes greedy.
 
 ---
 
