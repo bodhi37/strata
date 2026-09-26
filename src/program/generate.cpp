@@ -1108,7 +1108,10 @@ int main(int argc, char** argv) {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        // R10 P-CHUNK: the prefill buffers are TILE-sized + ~105 KiB/token of chunk state + ~21 KiB/token
+        // of expert-batch scratch (was a flat 680 KiB/token).  ~900 MiB of tile/entry/fixed VRAM is
+        // chunk-independent at the default tile.
+        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 900 + (o.prefill_chunk * 126) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());

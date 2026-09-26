@@ -59,6 +59,12 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// R10: allocate/free the chunk-sized device scratch.  `run` allocates on entry and frees on exit
+    /// (every exit), so a resident server's DECODE is not starved by an idle prefill's gigabytes
+    /// (measured: 16384-token chunk at 359 tok/s, then decode died with 'sample_tokens: out of memory').
+    bool alloc_all(std::string& err);
+    void free_all();
+    bool init_readers();
 
     const PrefillStats& stats() const { return stats_; }
 
