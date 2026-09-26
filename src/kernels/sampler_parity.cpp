@@ -536,6 +536,40 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- fixture 8: THE PENALTY WINDOW IS THE TAIL.  With an 8-entry history and penalty_last_n = 4, only
+    // the LAST four entries count: a token punished in the old half must come back to full strength, and one
+    // punished in the tail half stays down.  The reference counts the same tail; the observability check runs
+    // the reference once more WITHOUT the clamp (counting all 8) and requires the picks to differ.
+    {
+        const int NV4 = 8;
+        strata::kernels::SamplerParams p;
+        p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
+        p.penalty_last_n = 4; p.penalty_repeat = 3.0f; p.penalty_freq = 0.3f; p.penalty_present = 0.5f;
+
+        std::vector<float> l((size_t) NV4, -8.0f);
+        l[0] = 6.0f; l[3] = 6.5f;                       // token 0 leads clean; token 3 is the tail offender
+        std::vector<int> hist = {0, 0, 0, 0, 3, 3, 3, 3};   // token 0 old (out), token 3 in the tail
+
+        auto pick_clamped = [&](bool clamp) {
+            int best = 0; float bv = 0; bool first = true;
+            for (int v = 0; v < NV4; ++v) {
+                int c = 0;
+                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8) + i)] == v) ++c;
+                float logit = l[(size_t) v];
+                if (c > 0) { logit = logit <= 0.0f ? logit * p.penalty_repeat : logit / p.penalty_repeat;
+                             logit -= (float) c * p.penalty_freq + p.penalty_present; }
+                if (first || logit > bv) { bv = logit; best = v; first = false; }
+            }
+            return best;
+        };
+        const int want = pick_clamped(true), unclamped = pick_clamped(false);
+        const bool visible = want != unclamped;
+        std::printf("  %-34s %s (clamped pick %d, full-history pick %d)\n",
+                    "penalty window clamp is observable", visible ? "yes" : "*** NO ***", want, unclamped);
+        if (!visible) ++bad;
+        else bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);
+    }
+
     // A continuous stream and individual decode calls consume the same draw counters.
     {
         constexpr int count = 32, vocab = 16;

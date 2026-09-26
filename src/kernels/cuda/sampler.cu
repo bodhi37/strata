@@ -101,12 +101,32 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         hrow += history_len - hlen;          // the window is the TAIL
     }
 
+    // PENALTY MEMBERSHIP AS A BITMAP.  The history touches at most `hlen` tokens of a quarter-million
+    // vocabulary, but the naive `history_count` per candidate per argmax round costs O(k x n_vocab x hlen)
+    // integer compares (~318 M per token at k=20, hlen=64 - measured 45 -> 31 tok/s on a real workload).
+    // A shared bitmap gives an O(1) membership test, and only the (at most hlen) hits pay the count scan;
+    // the counts - and therefore every sampled value - are exactly what the per-candidate scan produced.
+    extern __shared__ unsigned int penal_bits[];
+    const int bits_words = (int) ((n_vocab + 31) / 32);
+    const bool use_bits = hrow != nullptr && bits_words > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
+            if (hrow[i] >= 0) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
+        __syncthreads();
+    }
+    auto hit_count = [&](int v) -> int {
+        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        return history_count(hrow, hlen, v);
+    };
+
     // `n_vocab` is the "no candidate" index: it loses every comparison to a real one, so a thread with no
     // elements contributes nothing rather than contributing a bogus zero.
     float bv = __int_as_float(0xff800000);   // -inf
     int best = n_vocab;
     for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-        const float s = apply_penalties(l[v], hrow ? history_count(hrow, hlen, v) : 0, p);
+        const float s = apply_penalties(l[v], hit_count(v), p);
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -167,6 +187,22 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         hrow += history_len - hlen;          // the window is the TAIL
     }
 
+    // the membership bitmap, as in `sampler_greedy_kernel` - see the cost note there
+    extern __shared__ unsigned int penal_bits[];
+    const int bits_words = (int) ((n_vocab + 31) / 32);
+    const bool use_bits = hrow != nullptr && bits_words > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
+            if (hrow[i] >= 0) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
+        __syncthreads();
+    }
+    auto hit_count = [&](int v) -> int {
+        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        return history_count(hrow, hlen, v);
+    };
+
     const int KMAX = 64;
     int k = p.top_k > 0 ? (p.top_k < KMAX ? p.top_k : KMAX) : 0;
     if (k <= 0) {
@@ -192,7 +228,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             bool taken = false;
             for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
             if (taken) continue;
-            const float s = apply_penalties(l[v], hrow ? history_count(hrow, hlen, v) : 0, p);
+            const float s = apply_penalties(l[v], hit_count(v), p);
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -248,7 +284,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         n_keep = cut;
     }
     auto scaled = [&](int i) {
-        return apply_penalties(sel_logit[i] * inv_t, hrow ? history_count(hrow, hlen, sel_ids[i]) : 0, p);
+        return apply_penalties(sel_logit[i] * inv_t, hit_count(sel_ids[i]), p);
     };
     float smx = scaled(0);
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, scaled(i));
@@ -274,15 +310,18 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                      p.penalty_last_n, (const void*) history, history_len);
         std::exit(1);
     }
+    const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
+                               ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
+                               : 0;
     if (p.greedy || p.temperature <= 0.0f) {
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, 0, (cudaStream_t) stream>>>(
+        sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, 0, (cudaStream_t) stream>>>(
+        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
             logits, n_vocab, n_tokens, history, history_len, p, out);
     }
     const cudaError_t e = cudaGetLastError();
