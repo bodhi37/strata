@@ -447,6 +447,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
                     std::vector<int32_t> order;
                     for (int32_t e = 0; e < NE; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
+                    // R6: process the experts in FILE-OFFSET order.  The staging stream reads one blob at a
+                    // time on the host thread (QD1), so the drive only ever reaches its random-2.6 MB rate -
+                    // 716 MB/s measured on a 327-token prefill, a full 61 GB arena sweep at 85 s.  Sorted by
+                    // offset the same QD1 stream is sequential and runs at the drive's advertised rate; the
+                    // per-expert rows are independent (moe_combine addresses them through slot_dev), so the
+                    // processing order is free.  Resident blobs cost no read either way.
+                    {
+                        const strata::kernels::cpu::ExpertLayout& lay_sort = strata::kernels::cpu::expert_layout();
+                        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+                            return lay_sort.blob_offset(l, a) < lay_sort.blob_offset(l, b);
+                        });
+                    }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
