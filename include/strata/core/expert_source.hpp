@@ -96,6 +96,10 @@ public:
     virtual void prefetch(int64_t layer, const int32_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// R9b: can this source feed the GPU's PCIe expert path at all?  The plan builder needs a cheap per-layer
+    /// gate that does not depend on one arbitrary expert being resident (the old test,
+    /// `device_alias(layer, 0) != nullptr`, flapped per layer with an LRU tier).
+    virtual bool pcie_ready() const { return device_alias(0, 0) != nullptr; }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -450,6 +454,7 @@ public:
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    bool pcie_ready() const override { return file_map_ != nullptr ? hot_dev_ok_ : !dev_slice_.empty(); }
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -506,6 +511,15 @@ private:
     /// R7: inclusive source counters; see `BlobStats`.
     BlobStats blob_stats_{};
     bool hot_locked_ = false;
+    // ---- R9b: THE GPU's PCIe EXPERT PATH READS THE TIER.  Upstream's 95 tok/s comes from the GPU computing
+    // its share of every layer's experts (the default --pcie-frac 0.55) - but that path requires the blob's
+    // host memory to be REGISTERED (cudaHostRegister), and the mmap arena variant never registered anything,
+    // so `pinned()`/`device_alias()` were permanently false/null and decode ran 100% on the CPU pool
+    // (~330 ms/window serial, the measured wall).  Registering the mlocked LRU tier turns both back on:
+    // `fetch_dma` copies tier-resident blobs into VRAM staging at full PCIe rate beside the CPU's work, and
+    // the grouped kernel computes them on the GPU.  Tier residents are exactly the right 97%+ to offload.
+    bool hot_dev_ok_ = false;
+    const uint8_t* hot_dev_base_ = nullptr;
     std::vector<int64_t> hot_slot_;  ///< per blob index: byte offset in hot_arena_, or -1 when not pinned
     int64_t prefetched_ = 0;         ///< R5-prefetch: whole-blob WILLNEED submissions since startup
     std::vector<uint8_t> pf_seen_;   ///< per-call dedupe scratch, sized n_expert_

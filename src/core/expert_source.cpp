@@ -288,7 +288,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
+        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_ready();
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
@@ -834,12 +834,32 @@ void ArenaExpertSource::close() {
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if (base_ == nullptr || layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers ||
+        expert < 0 || expert >= n_expert_)
+        return false;
+    // R9b: a TIER-RESIDENT blob's host pointer is inside the cudaHostRegistered tier - safe for async DMA.
+    // The in-flight ring blobs are NOT (their bytes land in the tier only when `wait_layer` commits), and the
+    // file mapping never is.  `blob()` answers tier residents first, so this predicate agrees with the pointer
+    // `blob()` returns for exactly the blobs that can be staged to the GPU.
+    if (file_map_ != nullptr) {
+        if (!hot_dev_ok_ || hot_slot_.empty()) return false;
+        const int64_t idx = layer * n_expert_ + expert;
+        return idx >= 0 && idx < blobs_ && hot_slot_[(size_t) idx] >= 0;
+    }
     const auto& lay = strata::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    // R9b: the registered tier's device alias (pcie-mode direct/kernel).  Only the single-slice form is
+    // wired; multi-slice leaves `hot_dev_base_` null and DMA mode (the default for native packs) instead.
+    if (file_map_ != nullptr) {
+        if (!hot_dev_ok_ || hot_dev_base_ == nullptr || hot_slot_.empty()) return nullptr;
+        if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+        const int64_t idx = layer * n_expert_ + expert;
+        if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] < 0) return nullptr;
+        return hot_dev_base_ + hot_slot_[(size_t) idx];
+    }
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
@@ -970,6 +990,52 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         dc_slots_ = (int64_t) hot_count_;
     }
     if (!dynamic_tier_) hot_locked_ = (::mlock(hot_arena_, (size_t) hot_used_) == 0);
+    // ---- R9b: REGISTER THE TIER WITH CUDA so the GPU's PCIe expert path can read it.
+    //
+    // With `--mmap-experts` the arena is a plain file mmap: `pinned_bytes_` is 0, `dev_slice_` empty, so the
+    // verify plan builder's `pinned()`/`device_alias()` gates were permanently closed and EVERY routed expert
+    // was computed on the CPU pool - measured ~330 ms of serial pool work per verify window on this box, which
+    // is the decode wall all by itself.  The tier is anonymous, mlocked and 2 MiB-page-backed - exactly what
+    // `cudaHostRegister` wants - and tier-resident blobs are 97%+ of routed traffic, so registering it turns
+    // `fetch_dma` (default --pcie-mode auto -> DMA for native packs, --pcie-frac 0.55) back on: the copy
+    // engine moves the layer's PCIe share into VRAM staging beside the CPU's own work and the grouped kernel
+    // computes it on the GPU.  Whole-range registration first; 2 GiB slices as the fallback, because a
+    // failure here must degrade to the CPU-only path, never to torn reads.
+    if (hot_locked_ && hot_arena_ != nullptr && hot_cap_ > 0 && file_map_ != nullptr) {
+        void* dev = nullptr;
+        auto reg = [&](uint8_t* p, uint64_t n) {
+            return cudaHostRegister(p, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        };
+        if (reg(hot_arena_, hot_cap_) == cudaSuccess) {
+            if (cudaHostGetDevicePointer(&dev, hot_arena_, 0) == cudaSuccess) {
+                hot_dev_ok_ = true;
+                hot_dev_base_ = (const uint8_t*) dev;
+            } else {
+                (void) cudaGetLastError();
+                cudaHostUnregister(hot_arena_);
+            }
+        } else {
+            (void) cudaGetLastError();
+            const uint64_t slice = (uint64_t) 2 << 30;
+            hot_dev_ok_ = true;
+            std::vector<void*> parts;
+            for (uint64_t off = 0; off < hot_cap_ && hot_dev_ok_; off += slice) {
+                const uint64_t n = std::min<uint64_t>(slice, hot_cap_ - off);
+                if (reg(hot_arena_ + off, n) != cudaSuccess) { hot_dev_ok_ = false; break; }
+                void* d = nullptr;
+                if (cudaHostGetDevicePointer(&d, hot_arena_ + off, 0) != cudaSuccess) { hot_dev_ok_ = false; break; }
+                parts.push_back(d);
+            }
+            if (hot_dev_ok_ && parts.size() == 1) hot_dev_base_ = (const uint8_t*) parts[0];
+            if (!hot_dev_ok_) {
+                for (size_t i = 0; i < parts.size(); ++i) cudaHostUnregister(hot_arena_ + (uint64_t) i * slice);
+            } else if (parts.size() > 1) {
+                // multi-slice: DMA (pcie-mode 0) works because it only needs `pinned()` == true; the
+                // single-pointer `device_alias()` form (direct/kernel modes) stays off with a null base.
+                hot_dev_base_ = nullptr;
+            }
+        }
+    }
 #endif
     char buf[420];
     std::snprintf(buf, sizeof buf,
@@ -980,6 +1046,10 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
                   (double) dc_slot_bytes_ / 1048576.0, (long long) dc_slots_,
                   (long long) dc_free_.size());
     note_ += buf;
+    if (file_map_ != nullptr)
+        note_ += hot_dev_ok_ ? (hot_dev_base_ ? "; tier cudaHostRegistered+device-alias (GPU PCIe expert path ON)"
+                                              : "; tier cudaHostRegistered sliced (GPU PCIe DMA path ON)")
+                             : "; tier NOT registered (GPU PCIe expert path off)";
 }
 
 // ---- R8: the adaptive LRU tier ---------------------------------------------------------------------------
