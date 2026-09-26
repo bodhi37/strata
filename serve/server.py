@@ -71,7 +71,12 @@ class MockEngine:
 
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
-    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough."""
+    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
+
+    Per-request sampling rides the same line as engine-side keys between max_new and the ids
+    (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
+    engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
+    """
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
@@ -103,11 +108,29 @@ class StrataEngine:
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
 
+    @staticmethod
+    def sampling_keys(sampling: dict) -> str:
+        keys = ""
+        t = sampling.get("temperature")
+        if isinstance(t, (int, float)) and float(t) > 0.0:
+            keys += f" temperature={float(t)!r}"
+        tp = sampling.get("top_p")
+        if isinstance(tp, (int, float)) and float(tp) < 1.0:
+            keys += f" top_p={float(tp)!r}"
+        tk = sampling.get("top_k")
+        if isinstance(tk, int) and 1 <= tk <= 64:
+            keys += f" top_k={tk}"        # the engine's sampled path takes 1..64; outside it keeps its 20
+        seed = sampling.get("seed")
+        if isinstance(seed, int) and seed > 0:
+            keys += f" seed={seed}"
+        return keys
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
-        head = f"GENI {int(max_new)} {embeddings}" if embeddings else f"GEN {int(max_new)}"
+        head = f"GENI {int(max_new)} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         self.proc.stdin.flush()
         done = False
