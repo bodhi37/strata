@@ -32,6 +32,11 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    // R8: where a chunk's time goes.  `ms_moe` is host time inside the MoE section; `ms_moe_rd_wait` is
+    // the part waiting for READER threads (starved reads), `ms_moe_used_wait` the part waiting for the GPU
+    // to free a staging slot (device-bound).  The balance says whether to add readers or fix the device side.
+    double ms_moe = 0, ms_moe_rd_wait = 0, ms_moe_used_wait = 0;
+    double ms_qsa = 0, ms_gdn = 0;
 };
 
 class Prefill {
