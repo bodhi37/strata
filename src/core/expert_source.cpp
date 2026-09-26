@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <immintrin.h>
 #include <thread>
 #include <vector>
 
@@ -422,6 +423,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
     d.multi_misses += njobs;
+    if (!d.usage_total.empty())
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (ids[i] >= 0 && ids[i] < d.n_expert) ++d.usage_total[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]];
     ++d.layers;
     d.experts += n_tok * k;
 }
@@ -646,6 +650,72 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
+    // Small-RAM machines: a native pack's experts (tens of GiB) as a file-backed mmap arena.  The first run
+    // materializes `<pack_dir>/experts-native.bin` from the GGUF shards; later runs page in lazily and the
+    // kernel page cache holds whatever fits - the same contract as FileExpertSource's mmap of experts.bin,
+    // for a pack whose blobs are not the canonical Q2_0 size.
+    if (from_gguf && file_backing_) {
+#if defined(_WIN32)
+        err = "ArenaExpertSource: file-backed native experts need the POSIX mmap path";
+        return false;
+#else
+        const std::string fb = pack_dir + "/experts-native.bin";
+        const uint64_t cap = want + (uint64_t) blob;
+        bool preexisting = false;
+        {
+            std::ifstream f(fb, std::ios::binary | std::ios::ate);
+            // a run killed mid-materialization leaves the full-size but INCOMPLETE file (ftruncate up front),
+            // so trust it only with the completion marker written after the load finished
+            if (f) {
+                std::ifstream done(fb + ".done");
+                preexisting = ((uint64_t) f.tellg() == cap) && done.good();
+            }
+        }
+        file_fd_ = ::open(fb.c_str(), O_RDWR | O_CREAT, 0644);
+        if (file_fd_ < 0) { err = "ArenaExpertSource: cannot open " + fb; return false; }
+        if (!preexisting && ::ftruncate(file_fd_, (off_t) cap) != 0) {
+            ::close(file_fd_); file_fd_ = -1;
+            err = "ArenaExpertSource: cannot size " + fb;
+            return false;
+        }
+        void* m = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd_, 0);
+        if (m == MAP_FAILED) {
+            ::close(file_fd_); file_fd_ = -1;
+            err = "ArenaExpertSource: mmap of " + fb + " failed (" + std::to_string(cap) + " B)";
+            return false;
+        }
+        file_map_ = m;
+        file_map_bytes_ = cap;
+        base_ = (const uint8_t*) m;
+        arena_ = nullptr;
+        pinned_bytes_ = 0;
+        slice_bytes_ = 0;
+        dev_slice_.clear();
+        note_ = "file-backed mmap " + fb +
+                (preexisting ? " (pre-existing; lazy page-in)" : " (materializing from the GGUF shards)");
+        LoadStats st;
+        if (preexisting) {
+            st.bytes = want;
+            st.layers = (uint64_t) n_layers;
+        } else {
+            st = load_experts_gguf(gguf_, (uint8_t*) m, lay, threads);
+        }
+        if (st.bytes != want) {
+            close();
+            err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
+            return false;
+        }
+        blobs_ = n_layers * n_expert;
+        n_expert_ = n_expert;
+        reads_ = 0;
+        gib_per_s_ = st.gib_per_second();
+        if (!preexisting) {
+            std::ofstream m(fb + ".done");
+            m << "ok";
+        }
+        return true;
+#endif
+    }
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds);
     if (!a->valid()) {
         delete a;
@@ -686,6 +756,41 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
+    if (pf_started_) {
+        pf_stop_.store(true, std::memory_order_release);
+        pf_epoch_.fetch_add(1, std::memory_order_release);
+        for (auto& t : pf_workers_) t.join();
+        pf_workers_.clear();
+        pf_started_ = false;
+        pf_stop_.store(false, std::memory_order_release);
+    }
+    ring_.clear();
+    ring_of_.clear();
+    ring_layer_ = -1;
+    if (hot_arena_ != nullptr) {
+#if !defined(_WIN32)
+        if (hot_locked_ && hot_used_ > 0) ::munlock(hot_arena_, (size_t) hot_used_);
+        ::munmap(hot_arena_, (size_t) hot_cap_);
+#endif
+        hot_arena_ = nullptr;
+        hot_cap_ = hot_used_ = 0;
+        hot_count_ = 0;
+        hot_locked_ = false;
+        hot_slot_.clear();
+    }
+    if (file_map_ != nullptr) {
+#if !defined(_WIN32)
+        if (file_map_bytes_ > 0) ::munmap(file_map_, file_map_bytes_);
+#endif
+        file_map_ = nullptr;
+        file_map_bytes_ = 0;
+    }
+    if (file_fd_ >= 0) {
+#if !defined(_WIN32)
+        ::close(file_fd_);
+#endif
+        file_fd_ = -1;
+    }
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -710,15 +815,214 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
     return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
 }
 
+// ================================ THE PINNED HOT TIER (small-RAM machines) ================================
+//
+// See the header.  Two things make this pay rather than duplicate the mapping:
+//
+//   * the tier is ANONYMOUS and `mlock`ed, so it is not a reclaim candidate.  The header above says the mapped
+//     arena loses exactly that property ("file-backed pages are the ones the OS drops from the standby list"),
+//     and measured 42.8 GB/s reading anonymous memory against ~19 GB/s through the mapping;
+//   * each blob is copied with ONE whole-blob read out of the mapping.  A 2.6 MB blob touched a 4 KiB page at a
+//     time costs ~340 us per fault on this class of drive (~45x the drive's own 3.8 ms for the whole blob).
+//
+// The order is the PROFILE's, so the tier holds the highest-frequency blobs first and what still misses is the
+// tail of the distribution.  After each range is copied its file pages are released with POSIX_FADV_DONTNEED:
+// they will never be read from the file again (this tier serves them), and on a 30 GiB box the 10-14 GiB that
+// frees is what lets the COLD expert set stay cached for prefill's full pass over it.
+void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t bytes) {
+    if (base_ == nullptr || file_map_ == nullptr || bytes == 0 || ranked.empty() || blobs_ <= 0 || hot_arena_ != nullptr)
+        return;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (lay.n_expert <= 0 || lay.n_layers <= 0) return;
+#if !defined(_WIN32)
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << 26)
+#endif
+    void* m = ::mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+    const bool huge = m != MAP_FAILED;
+    if (m == MAP_FAILED)
+        m = ::mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        note_ += "; hot tier NOT allocated (mmap of " + std::to_string(bytes) + " B failed)";
+        return;
+    }
+    hot_arena_ = (uint8_t*) m;
+    hot_cap_ = bytes;
+    hot_slot_.assign((size_t) blobs_, -1);
+    for (const auto& pr : ranked) {
+        const int32_t l = pr.first, e = pr.second;
+        if (l < 0 || e < 0 || l >= lay.n_layers || e >= lay.n_expert) continue;
+        const int64_t idx = (int64_t) l * n_expert_ + (int64_t) e;
+        if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] >= 0) continue;
+        const uint64_t len = lay.blob_bytes(l);
+        const uint64_t off = lay.blob_offset(l, e);
+        if (len == 0 || off + len > file_map_bytes_ || hot_used_ + len > hot_cap_) break;
+        std::memcpy(hot_arena_ + hot_used_, base_ + off, (size_t) len);
+        hot_slot_[(size_t) idx] = (int64_t) hot_used_;
+        hot_used_ += len;
+        ++hot_count_;
+        if (file_fd_ >= 0) ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
+    }
+    if (hot_used_ == 0) {
+        ::munmap(hot_arena_, (size_t) hot_cap_);
+        hot_arena_ = nullptr; hot_cap_ = 0; hot_slot_.clear();
+        note_ += "; hot tier empty";
+        return;
+    }
+    hot_locked_ = (::mlock(hot_arena_, (size_t) hot_used_) == 0);
+#endif
+    char buf[320];
+    std::snprintf(buf, sizeof buf, "; hot tier %.2f GiB in %lld blobs from the profile%s%s",
+                  (double) hot_used_ / 1073741824.0, (long long) hot_count_,
+                  hot_locked_ ? " (mlocked)" : " (mlock FAILED - reclaimable)", huge ? " [2 MiB pages]" : "");
+    note_ += buf;
+}
+
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr) return nullptr;
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
     ++reads_;
-    // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
-    // this class over `FileExpertSource`.
+    // R5-fetch: the ring serves THIS layer's pread misses (see begin_layer); `ring_layer_` pins the validity
+    // to the layer the reads were issued for, so a later `blob()` (the profile fill, prefill's staging) can
+    // never see a previous layer's bytes.
+    if (layer == ring_layer_ && (int64_t) ring_of_.size() == blobs_ && ring_of_[(size_t) idx] >= 0)
+        return ring_[(size_t) ring_of_[(size_t) idx]].data();
+    if (!hot_slot_.empty()) {
+        ++hot_lookups_;
+        if (hot_slot_[(size_t) idx] >= 0) { ++hot_hits_; return hot_arena_ + hot_slot_[(size_t) idx]; }
+    }
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+}
+
+// R5-fetch: read one whole blob into `dst`.  The hot tier memcpy's out of the locked arena; the file-backed
+// arena issues ONE sequential `pread`, which the drive serves at its full rate - against ~340 us of latency
+// per 4 KiB page fault when the pool walks the mapping instead (see `pin_hot`'s comment for the measurement).
+int64_t ArenaExpertSource::read_blob(int64_t layer, int64_t expert, void* dst) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return -1;
+    if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+        std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
+        ++prefetched_;
+        return (int64_t) len;
+    }
+    if (file_fd_ < 0 || file_map_ == nullptr) return -1;
+    const uint64_t off = lay.blob_offset(layer, expert);
+    if (off + len > file_map_bytes_) return -1;
+    uint8_t* p = (uint8_t*) dst;
+    uint64_t done = 0;
+    while (done < len) {
+        const ssize_t r = ::pread(file_fd_, p + done, (size_t) (len - done), (off_t) (off + done));
+        if (r <= 0) return -1;
+        done += (uint64_t) r;
+    }
+    ++prefetched_;
+    return (int64_t) len;
+}
+
+// R5-fetch: the persistent reader threads.  The protocol is ExpertPool's (pool.cpp): a worker counts itself
+// parked BEFORE its first wait so the host's publish below can never outrun a thread that is still leaving
+// the previous batch's claim loop - a stolen or double-claimed job would make `pf_done_` overshoot the batch
+// size and the host would wait forever.  R5b: the park is a BLOCKING condvar wait, not a spin - the readers
+// idle most of each layer (the pool computes), and spinning threads on the SMT siblings measurably slow the
+// compute workers down.
+void ArenaExpertSource::pf_worker() {
+    uint32_t seen = 0;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(pf_mu_);
+            pf_parked_.fetch_add(1, std::memory_order_acq_rel);   // arrive at the park before the first wait
+            pf_cv_.wait(lk, [&] { return pf_epoch_.load(std::memory_order_acquire) != seen ||
+                                         pf_stop_.load(std::memory_order_relaxed); });
+            pf_parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
+        }
+        if (pf_stop_.load(std::memory_order_acquire)) return;
+        seen = pf_epoch_.load(std::memory_order_relaxed);
+        for (;;) {
+            const uint32_t i = pf_head_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= pf_njobs_.load(std::memory_order_acquire)) break;
+            const PfJob& j = pf_jobs_[(size_t) i];
+            uint8_t* dst = ring_[(size_t) j.slot].data();
+            uint64_t done = 0;
+            while (done < j.len) {
+                const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (j.len - done), (off_t) (j.off + done));
+                if (r <= 0) break;
+                done += (uint64_t) r;
+            }
+            pf_done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+}
+
+// R5-fetch.  Called with a layer's routing ids before the pool sets up its jobs.  The misses of the layer
+// (what neither the hot tier nor a previous read can answer) are read WHOLE into the ring with `pf_workers_`
+// concurrent preads - the drive streams them back-to-back at its sequential rate while the host finishes
+// dispatching, instead of the drain faulting 4 KiB at a time and waiting on each page.  The ring is one
+// layer deep: the dispatch contract has the pool block until this layer's drain is done, so the slots are
+// free the next time this runs.  Blobs beyond the ring (more unique misses than slots - not reachable with
+// this model's k=10 (+shared) and MAXT=4, but never say never) fall back to one WILLNEED each.
+void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
+    if (base_ == nullptr || ids == nullptr || k <= 0) return;
+    if (layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers) return;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if ((int64_t) pf_seen_.size() != n_expert_) pf_seen_.assign((size_t) n_expert_, 0);
+    else std::fill(pf_seen_.begin(), pf_seen_.end(), (uint8_t) 0);
+    if (!pf_started_ && file_fd_ >= 0 && file_map_ != nullptr) {
+        ring_.assign(kRingSlots, {});
+        for (auto& r : ring_) r.resize((size_t) lay.max_blob + 512);
+        ring_of_.assign((size_t) blobs_, -1);
+        pf_jobs_.resize(kRingSlots);
+        for (int i = 0; i < 10; ++i) pf_workers_.emplace_back([this] { pf_worker(); });
+        pf_started_ = true;
+    }
+    if (!pf_started_) {
+        // resident arena or no file: nothing to fetch, but keep the dedupe+stats behaviour
+        return;
+    }
+    // invalidate the previous layer's ring: `blob()` only serves ring slots for `ring_layer_`
+    ring_layer_ = layer;
+    int n = 0;
+    for (int64_t i = 0; i < k && n < kRingSlots; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= n_expert_ || pf_seen_[(size_t) e]) continue;
+        pf_seen_[(size_t) e] = 1;
+        const int64_t idx = layer * n_expert_ + e;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;   // the hot tier answers this one
+        const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
+        if (len == 0 || off + len > file_map_bytes_) continue;
+        const int slot = n++;
+        pf_jobs_[(size_t) slot] = {idx, slot, off, len};
+        ring_of_[(size_t) idx] = slot;
+    }
+    if (n == 0) return;
+    for (int64_t i = 0; i < k; ++i) {   // the rest (ring full): readahead only
+        const int64_t e = ids[i];
+        if (e < 0 || e >= n_expert_ || !pf_seen_[(size_t) e]) continue;
+        pf_seen_[(size_t) e] = 2;       // mark as handled; ring_of_ decides who is actually served
+        const int64_t idx = layer * n_expert_ + e;
+        if (ring_of_[(size_t) idx] >= 0) continue;
+        const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
+        if (len == 0 || off + len > file_map_bytes_) continue;
+        ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+        ++prefetched_;
+    }
+    // publish the batch and wait for the reads.  The parked-count barrier (ExpertPool's protocol) guarantees
+    // every reader thread is parked before head_/done_/njobs_ are reset, so no thread can touch the previous
+    // batch's state while it is republished.
+    while (pf_parked_.load(std::memory_order_acquire) != (uint32_t) pf_workers_.size()) _mm_pause();
+    pf_head_.store(0, std::memory_order_relaxed);
+    pf_done_.store(0, std::memory_order_relaxed);
+    pf_njobs_.store((uint32_t) n, std::memory_order_release);
+    pf_epoch_.fetch_add(1, std::memory_order_release);
+    { std::lock_guard<std::mutex> lk(pf_mu_); pf_cv_.notify_all(); }
+    while (pf_done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
+    prefetched_ += n;
 }
 
 }  // namespace strata::core
