@@ -243,13 +243,18 @@ void iq4nl_rows_multi(const uint8_t* w, size_t row_bytes, int n, const void* con
             const __m128i lo = _mm_and_si128(q4, m4);
             const __m128i hi = _mm_and_si128(_mm_srli_epi16(q4, 4), m4);
             const __m256i g = _mm256_shuffle_epi8(lut, _mm256_set_m128i(hi, lo));   // 32 int8 magnitudes
+            // R10 FIX: vpsignb(a,b) = a*sign(b), so sign(g,g) is |g|, NOT the sign vector - the first version
+            // precomputed "gs = sign(g,g)" and then sy = sign(yv, gs) reduced to yv (sign of |g| is +1 or 0),
+            // i.e. THE WEIGHT SIGNS WERE NEVER APPLIED (sum |w|*y instead of sum w*y; caught by
+            // scratch/iq4nl_fuzz.cpp after the engine produced repetitive output - the vs-float parity at
+            // 1.3e-2 could not see it under the activation noise).  The correct form needs no precomputed
+            // sign vector at all: ggml's own mul_add_epi8 is maddubs(|x|, y*sign(x)).
             const __m256i ax = _mm256_abs_epi8(g);
-            const __m256i gs = _mm256_sign_epi8(g, g);                             // -1/0/+1 per byte
             const float dx = h2f(u16(wb));
             for (int t = 0; t < nt; ++t) {
                 const uint8_t* yb = (const uint8_t*) hq[t] + (size_t) ib * 34;   // block_q8_0: fp16 d + qs[32]
                 const __m256i yv = _mm256_loadu_si256((const __m256i*) (const void*) (yb + 2));
-                const __m256i sy = _mm256_sign_epi8(yv, gs);
+                const __m256i sy = _mm256_sign_epi8(yv, g);                      // y * sign(g)
                 const __m256i p16 = _mm256_maddubs_epi16(ax, sy);
                 const __m256i p32 = _mm256_madd_epi16(p16, ones);
                 const float dy = h2f(u16(yb));

@@ -227,12 +227,15 @@ class Vision:
 
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    compiled it) first on the library search path, then any STRATA_* knobs the config carries (cfg["env"]:
+    the A/B arm for engine experiments, e.g. STRATA_NO_IQ512 / STRATA_PARK_SPIN_US)."""
     env = dict(os.environ)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+    for k, v in (cfg.get("env") or {}).items():
+        env[str(k)] = str(v)
     return env
 
 

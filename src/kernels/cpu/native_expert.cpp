@@ -103,7 +103,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // kernel re-decodes the nibble LUT once PER TOKEN.  The AVX-512 multi-token kernel decodes once per
     // block and applies every token with one load/sign/maddubs/madd - measured 3x at nt=5 on the kernel
     // bench, identical per-block integers, float-order-only differences (same class the gu path carries).
-    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    // STRATA_NO_IQ4NL is the A/B arm (the first engine run with this kernel produced repetitive output;
+    // the isolation is kept until the fuzz parity proves which side of the border the fault is on).
+    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr &&
+                               std::getenv("STRATA_NO_IQ4NL") == nullptr;
     if (avx512 && nt >= 2 && f.d_type == 20) {   // GGML_TYPE_IQ4_NL
         iq4nl_rows_multi(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
