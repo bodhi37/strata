@@ -1,0 +1,33 @@
+[
+ {
+  "target": 1024,
+  "prompt_tokens": null,
+  "completion_tokens": 0,
+  "ttft_s": NaN,
+  "prefill_tok_s": NaN,
+  "decode_tok_s": NaN,
+  "wall_s": 0.012070178985595703
+ },
+ {
+  "target": 4096,
+  "prompt_tokens": null,
+  "completion_tokens": 0,
+  "ttft_s": NaN,
+  "prefill_tok_s": NaN,
+  "decode_tok_s": NaN,
+  "wall_s": 0.008529186248779297
+ },
+ {
+  "target": 32768,
+  "prompt_tokens": null,
+  "completion_tokens": 0,
+  "ttft_s": NaN,
+  "prefill_tok_s": NaN,
+  "decode_tok_s": NaN,
+  "wall_s": 0.06225252151489258
+ },
+ {
+  "target": 131072,
+  "error": "<HTTPError 400: 'Bad Request'>"
+ }
+]

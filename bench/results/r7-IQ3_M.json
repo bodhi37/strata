@@ -1,0 +1,19 @@
+[
+ {
+  "target": 1024,
+  "prompt_tokens": null,
+  "completion_tokens": 89,
+  "ttft_s": 33.422144412994385,
+  "prefill_tok_s": NaN,
+  "decode_tok_s": 4.264987492312799,
+  "wall_s": 54.055264711380005
+ },
+ {
+  "target": 4096,
+  "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+ },
+ {
+  "target": 32768,
+  "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+ }
+]

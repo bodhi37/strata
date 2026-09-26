@@ -46,3 +46,11 @@ build-vision.bat
 /dist/
 *.done
 /third_party/*.zip
+llama.cpp/
+/model/
+/ple/
+/toolchain/
+/data/*.bin
+data/*.bin
+llama-pinned.tar.gz
+/tests/

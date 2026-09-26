@@ -77,6 +77,13 @@ public:
     /// True when `(layer, expert)`'s bytes are being read and are NOT yet valid.  A source with no prefetch
     /// answers false for everything, so the split reduces to the old code path.
     virtual bool ring_pending(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// **R7: ASK THE KERNEL TO START READING THIS LAYER'S EXPERTS NOW.**  Prefill stages one blob at a time
+    /// on the host thread, so - exactly like decode before the two-pass split - the drive sits at QD1 and a
+    /// 33k-token prompt measured 498 s for 330 GB of reads (0.67 GB/s, the drive's QD1 rate).  Prefill knows
+    /// the whole layer's expert set up front and processes it in file-offset order, so a WILLNEED over that
+    /// list turns the QD1 stream into near-sequential readahead at the drive's full rate and the staging
+    /// reads become page-cache hits.  A source without a file is a no-op.
+    virtual void prefetch(int64_t layer, const int32_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
 };
@@ -400,6 +407,7 @@ public:
     int64_t read_blob(int64_t layer, int64_t expert, void* dst) override;
     void wait_layer() override;                          ///< R7: block until this layer's submitted reads land
     bool ring_pending(int64_t layer, int64_t expert) const override;   ///< R7: is this blob still in flight?
+    void prefetch(int64_t layer, const int32_t* experts, int64_t n) override;   ///< R7: warm the page cache
     void close();
 
     bool mapped() const { return base_ != nullptr; }

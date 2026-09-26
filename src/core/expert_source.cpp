@@ -1150,6 +1150,27 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
     ring_waiting_ = true;
 }
 
+// R7: warm the page cache for a layer's whole expert set.  Prefill calls this once per layer, with the
+// experts it is about to stage, before the first staging read.  See the header for why: prefill is QD1 and
+// measured 0.67 GB/s on a 33k-token prompt, i.e. it was latency-bound exactly like decode was.
+void ArenaExpertSource::prefetch(int64_t layer, const int32_t* experts, int64_t n) {
+    if (file_fd_ < 0 || file_map_ == nullptr || experts == nullptr || n <= 0) return;
+    if (layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers) return;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t e = experts[i];
+        if (e < 0 || e >= n_expert_) continue;
+        const int64_t idx = layer * n_expert_ + e;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;   // the tier answers it from RAM
+        const uint64_t off = lay.blob_offset(layer, e);
+        if (off + len > file_map_bytes_) continue;
+        ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+        ++prefetched_;
+    }
+}
+
 // R7: the blocking half of `begin_layer`.  Same wait the old single-phase form did inline.
 // R7: a new verify window.  Score the previous window as a predictor of this one, then (optionally) ask the
 // kernel to start reading the predicted set NOW, so the per-layer `pread` finds it in the page cache instead of
@@ -1196,9 +1217,18 @@ void ArenaExpertSource::wait_layer() {
     ring_waiting_ = false;
 }
 
-// R7: is `(layer, expert)`'s blob one of the reads that are still in flight?
+// R7: is `(layer, expert)`'s blob one of the reads this layer submitted to the ring?
+//
+// **THIS MUST NOT TEST `ring_waiting_`.**  That flag means "wait_layer has not run yet", and it is cleared
+// *between* dispatch pass 0 and pass 1 - so a version of this predicate that checked it made every pass-1
+// entry look like a pass-0 entry, pass 1 skipped all of them, and **~19% of this model's expert
+// contributions were silently dropped**: measured on the IQ3_XXS pack, 97 windows, 78,855 routed ids,
+// 63,930 blob() calls - exactly the hot-tier count, i.e. not one miss was ever dispatched.  The model still
+// produced fluent English, which is precisely why it had to be found in the counters rather than in the
+// output; it is also the likely source of the capability eval's arithmetic misses.  A blob is "pending"
+// when it was claimed for THIS layer, whatever stage of the two-pass handoff it is at.
 bool ArenaExpertSource::ring_pending(int64_t layer, int64_t expert) const {
-    if (!ring_waiting_ || layer != ring_layer_) return false;
+    if (layer != ring_layer_) return false;
     if (expert < 0 || expert >= n_expert_) return false;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_ || (int64_t) ring_of_.size() != blobs_) return false;

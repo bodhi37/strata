@@ -1,0 +1,11 @@
+[
+ {
+  "target": 4096,
+  "prompt_tokens": null,
+  "completion_tokens": 0,
+  "ttft_s": NaN,
+  "prefill_tok_s": NaN,
+  "decode_tok_s": NaN,
+  "wall_s": 0.012124061584472656
+ }
+]
