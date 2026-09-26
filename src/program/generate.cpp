@@ -2196,6 +2196,15 @@ int main(int argc, char** argv) {
             if (!lent_now.empty())
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+            // R8: prefill phase attribution - say WHERE the prompt time went instead of guessing.
+            {
+                const strata::prefill::PrefillStats& ps = sp.stats();
+                std::fprintf(stderr,
+                             "strata serve: prefill %lld tok: total %.0f ms | moe %.0f (rd-wait %.0f, used-wait %.0f), "
+                             "qsa %.0f, gdn %.0f, ple %.0f, experts host %.0f ms, streamed %lld\n",
+                             (long long) ps.tokens, ps.ms_total, ps.ms_moe, ps.ms_moe_rd_wait, ps.ms_moe_used_wait,
+                             ps.ms_qsa, ps.ms_gdn, ps.ms_ple, ps.ms_experts_host, (long long) ps.experts_streamed);
+            }
             // the verify windows: the first holds the last prompt token alone
             int64_t p = n - 1;
             int32_t x = (int32_t) ids[(size_t) (n - 1)];

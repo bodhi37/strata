@@ -71,6 +71,11 @@ public:
     virtual int64_t read_blob_raw(int64_t layer, int64_t expert, void* dst) {
         (void) layer; (void) expert; (void) dst; return -1;
     }
+    /// R8b: prefill admission hook (see `ArenaExpertSource::dc_stage_admit`).  A no-op for sources without
+    /// an adaptive tier.
+    virtual bool stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes) {
+        (void) layer; (void) expert; (void) bytes; return false;
+    }
     /// **R7: SPLIT THE WAIT FROM THE READ SO IT CAN BE HIDDEN.**  `begin_layer` used to submit the layer's
     /// whole-blob reads AND block until they landed, which put the drive's latency on the critical path in front
     /// of the CPU's own drain - measured on the IQ3_XXS pack, 176 ms of a 272 ms window where the CPU had 57 ms
@@ -386,14 +391,23 @@ public:
     /// and decode fell to 0.2 tok/s (1.5 GB/token of NVMe reads).  With this on, the tier is an LRU whose
     /// initial contents are the profile in rank order: a decode miss is admitted into the tier (the pread
     /// ring lands DIRECTLY in the slot, no extra copy), the least-recently-used blob is evicted to make
-    /// room, and the static profile is just the starting LRU order.  Prefill never admits (a prompt sweeps
-    /// every expert of every layer, so admitting prefill traffic would flush the tier with cold data).
+    /// room, and the static profile is just the starting LRU order.  R8b: prefill admits TOO (see
+    /// `dc_stage_admit`) - the original "prefill must not admit" rule was wrong for agentic sessions, where
+    /// the prompt's routed experts are precisely the working set every later turn and generation reuses.
     void set_dynamic_tier(bool on) { dynamic_tier_ = on; }
     bool dynamic_tier() const { return dynamic_tier_; }
     /// R8 diagnostics for the serve stats line.
     int64_t dc_admits() const { return dc_admits_; }
     int64_t dc_evicts() const { return dc_evicts_; }
     int64_t dc_fallbacks() const { return dc_fallbacks_; }
+    /// R8b: **PREFILL ADMISSIONS.**  A prompt's routing is decided layer by layer as prefill runs, and the
+    /// experts a prompt routes to are exactly the experts its generation will route to - so prefill's
+    /// staging reads are admitted to the LRU.  A multi-turn session then prefills from RAM after its first
+    /// turn and decode starts primed; measured, an unadmitted prompt sweeps ~20 GB of disk EVERY turn and
+    /// decode pays the same misses again.  `dc_stage_admit` copies the landed staging bytes into a fresh or
+    /// evicted LRU slot and commits it.  False when the tier cannot take it (no tier / no slot).
+    bool dc_stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes);
+    int64_t dc_stage_admits() const { return dc_stage_admits_; }
     /// Whether the tier is doing anything: served / total `blob()` calls since startup.
     int64_t hot_hits() const { return hot_hits_; }
     int64_t hot_lookups() const { return hot_lookups_; }
@@ -473,13 +487,20 @@ private:
     std::vector<int32_t> dc_prev_, dc_next_;   ///< per slot: LRU neighbours (-1 = none)
     std::vector<int32_t> dc_idx_;              ///< per slot: blob index it holds, or -1 when free
     std::vector<uint32_t> dc_epoch_;           ///< per slot: window epoch of the last touch/admit
+    std::vector<uint16_t> dc_count_;           ///< per slot: decayed hit count (frequency-aware eviction)
     std::vector<int32_t> dc_free_;             ///< free-slot stack
     int32_t dc_head_ = -1, dc_tail_ = -1;      ///< LRU: head = most recent
     std::vector<int64_t> dc_admit_list_;       ///< this layer's pending admissions (blob idx), committed in wait_layer
     int64_t dc_admits_ = 0, dc_evicts_ = 0, dc_fallbacks_ = 0;
+    int64_t dc_stage_admits_ = 0;              ///< R8b: prefill admissions
+    /// R8b: guards the LRU structures when prefill's READER threads touch them (decode's mutators are all
+    /// host-thread and never overlap prefill, but prefill touches run concurrently on the reader pool).
+    std::mutex dc_mu_;
     void dc_init(int64_t slot_bytes);
     int32_t dc_alloc(int64_t idx);             ///< a free or evicted slot for blob `idx`, or -1
     void dc_touch(int32_t slot);               ///< move to LRU head, stamp the window epoch
+    void dc_touch_locked(int32_t slot);
+    int32_t dc_alloc_locked(int64_t idx);
     void dc_unlink(int32_t slot);
     void dc_link_head(int32_t slot);
     /// R7: inclusive source counters; see `BlobStats`.

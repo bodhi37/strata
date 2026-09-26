@@ -905,10 +905,6 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
     const bool huge = (::madvise(m, (size_t) cap, MADV_HUGEPAGE) == 0);
     dc_init((int64_t) slot);
     hot_slot_.assign((size_t) blobs_, -1);
-    // R8: lock the WHOLE arena up front, not just the filled part: pages faulted later by an LRU admission
-    // inherit VM_LOCKED from the VMA, but only if the range was mlocked - locking after the fill (the R7
-    // order) would leave every admission page reclaimable, exactly what the tier exists to prevent.
-    if (dynamic_tier_) hot_locked_ = (::mlock(hot_arena_, (size_t) hot_cap_) == 0);
     for (const auto& pr : ranked) {
         if (hot_count_ >= dc_slots_) break;   // the arena is full of whole slots
         const int32_t l = pr.first, e = pr.second;
@@ -938,6 +934,10 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         const int32_t s = (int32_t) hot_count_;
         dc_idx_[(size_t) s] = (int32_t) idx;
         dc_epoch_[(size_t) s] = 0;
+        // R8.1: the profile seeds the frequency dimension too.  64 halves to ~1 after six untouched windows,
+        // so on a genuinely different domain the cold profile blobs DO yield - but a one-shot miss flood
+        // (count 1) can never flush them within a single request.
+        dc_count_[(size_t) s] = 64;
         dc_prev_[(size_t) s] = dc_tail_;
         dc_next_[(size_t) s] = -1;
         if (dc_tail_ >= 0) dc_next_[(size_t) dc_tail_] = s; else dc_head_ = s;
@@ -958,6 +958,12 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         return;
     }
     hot_used_ = (uint64_t) hot_count_ * dc_slot_bytes_;
+    // R8: lock AFTER the fill (the R7 order this kernel accepts).  Locking the untouched mapping BEFORE
+    // filling fails with ENOMEM here (22 GiB of THP prefault under fragmentation) and the failure mode is
+    // catastrophic: the tier runs reclaimable and the kernel evicts hot-tier pages mid-generation.  mlock()
+    // sets VM_LOCKED on the whole VMA, so pages faulted LATER by an LRU admission inside the range are
+    // locked too - admissions need nothing extra.
+    hot_locked_ = (::mlock(hot_arena_, (size_t) hot_cap_) == 0);
     if (!dynamic_tier_ && hot_used_ < hot_cap_) {   // static A/B: the free tail has no future, give it back
         ::munmap(hot_arena_ + hot_used_, (size_t) (hot_cap_ - hot_used_));
         hot_cap_ = hot_used_;
@@ -985,6 +991,7 @@ void ArenaExpertSource::dc_init(int64_t slot_bytes) {
     dc_next_.assign((size_t) dc_slots_, -1);
     dc_idx_.assign((size_t) dc_slots_, -1);
     dc_epoch_.assign((size_t) dc_slots_, 0);
+    dc_count_.assign((size_t) dc_slots_, 0);
     dc_free_.clear();
     dc_head_ = dc_tail_ = -1;
     dc_admit_list_.clear();
@@ -1007,37 +1014,88 @@ void ArenaExpertSource::dc_link_head(int32_t s) {
 }
 
 void ArenaExpertSource::dc_touch(int32_t s) {
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    dc_touch_locked(s);
+}
+
+void ArenaExpertSource::dc_touch_locked(int32_t s) {
     if (s < 0 || s >= (int32_t) dc_slots_) return;
-    if (dc_head_ == s) { dc_epoch_[(size_t) s] = window_epoch_; return; }
-    dc_unlink(s);
-    dc_link_head(s);
+    if (dc_head_ != s) {
+        dc_unlink(s);
+        dc_link_head(s);
+    }
     dc_epoch_[(size_t) s] = window_epoch_;
+    // R8.1: frequency.  A one-shot miss (a diverse generation's novel expert) stays cheap to evict; a blob
+    // the workload keeps re-referencing gets expensive to evict.  Capped so a long-lived favourite cannot
+    // become untouchable.
+    if (dc_count_[(size_t) s] < 4095) ++dc_count_[(size_t) s];
 }
 
 int32_t ArenaExpertSource::dc_alloc(int64_t idx) {
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    return dc_alloc_locked(idx);
+}
+
+int32_t ArenaExpertSource::dc_alloc_locked(int64_t idx) {
     int32_t s;
     if (!dc_free_.empty()) {
         s = dc_free_.back();
         dc_free_.pop_back();
     } else {
-        // Evict from the LRU tail.  Slots touched in the CURRENT window are skipped: they are this window's
-        // own admissions and hits, and evicting one would drop bytes the same window is still using.
+        // R8.1: EVICT BY FREQUENCY, WITH LRU AS THE TIE-BREAK.  The pure-LRU form thrashes on a diverse
+        // long generation: every miss is a one-shot (measured: 9,754 misses, 0% window-to-window repeat),
+        // so the flood admitted and evicted 15,914 blobs in one request and decode fell to 7.6 tok/s while
+        // the resident profile content - which WOULD have been hit - was flushed.  The victim is now the
+        // lowest-hit-count slot within a bounded walk from the LRU tail (LRU position breaks ties), so a
+        // one-shot flood recycles among itself and never pushes out content the workload actually re-uses.
         s = -1;
-        for (int32_t v = dc_tail_; v >= 0; v = dc_prev_[(size_t) v]) {
-            if (dc_epoch_[(size_t) v] != window_epoch_) { s = v; break; }
+        int32_t best = -1;
+        uint16_t best_count = 0xffff;
+        int32_t v = dc_tail_;
+        for (int scanned = 0; v >= 0 && scanned < 512; ++scanned, v = dc_prev_[(size_t) v]) {
+            if (dc_epoch_[(size_t) v] == window_epoch_) continue;   // this window's own bytes
+            const uint16_t c = dc_count_[(size_t) v];
+            if (c < best_count) { best_count = c; best = v; if (c == 0) break; }
         }
-        if (s < 0) return -1;   // every slot is in use by this window: fall back to the legacy ring
+        if (best < 0) return -1;   // every slot is in use by this window: fall back to the legacy ring
+        s = best;
         const int64_t vidx = dc_idx_[(size_t) s];
         if (vidx >= 0 && vidx < (int64_t) hot_slot_.size()) hot_slot_[(size_t) vidx] = -1;
         ++dc_evicts_;
-        // NO explicit unlink here: `dc_touch` below unlinks the victim (it is still in the list) and relinks
-        // it at the head.  Unlinking twice corrupts the intrusive list - the second unlink reads the -1
-        // sentinels and sets head = tail = -1, which silently collapses the LRU to one slot and every later
-        // allocation evicts nothing (measured: 394 admissions against 16,671 ring fallbacks).
+        // NO explicit unlink here: `dc_touch_locked` below unlinks the victim (it is still in the list) and
+        // relinks it at the head.  Unlinking twice corrupts the intrusive list - the second unlink reads the
+        // -1 sentinels and sets head = tail = -1, which silently collapses the LRU to one slot and every
+        // later allocation evicts nothing (measured: 394 admissions against 16,671 ring fallbacks).
     }
     dc_idx_[(size_t) s] = (int32_t) idx;
-    dc_touch(s);
+    dc_touch_locked(s);
+    dc_count_[(size_t) s] = 1;   // admitted: one shot of credit until the workload proves otherwise
     return s;
+}
+
+// R8b: **PREFILL ADMISSIONS.**  See the header.  `bytes` are the staging buffer's landed copy of
+// `(layer, expert)`; a resident blob just gets its frequency touch, a miss takes a slot (evicting the
+// lowest-value victim) and memcpy's in.  Called from prefill's consume step, host thread, serialized against
+// the decode path - but NOT against prefill's own reader threads touching resident blobs, hence the lock.
+bool ArenaExpertSource::dc_stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes) {
+    if (!dynamic_tier_ || dc_slots_ <= 0 || hot_slot_.empty() || bytes == nullptr) return false;
+    if (layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return false;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0 || len > dc_slot_bytes_) return false;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    if (hot_slot_[(size_t) idx] >= 0) {          // resident: this prompt's evidence of reuse
+        dc_touch_locked((int32_t) ((uint64_t) hot_slot_[(size_t) idx] / dc_slot_bytes_));
+        return true;
+    }
+    const int32_t s = dc_alloc_locked(idx);
+    if (s < 0) return false;
+    std::memcpy(hot_arena_ + (uint64_t) s * dc_slot_bytes_, bytes, (size_t) len);
+    hot_slot_[(size_t) idx] = (int64_t) ((uint64_t) s * dc_slot_bytes_);
+    ++dc_stage_admits_;
+    return true;
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
@@ -1086,9 +1144,15 @@ int64_t ArenaExpertSource::read_blob_raw(int64_t layer, int64_t expert, void* ds
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     const uint64_t len = lay.blob_bytes(layer);
     if (len == 0) return -1;
-    if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
-        std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
-        return (int64_t) len;
+    {   // R8b: the lookup, the copy and the touch hold `dc_mu_` TOGETHER, because the host thread's
+        // `dc_stage_admit` can evict this slot between the lookup and the copy - a memcpy out of a freed
+        // slot would hand the staging buffer torn bytes that reach the GPU as a plausible, wrong expert.
+        std::lock_guard<std::mutex> lk(dc_mu_);
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+            std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
+            dc_touch_locked((int32_t) ((uint64_t) hot_slot_[(size_t) idx] / dc_slot_bytes_));
+            return (int64_t) len;
+        }
     }
     if (file_fd_ < 0 || file_map_ == nullptr) return -1;
     const uint64_t off = lay.blob_offset(layer, expert);
@@ -1100,6 +1164,9 @@ int64_t ArenaExpertSource::read_blob_raw(int64_t layer, int64_t expert, void* ds
         if (r <= 0) return -1;
         done += (uint64_t) r;
     }
+    // R8.2: same page-cache argument as the ring reader - the staging buffer holds the bytes, the cache
+    // copy only fuels reclaim churn (see pf_worker).
+    ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
     return (int64_t) len;
 }
 
@@ -1154,6 +1221,13 @@ void ArenaExpertSource::pf_worker() {
                 if (r <= 0) break;
                 done += (uint64_t) r;
             }
+            // R8.2: **DROP THE PAGE-CACHE COPY IMMEDIATELY.**  A whole-blob `pread` leaves ~530 cached pages
+            // behind, and on a 30 GiB box that already runs a 22 GiB mlocked tier there is no cache left to
+            // hold them: the kernel allocates, clears, copies and then RECLAIMS every page of every miss.
+            // perf during a diverse 300-token generation measured ~39% of the engine's CPU inside kernel
+            // page-management on exactly this cycle.  The bytes the ring needed are in the ring; the cache
+            // copy serves nobody (decode re-uses go through the LRU tier, prefill staging re-reads nothing).
+            ::posix_fadvise(file_fd_, (off_t) j.off, (off_t) j.len, POSIX_FADV_DONTNEED);
             pf_done_.fetch_add(1, std::memory_order_release);
         }
     }
@@ -1174,7 +1248,8 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
     else std::fill(pf_seen_.begin(), pf_seen_.end(), (uint8_t) 0);
     if (!pf_started_ && file_fd_ >= 0 && file_map_ != nullptr) {
         // R7: the predictor is on by default; `STRATA_NO_PREDICT=1` is the A/B arm.
-        prefetch_predict_ = (std::getenv("STRATA_NO_PREDICT") == nullptr);
+        // R8: off by default (see pf_window_start); STRATA_PREDICT=1 turns it back on.
+        prefetch_predict_ = (std::getenv("STRATA_PREDICT") != nullptr);
         ring_.assign(kRingSlots, {});
         for (auto& r : ring_) r.resize((size_t) lay.max_blob + 512);
         ring_of_.assign((size_t) blobs_, -1);
@@ -1321,6 +1396,15 @@ void ArenaExpertSource::prefetch(int64_t layer, const int32_t* experts, int64_t 
 // of the window where it can run at full queue depth beside the CPU, and the 106-odd syscalls cost microseconds.
 void ArenaExpertSource::pf_window_start() {
     ++window_epoch_;
+    // R8.1: decay the frequency counts.  Half-life = one window: a blob hit last window keeps most of its
+    // credit, a blob untouched for eight windows has none, and the tier follows the workload as it moves.
+    // ~10,840 shifts per window - noise.
+    for (size_t i = 0; i < dc_count_.size(); ++i) dc_count_[i] >>= 1;
+    // R8: the fadvise predictor is OFF by default now.  With the LRU tier, a blob that misses again is
+    // ADMITTED (the ring reads it into a tier slot), so warming its page cache with WILLNEED only duplicates
+    // the read - and on a cold page cache each call costs ~2 ms of synchronous kernel work, which at ~1,600
+    // misses per adapting window was seconds per window of pure syscall.  STRATA_PREDICT=1 restores the R7
+    // behaviour for A/B.
     if (window_epoch_ > 1 && prefetch_predict_ && file_fd_ >= 0) {
         for (const int32_t idx : last_misses_) {
             if (idx < 0 || idx >= blobs_) continue;

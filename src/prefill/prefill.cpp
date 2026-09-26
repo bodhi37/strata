@@ -211,11 +211,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(NE); m.off.resize(NE + 1);
     m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) { err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit"; return false; }
-    // R8: the staging readers.  Six pread threads against the staging ring: the submissions run ~11 slots
-    // ahead of the compute, so the drive sits at QD6-8 in file-offset order instead of QD1.
+    // R8: the staging readers.  Twelve pread threads against the staging ring: the submissions run ~11
+    // slots ahead of the compute, so the drive sits at QD10-12 in file-offset order instead of QD1.
+    // (Six measured 1.09 GB/s on a 2,232-token prompt; the drive has more queue depth to give.)
     {
         Impl* mm = impl_.get();
-        for (int i = 0; i < 6; ++i)
+        for (int i = 0; i < 12; ++i)
             m.rd_pool_.emplace_back([mm]() {
                 for (;;) {
                     Impl::RdJob j;
@@ -373,6 +374,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
+                    const auto tg = Clock::now();
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
                                           *wo = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
                                           *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
@@ -390,8 +392,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
+                    stats_.ms_gdn += ms_since(tg);
                 } else if (half == 0) {
                     // ======================= QSA =======================
+                    const auto tq = Clock::now();
                     const core::QsaState& st = ss.qsa_states[qsa_index];
                     const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                           *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
@@ -447,8 +451,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
+                    stats_.ms_qsa += ms_since(tq);
                 } else {
                     // ======================= MoE =======================
+                    const auto tmo = Clock::now();
                     const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
                                           *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
                                           *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -501,11 +507,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         });
                     }
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-                    // R7: warm the page cache for the WHOLE layer before the first staging read.  The staging
-                    // stream is QD1 on the host thread, so without this a 33k-token prompt read 330 GB at
-                    // 0.67 GB/s - the drive's per-request latency, not its bandwidth.  `order` is already in
-                    // file-offset order (R6), so the WILLNEEDs coalesce into near-sequential readahead.
-                    if (!order.empty()) m.src->prefetch(l, order.data(), (int64_t) order.size());
+                    // R8: the R7 per-layer WILLNEED prefetch is GONE, and that is a measured decision: on a
+                    // cold page cache each `posix_fadvise(WILLNEED)` costs ~2 ms of synchronous kernel work
+                    // (extent-tree walk + readahead kick), so a layer's 512 calls = ~1.0 s and a full chunk
+                    // = ~48 s of pure syscall - the dominant prefill cost (micro-bench,
+                    // scratchpad/willneed_test.py: 512 fadvise = 1.03 s, then the preads land in 0.03 s).
+                    // The R8 reader pool preads the same ranges directly at QD10-12, which the drive serves
+                    // at 2-3 GB/s sustained - prefetching in front of it only doubled the work.
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
                     std::vector<int> stage_of(order.size(), -1);
@@ -521,32 +529,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
                         stage_of[j] = sl;
-                        if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
+                        if (m.stage_live[sl]) {   // its previous blob was dequantized
+                            const auto tu = Clock::now();
+                            cudaEventSynchronize(m.used[sl]);
+                            stats_.ms_moe_used_wait += ms_since(tu);
+                        }
                         m.rd_done_[sl].store(true, std::memory_order_relaxed);   // replaced below if pooled
                         m.stage_dma_[sl] = false;
                         m.stage_dma_src_[sl] = nullptr;
-                        // R5-fetch: take the blob WHOLE into the staging buffer with one sequential read out
-                        // of the source's file (or a memcpy out of its hot tier).  The old path memcpy'd from
-                        // the mapped pointer, which faults the blob 4 KiB at a time and measured ~23 ms per
-                        // blob on this class of drive - the pipeline here was staging-bound, not drive-bound.
-                        // `blob()` (and its faulting) is now only the fallback for sources without a file.
-                        if (m.src->read_blob_raw(l, e, m.stage_host[sl]) >= 0) {
-                            m.rd_done_[sl].store(false, std::memory_order_release);
-                            {
-                                std::lock_guard<std::mutex> lk(m.rd_mu_);
-                                m.rd_q_.push_back({l, e, m.stage_host[sl], &m.rd_done_[sl], &m.rd_status_[sl]});
-                            }
-                            m.rd_cv_.notify_one();
-                        } else {
-                            const uint8_t* b = m.src->blob(l, e);
-                            if (!b) { err = "prefill: expert source has no blob"; return false; }
-                            if (m.src->pinned(l, e)) {
-                                m.stage_dma_[sl] = true;                    // DMA straight from the pinned arena
-                                m.stage_dma_src_[sl] = b;
-                            } else {
-                                std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
-                            }
+                        // R8: ALWAYS queue the read to the pool - probing with a synchronous read here (the
+                        // first version) pread the whole blob on the HOST thread at QD1 and then read it
+                        // AGAIN in the worker: the drive saw every blob twice and the host serialized at
+                        // its 0.6-0.7 GB/s.  A source that cannot raw-read answers -1 through rd_status_
+                        // and the consume step falls back to `blob()`.
+                        m.rd_done_[sl].store(false, std::memory_order_release);
+                        {
+                            std::lock_guard<std::mutex> lk(m.rd_mu_);
+                            m.rd_q_.push_back({l, e, m.stage_host[sl], &m.rd_done_[sl], &m.rd_status_[sl]});
                         }
+                        m.rd_cv_.notify_one();
                         stats_.ms_experts_host += ms_since(th);
                         ++stats_.experts_streamed;
                         return true;
@@ -562,13 +563,26 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                             cudaMemcpyHostToDevice, m.copy);
                             ++stats_.experts_dma;
                         } else {
+                            const auto tw = Clock::now();
                             if (!m.rd_done_[sl].load(std::memory_order_acquire)) {
                                 std::unique_lock<std::mutex> lk(m.rd_mu_);
                                 m.rd_done_cv_.wait(lk, [&] {
                                     return m.rd_done_[sl].load(std::memory_order_acquire);
                                 });
                             }
-                            if (m.rd_status_[sl].load(std::memory_order_acquire) < 0) return false;
+                            stats_.ms_moe_rd_wait += ms_since(tw);
+                            if (m.rd_status_[sl].load(std::memory_order_acquire) < 0) {
+                                // the source cannot raw-read (no file): fall back to the mapped blob
+                                const uint8_t* b = m.src->blob(l, e);
+                                if (!b) { err = "prefill: expert source has no blob"; return false; }
+                                std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
+                            }
+                            // R8b: **THE STAGED BLOB IS ADMITTED TO THE LRU TIER.**  The prompt's routed
+                            // experts are exactly what this turn's generation and every later turn's prompt
+                            // will route; without admission every turn sweeps ~20 GB of disk again
+                            // (measured).  The frequency-aware eviction keeps a one-prompt flood from
+                            // flushing the tier's protected content.
+                            m.src->stage_admit(l, e, m.stage_host[sl]);
                             cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l),
                                             cudaMemcpyHostToDevice, m.copy);
                         }
@@ -578,6 +592,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     };
                     size_t staged = 0;
                     const size_t lookahead = STAGE - 1;
+                    const auto tm0 = Clock::now();
                     for (size_t j = 0; j < order.size(); ++j) {
                         while (staged < order.size() && staged <= j + lookahead) {
                             if (!stage_one(staged)) return false;
@@ -610,6 +625,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    stats_.ms_moe += ms_since(tmo);
                 }
                 // ---- the hyper-connection write of this half
                 gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
