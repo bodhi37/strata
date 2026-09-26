@@ -5,9 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
-
 #include <cstdio>
+#include <fstream>
+#include <immintrin.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +15,7 @@
 #else
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 namespace strata::kernels::cpu {
@@ -47,12 +48,34 @@ std::vector<int> physical_cores(bool skip_first) {
         }
     }
 #else
+    // R9a: ONE LOGICAL CPU PER PHYSICAL CORE (the first thread of each sibling set), followed by the SMT
+    // siblings in core order.  The old form listed every logical CPU the affinity mask allows and then took
+    // them in index order, so 12 workers on a 12C/24T 9900X landed as {1,2,3,...,16}: cores 0-7 each got TWO
+    // workers (both running AVX-512 drains at ~60% speed against each other) while cores 9-11 sat idle, and
+    // nothing ever ran on the siblings except by accident.  With this order the first 11 workers are alone on
+    // their cores, worker 12+ takes a sibling, and the readers/server/GPU threads have 12 siblings to land on.
     cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof set, &set) == 0)
-        for (int i = 0; i < CPU_SETSIZE; ++i)
-            if (CPU_ISSET(i, &set)) cores.push_back(i);
-    else
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        std::vector<int> phys, sib;
+        for (long i = 0; i < ncpu && i < CPU_SETSIZE; ++i) {
+            if (!CPU_ISSET((int) i, &set)) continue;
+            char path[128];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            std::ifstream f(path);
+            long first = i;
+            if (f) {
+                std::string line;
+                std::getline(f, line);
+                first = strtol(line.c_str(), nullptr, 10);
+            }
+            if (first == i) phys.push_back((int) i);
+            else sib.push_back((int) i);
+        }
+        for (int c : phys) cores.push_back(c);
+        for (int c : sib) cores.push_back(c);
+    }
+    if (cores.empty())
         for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
 #endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
@@ -127,7 +150,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
 ExpertPool::~ExpertPool() {
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    epoch_.fetch_add(1, std::memory_order_release);
+    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }
+    park_cv_.notify_all();
     for (auto& t : threads_) t.join();
 }
 
@@ -139,17 +163,22 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
-        // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
-        // iterations are spent here with nothing to do.
-        //
-        // **AND NOTHING ELSE HAPPENS IN HERE.**  This loop used to do `pauses_.fetch_add(1)` on every iteration
-        // - a locked read-modify-write, five workers against one cache line - so the workers spent their wait
-        // invalidating each other's caches and the very line the host writes to publish work.  The counter was
-        // diagnostic and nothing branched on it.  See the note on the atomics in pool.hpp.
-        while (epoch_.load(std::memory_order_acquire) == seen) {
+        // R9a: HYBRID PARK.  Spin briefly (the phases inside one layer are ~150 us apart, so most waits end
+        // inside the spin), then block on the condvar instead of burning the core through the GPU attention
+        // phases, the ring waits and the MTP draft.  `parked_` still counts this worker from entry into the
+        // wait (spin or blocked) until it observes the new epoch, so the publisher barrier is unchanged.
+        for (int spun = 0; epoch_.load(std::memory_order_acquire) == seen; ++spun) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            if (spun < kParkSpin) {
+                _mm_pause();
+                continue;
+            }
+            std::unique_lock<std::mutex> lk(park_mu_);
+            if (epoch_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed))
+                park_cv_.wait(lk, [&] {
+                    return epoch_.load(std::memory_order_acquire) != seen ||
+                           stop_.load(std::memory_order_relaxed);
+                });
         }
         if (stop_.load(std::memory_order_acquire)) return;
         seen = epoch_.load(std::memory_order_relaxed);
@@ -245,7 +274,8 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     njobs_ = n_tasks;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);
+    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }
+    park_cv_.notify_all();
     if (host_works_) drain(-1, host_scratch_);
     while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) _mm_pause();
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
@@ -356,7 +386,8 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     mode_ = 0;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);   // release: jobs_/njobs_ are visible before the bump
+    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }   // release: jobs_/njobs_ visible before the bump
+    park_cv_.notify_all();
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //

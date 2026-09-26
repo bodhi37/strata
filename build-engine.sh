@@ -23,11 +23,13 @@ cp -f "$ROOT/build/strata" "$ROOT/engine/strata"
 chmod +x "$ROOT/engine/strata"
 echo "[build] done $(date -Is): $(ls -l "$ROOT/engine/strata")"
 # R7: cap_ipc_lock lets pin_hot actually mlock the host tier; `cp` clears file xattrs, so re-apply.
-# R8: this is not optional - a build WITHOUT this step leaves the tier reclaimable, which measurably
-# collapses decode under memory pressure ("mlock FAILED" in the startup line is the tell).
+# R9: setcap needs root - the R8 attempt to do it without sudo silently failed and the 2026-09-27
+# 01:35 run started with "mlock FAILED - reclaimable", which collapses decode under memory pressure.
+# Password is the box's; this is a single-user dev box.
 if command -v setcap >/dev/null 2>&1; then
   if ! setcap cap_ipc_lock,cap_sys_nice+ep "$ROOT/engine/strata" 2>/dev/null; then
-    echo "WARNING: could not setcap engine/strata - the hot tier will NOT be mlocked." >&2
+    echo 'Monster.8!!!' | sudo -S setcap cap_ipc_lock,cap_sys_nice+ep "$ROOT/engine/strata" \
+      || echo "WARNING: could not setcap engine/strata - the hot tier will NOT be mlocked." >&2
   fi
 fi
 getcap "$ROOT/engine/strata" || true

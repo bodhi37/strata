@@ -24,6 +24,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -169,6 +171,16 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    // R9a: the park is a HYBRID.  The pure `_mm_pause` spin measured 100% of every worker's CPU on a 24-thread
+    // box (perf: ExpertPool::worker = every sample) - 12-16 cores busy-waiting through the GPU's attention
+    // phases, the ring waits and the MTP draft, starving the reader threads' futex wakeups and the desktop.
+    // Each worker now spins briefly (kParkSpin pauses, ~150 us - the phases inside one layer are that close)
+    // and then blocks on the condvar.  `parked_` semantics are unchanged: it counts a worker from the moment
+    // it enters the wait (spin or blocked) until it observes a new epoch, so the publisher barrier holds.
+    std::mutex park_mu_;
+    std::condition_variable park_cv_;
+    static constexpr int kParkSpin = 20000;
+    std::thread::id host_thread_{};   // R9a: diagnostics
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
