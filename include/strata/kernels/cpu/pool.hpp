@@ -179,7 +179,19 @@ private:
     // it enters the wait (spin or blocked) until it observes a new epoch, so the publisher barrier holds.
     std::mutex park_mu_;
     std::condition_variable park_cv_;
-    static constexpr int kParkSpin = 20000;
+    // R10: the park spin is TUNABLE at runtime (STRATA_PARK_SPIN_US, microseconds, default 2500).  The R9a
+    // fixed 150 us was sized for the 6-core upstream box whose intra-layer phases sit ~150 us apart; on the
+    // 9900X a decode window's phases are ~0.5-2.5 ms apart, so every worker BLOCKED between phases and each
+    // publish paid a staggered futex wake while the first workers to wake ate the whole task queue - the
+    // drain ran at a fraction of its threads' capacity (measured 13.5 GB/s aggregate vs a 6.2 GB/s
+    // single-thread kernel rate on 17 claimants).  A spin that covers the intra-window gaps keeps workers
+    // hot through a window; they still block between requests.  The futex-starvation concern that motivated
+    // the block (ring readers, desktop) is bounded by leaving 8 SMT siblings unclaimed by the pool.
+    int park_spin_iters_();   // pause-iteration cap per park; ~143 pauses/us on Zen 5
+    static int park_spin_iters();   // cached env read, thread-safe via function-local static
+    // R10: tasks per thread per phase (STRATA_POOL_TASKS, default 3).  51 tiny tasks per layer-phase was
+    // granularity-starved against wake jitter; with a hot spin 2-3 per thread balances tails well.
+    static int tasks_per_thread();
     std::thread::id host_thread_{};   // R9a: diagnostics
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data

@@ -15,4 +15,11 @@ void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 
+/// R10: multi-token AVX-512 IQ4_NL rows against Q8_0 activations (the down projection of every native
+/// pack here).  `w` points at the first down row, `row_bytes` is ggml_row_size(IQ4_NL, n), `hq[t]` are
+/// n-value Q8_0 buffers.  One block decodes once; each token is one load/sign/maddubs/madd.  The
+/// per-block integers equal ggml's kernel exactly; only the float addition order differs (rel ~1e-7).
+void iq4nl_rows_multi(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
+                      int r0, int r1);
+
 }  // namespace strata::kernels::cpu

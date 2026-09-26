@@ -6,6 +6,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <immintrin.h>
 
@@ -19,6 +20,24 @@
 #endif
 
 namespace strata::kernels::cpu {
+
+// R10: runtime-tunable park spin and task granularity.  See pool.hpp for why these exist.
+int ExpertPool::park_spin_iters() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PARK_SPIN_US");
+        const int us = e ? std::max(1, std::atoi(e)) : 2500;
+        return us * 143;   // ~7 ns per _mm_pause on Zen 5 at ~5 GHz
+    }();
+    return v;
+}
+
+int ExpertPool::tasks_per_thread() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_POOL_TASKS");
+        return e ? std::max(1, std::atoi(e)) : 3;
+    }();
+    return v;
+}
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
@@ -163,13 +182,15 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        // R9a: HYBRID PARK.  Spin briefly (the phases inside one layer are ~150 us apart, so most waits end
-        // inside the spin), then block on the condvar instead of burning the core through the GPU attention
-        // phases, the ring waits and the MTP draft.  `parked_` still counts this worker from entry into the
-        // wait (spin or blocked) until it observes the new epoch, so the publisher barrier is unchanged.
+        // R9a/R10: HYBRID PARK with a RUNTIME-TUNED spin.  Spin `park_spin_iters()` pauses (default ~2.5 ms,
+        // which covers every intra-window gap: attention, router, act-quant, MTP draft), then block on the
+        // condvar - so a worker stays hot on its core through a whole generation window and only sleeps
+        // between requests.  `parked_` still counts this worker from entry into the wait (spin or blocked)
+        // until it observes the new epoch, so the publisher barrier is unchanged.
+        const int spin_cap = park_spin_iters();
         for (int spun = 0; epoch_.load(std::memory_order_acquire) == seen; ++spun) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            if (spun < kParkSpin) {
+            if (spun < spin_cap) {
                 _mm_pause();
                 continue;
             }
@@ -317,7 +338,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
     const int threads = n_ + (host_works_ ? 1 : 0);
-    mtasks_ = 3 * threads;
+    mtasks_ = tasks_per_thread() * threads;
     mrows_ = (int64_t) n * FF;
     run_phase(3, mtasks_);
     const auto t1 = std::chrono::steady_clock::now();
@@ -345,7 +366,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
+        mtasks_ = tasks_per_thread() * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
