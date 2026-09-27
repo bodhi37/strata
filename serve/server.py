@@ -10,6 +10,7 @@ data, http(s) URLs or local file paths) go through `strata-vision` (the model's 
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
+An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
 `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
@@ -42,6 +43,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -321,7 +323,9 @@ class Service:
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
-    def prepare(self, messages, tools, kwargs, max_new):
+    def prepare(self, messages, tools, kwargs, max_new=None):
+        """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+        the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
@@ -352,10 +356,16 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        if len(ids) + max_new > self.engine.max_context:
+        room = self.engine.max_context - CTX_SLACK - len(ids)
+        if max_new is None or max_new <= 0:
+            if room < 1:
+                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                 f"({self.engine.max_context}); requests are never truncated")
+            max_new = room
+        elif max_new > room:
             raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                              f"({self.engine.max_context}); requests are never truncated")
-        return ids, kwargs.get("enable_thinking", True) is not False
+        return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -703,10 +713,8 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
-            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 1024)
-            if max_new <= 0:                             # a non-positive budget (some clients send -1) means "unset"
-                max_new = 1024
-            ids, thinking = svc.prepare(messages, tools, kw, max_new)
+            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
@@ -727,10 +735,8 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             messages, tools, kw = anthropic_to_messages(req)
-            max_new = int(req.get("max_tokens") or 1024)
-            if max_new <= 0:                             # a non-positive budget (some clients send -1) means "unset"
-                max_new = 1024
-            ids, thinking = svc.prepare(messages, tools, kw, max_new)
+            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
