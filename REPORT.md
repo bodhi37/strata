@@ -127,7 +127,70 @@ coverage only 18% of layers need a read at all, and the ring-wait would fall fro
 
 ---
 
-## 1. Which "Strata"
+## 0.6 R13 TAKEOVER (2026-09-27 evening) — environment fixes, honest baseline, and where the wall actually is
+
+### 0.6.1 Environment bugs found and fixed (each one blocked real work)
+
+| bug | symptom | fix |
+| --- | --- | --- |
+| **GPU persistence mode off** | every engine start dies with `native embedding: cannot pin 644 MiB` — actually `cudaErrorDevicesUnavailable`; the ~1 s of CPU init races the driver tearing GPU state down | `sudo nvidia-smi -pm 1` (reboot-volatile; re-apply after reboot) |
+| **Concurrent clients on one session** | outputs mixing topics across requests, 0-token responses, HTTP 400s — the kv-cache agent's harness and the bench shared one engine session; interleaved renders contaminated each other | never benchmark a shared server; one client at a time, private port |
+| **`pkill -f` self-match** | launcher shells SIGTERM'd themselves mid-restart | srv.sh's `[e]` bracket pattern, or kill by PID |
+| **Port 8111 contention** | engine killed silently mid-bench (harness restarts "its" port) | bench on 8123+ |
+
+### 0.6.2 Engine changes this session (committed on `r9-hillclimb`)
+
+* **R13a: O_DIRECT expert reads** (`expert_source.cpp/.hpp`, commit `4eca284`). Ring / prefill-staging /
+  tier-fill reads go through an `O_RDONLY|O_DIRECT` twin fd with a thread-local 4 KiB-aligned bounce buffer
+  (blob offsets are 256 B-aligned, ring dsts are heap vectors). Kills the per-read page-cache
+  alloc/copy/`DONTNEED` cycle. Buffered pread+DONTNEED remains as automatic fallback; `STRATA_NO_ODIRECT=1`
+  is the A/B arm. **Measured: NEUTRAL on decode** (30.4 s vs 31.1 s for the same 150-token request; identical
+  output text at temperature 0 — a free correctness check of the direct path).
+* `NativeEmbed::load` now reports the cudaErrorString (this is what exposed the persistence-mode bug).
+
+### 0.6.3 Honest baseline (IQ3_XXS, r13-base = r12-static config + O_DIRECT, single client, 200-token gens)
+
+`scratch/r11_decode_bench.py`, six topics, temperature 0, all **OK** (coherent; single client):
+
+| run | min | median | max |
+| --- | ---: | ---: | ---: |
+| run1 (cold-ish) | 6.31 | 8.00 | 9.18 |
+| run2 (warm) | 4.79 | 7.25 | 9.88 |
+
+Warm is NOT faster: the tier is static and every topic switch is a full cache MISS that re-reads that
+domain's tail from the SSD. 300-token gens reach ~14.1 tok/s (the working set warms within a request).
+
+### 0.6.4 Where the wall actually is (measured this session, replaces guesswork)
+
+* Per ~200-token request the engine pulls **5.3-5.4k blobs / 11.7 GB** from the arena (8.3% of routed ids
+  miss the 24.5 GiB tier). Prefill **saturates the drive** (peak 845 MB/s, 16 parallel staging readers).
+* **Decode cannot** — the misses arrive spread across the 48 strictly serial layers, so the drive sits at
+  QD1-2: 35-190 MB/s during decode, ringwait ~230 ms per verify window of ~2.2 tokens. 2.18 MB / ~3.5 ms =
+  0.63 GB/s ≈ the observed 0.54-0.56 GB/s effective rate. **This is a latency wall, not a bandwidth wall:
+  parallel readers, O_DIRECT, and kSplit cannot touch it.** (O_DIRECT measured neutral, confirming.)
+* Consequences: decode improves only via (a) fewer misses (more resident GiB — zram is DEAD for experts,
+  the payloads measured 1.008x incompressible in R7; host footprint reclaim is the remaining RAM source),
+  (b) more tokens per verify window (MTP spec tuning — but larger windows fetch MORE distinct experts per
+  window, so the amortization is not free), (c) offloading misses to the GPU PCIe path (`--pcie-frac`,
+  default 0.55, untested higher), or (d) merging neighboring blob reads per layer.
+* Prefill's ceiling on big prompts is the ~53% of the arena a chunk sweeps; coverage ~97% would make
+  prefill compute-bound (R10.5 measured 694 tok/s warm).
+
+### 0.6.5 Staged and NOT yet measured (next session starts here)
+
+1. `strata-r13-admit.json` — dynamic LRU tier + `STRATA_PREFILL_ADMIT=1`: prefill's sweep pays for its
+   reads anyway, so admitting them lets the decode after a prefill run warm (multi-turn/agentic reuse).
+   Count-0 admits + frequency-aware eviction protect the profile blobs. **Bench was interrupted — run it.**
+2. `strata-r13-spec6.json` (admit + `--spec 6`) and `strata-r13-spin.json` (+ `STRATA_PARK_SPIN_US=250`).
+3. `--pcie-frac` sweep (0.8/1.0): GPU computes more of the misses beside the CPU pool.
+4. Host RAM reclaim (dense pool 1416 MiB, embedding 644 MiB — VRAM already holds both) → bigger tier.
+5. Rebuild `data/profile-r10.bin` from the freshest counts (24576 sampled now).
+6. IQ3_M / IQ4_XS bake-off at the 20-30 gate (configs exist from R7; re-derive tier for the bigger arenas).
+7. The GPU expert hit path still carries the engine's "NOT CORRECT" warning (divergence vs cache-off at
+   2.97% hits: first diff token 40). Coherence gates pass with it on, but a KL eval cache-on/off would
+   settle whether the VRAM tier can grow.
+
+
 
 The task's reference URL returned 404 on 2026-09-25 and the `nikko1221` account had 0 public repos.
 Case variants were tested; **`Niko1221`** (capital N, single k) owns the repo and it clones and
