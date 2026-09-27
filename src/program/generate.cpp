@@ -41,6 +41,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "sess_record.hpp"
 
 #include <cuda_runtime.h>
 
@@ -1890,7 +1891,10 @@ int main(int argc, char** argv) {
     //
     // and each generated token is written to stdout as `T <id>` as soon as its verify window is done, followed by
     //
-    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length> [<sess_len>]
+    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length> <sess_len> [<reused> <prefilled>]
+    //
+    // (`sess_len` is the engine's committed token stream length - the plan v0.4 P8c session
+    // record; `reused`/`prefilled` report how many prompt tokens the cache carried vs prefilled.)
     //
     // (`ERR <message>` instead when a request cannot run; `QUIT` ends the process).  A plain `GEN` starts from
     // an empty sequence (`session_zero`): the prompt goes through the batched prompt path and its last token
@@ -1949,7 +1953,18 @@ int main(int argc, char** argv) {
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
         std::vector<int64_t> cur;
-        long long sess_len = 0;   // plan v0.3 P8b: live cells the session covers (prompt + accepted tokens)
+        // plan v0.4 P8c: the engine owns the committed token stream.  `rec` is the append-only log
+        // of the token ids whose session state (QSA KV + indexer, GDN, PLE, ple_prev) is resident;
+        // it is appended only where state advances and cleared exactly where session_zero runs, so
+        // rec.len() IS the live length the DONE line reports and the reuse gate verifies against -
+        // one source of truth, content-checked every request.
+        strata::program::SessionRecord rec;
+        rec.reserve(o.max_context);
+        const bool cache_disabled = [] {
+            const char* v = std::getenv("STRATA_NO_PREFIX_CACHE");
+            return v != nullptr && v[0] == '1';
+        }();
+        long long cache_hits = 0, cache_misses = 0;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
@@ -2034,7 +2049,7 @@ int main(int argc, char** argv) {
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
         // **A RESIDENT ENGINE MUST NOT DIE BECAUSE ONE REQUEST DID.**  Every failure below is request-scoped:
-        // the next request runs `session_zero` unless it explicitly KEEPs, and clearing `sess_len` here makes
+        // the next request runs `session_zero` unless the record verifies, and clearing the record here makes
         // reuse impossible, so a half-built session can never be continued.  Before this, the ERR line went to a
         // buffered stdout and the process left the loop - the server only saw a closed pipe and reported "the
         // engine process ended", which is how a VRAM exhaustion turned into silent empty responses.
@@ -2042,7 +2057,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: request aborted: %s\n", why.c_str());
             std::printf("ERR %s\n", why.c_str());
             std::fflush(stdout);
-            sess_len = 0;
+            rec.reset();
         };
         while (std::getline(std::cin, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -2170,14 +2185,25 @@ int main(int argc, char** argv) {
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); continue; }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
-            // plan v0.3 P8b: KEEP reuses the live session when the new prompt extends it exactly.
-            bool reuse = !geni && keep_n > 0 && keep_n <= sess_len && keep_n < n && mrope_identity;
-            if (reuse && keep_n != sess_len) reuse = false;   // the state cannot rewind
-            if (!reuse) {
+            // plan v0.4 P8c: reuse is unconditional, automatic, and content-verified.  The live
+            // session is kept when the engine's own committed record is a token-exact prefix of the
+            // proposed stream - the wire's KEEP hint is advisory, the record is the evidence.  Any
+            // mismatch (edited history, new conversation, restart, stale server view) is a clean
+            // miss: session_zero + full prefill, indistinguishable from a cold start.
+            const bool reuse = !geni && !cache_disabled && mrope_identity && rec.len() > 0 &&
+                               rec.len() < n && rec.is_prefix_of(ids.data(), n);
+            const long long reused_tok = reuse ? rec.len() : 0;
+            if (reuse) {
+                ++cache_hits;
+            } else {
+                ++cache_misses;
                 strata::core::session_zero(ss, g, nullptr, main_cs);
-                sess_len = 0;
-                keep_n = 0;
+                rec.reset();
             }
+            keep_n = reuse ? rec.len() : 0;   // the parsed KEEP hint is ignored; the record decides
+            std::fprintf(stderr, "strata serve: cache: %s, keep %lld of %lld prompt tokens "
+                                 "(hits %lld / misses %lld)\n", reuse ? "HIT" : "MISS", (long long) keep_n,
+                         (long long) n, cache_hits, cache_misses);
             cudaStreamSynchronize(main_stream);
             mtp.set_prompt_len(n);
             std::vector<std::pair<int32_t, int32_t>> lent_now;
@@ -2194,6 +2220,7 @@ int main(int argc, char** argv) {
                 request_failed("prefill failed: " + err);
                 continue;
             }
+            if (n - keep_n > 1) rec.append(ids.data() + keep_n, n - 1 - keep_n);   // ids[n-1] commits via the first window
             for (const auto& [i, slot] : lent_now) {
                 const int64_t lb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 // R10: refill through the PINNED staging buffer + `read_blob` (one whole-blob pread, or a
@@ -2226,6 +2253,14 @@ int main(int argc, char** argv) {
             std::vector<float> dprob((size_t) S, 0.0f);
             bool first_window = true;
             int64_t produced_n = 0;
+            // plan v0.4 P8c: the in-flight token.  When a window emits its own proposal (outv[a])
+            // that token has no committed cell yet; `pending_*` remembers it and the fix-up after
+            // the loop commits it, so the record covers the whole emitted stream (stop token
+            // included) when the request ends.
+            bool pending_fix = false;
+            bool fixup_committed = false;
+            int32_t pending_tok = 0;
+            int64_t pending_pos = 0;
             // R7: MTP acceptance, the amortisation factor for the expert fetches.  `tokens/round` is the number
             // of decode steps each expert read is charged to, so it multiplies the effective expert bandwidth.
             int64_t win_rounds = 0, win_tokens = 0, win_accepted = 0;
@@ -2270,14 +2305,35 @@ int main(int argc, char** argv) {
                 ++win_rounds;
                 win_tokens += T;
                 win_accepted += a;
+                // plan v0.4 P8c: commit exactly the stream that will be emitted.  `e` is the last
+                // index of outv[0..a] this window emits (eos, or the max_new cut, whichever comes
+                // first).  For e < a the eos (or the length-cut token) is an ACCEPTED DRAFT with a
+                // cell, so commit(e+2) commits precisely the emitted stream and the drafts beyond
+                // it (which a clean prefill never sees) are never consumed by GDN/PLE.  For
+                // e == a the newest emitted token is the fresh PROPOSAL with no cell: commit(a+1)
+                // and remember it as pending - the fix-up after the loop processes it.
+                int e = a;
+                for (int i = 0; i <= a; ++i)
+                    if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                        e = i;
+                        break;
+                    }
+                e = std::min(e, (int) std::min<int64_t>(a, max_new - produced_n - 1));
+                const int nk = (e < a) ? e + 2 : a + 1;
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                if (!ver.commit(nk, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     request_failed("verify commit failed: " + err);
                     continue;
+                }
+                rec.append(window.data(), nk);
+                pending_fix = e == a;
+                if (pending_fix) {
+                    pending_tok = outv[(size_t) a];
+                    pending_pos = p + a + 1;
                 }
                 first_window = false;
                 bool eos = false;
@@ -2305,8 +2361,35 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            // plan v0.4 P8c: resolve the in-flight token.  The last window's proposal (normally the
+            // stop token) has no committed cell yet; one T=1 window processes it so the committed
+            // state covers the whole emitted stream - exactly the seam the next turn's suffix
+            // prefill continues from.  Without it the record would be one token short of the
+            // stream the server caches (the original P8b defect: silent state divergence).  If it
+            // does not fit or fails, drop the record - the next turn is a clean full prefill.
+            if (pending_fix) {
+                if (pending_pos + 1 > o.max_context) {
+                    rec.reset();
+                } else if (!ver.run(1, &pending_tok, pending_pos, &drive_pool_multi, &drive, outv.data(), err) ||
+                           drive.d.failed) {
+                    std::fprintf(stderr, "strata serve: the end-of-turn fix-up failed (%s); the cache is dropped\n",
+                                 drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    rec.reset();
+                } else if (!ver.commit(1, err)) {
+                    std::fprintf(stderr, "strata serve: the end-of-turn fix-up commit failed (%s); the cache is dropped\n",
+                                 err.c_str());
+                    rec.reset();
+                } else {
+                    rec.append(pending_tok);
+                    fixup_committed = true;
+                }
+            }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
-            sess_len = n + produced_n;   // the live state now covers prompt + accepted tokens
+            // plan v0.4 P8c observability: the DONE line now ends with `reused` and `prefilled` -
+            // whether the cache engaged and how many tokens each side cost.  A feature that
+            // silently never engages is the failure mode this replaces; the numbers are visible
+            // on every request.
+            const long long prefilled_tok = (n - 1 - keep_n) + (fixup_committed ? 1 : 0);
             // ---- R7: WHERE THE EXPERT BYTES CAME FROM, AND WHAT THEY COST.  The R5 line below reported only
             // the lookups that REACHED the hot-tier check, so a blob answered from the pread ring or from the
             // file mapping was invisible and a disk-bound run could print "100% hot".  These figures are
@@ -2368,8 +2451,8 @@ int main(int argc, char** argv) {
                                  pool.ms_multi_down * per);
                 }
             }
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld\n", (long long) produced_n, (long long) n, prompt_ms,
-                        decode_ms, finish, (long long) sess_len);
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", (long long) produced_n, (long long) n,
+                        prompt_ms, decode_ms, finish, (long long) rec.len(), reused_tok, prefilled_tok);
             std::fflush(stdout);
             std::fprintf(stderr, "strata serve: %lld prompt tokens in %.0f ms (%.1f tok/s), %lld generated in %.0f ms "
                                  "(%.1f tok/s)\n", (long long) n, prompt_ms, prompt_ms > 0 ? 1000.0 * n / prompt_ms : 0.0,

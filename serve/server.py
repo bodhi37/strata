@@ -50,22 +50,37 @@ class Engine(Protocol):
 
 
 class MockEngine:
-    """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token."""
+    """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.
+
+    It speaks the same surface contract as `StrataEngine` (`generate(..., keep=)`, the `last`
+    DONE fields incl. `sess`), so the prefix-cache path in `Service` is exercisable without the
+    GPU: the reported `sess` covers the full prompt + the emitted tokens exactly as the real
+    engine's session record does."""
 
     def __init__(self, tokenizer, script: str, max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
         self.script = tokenizer.encode(script, parse_special=True) + tokenizer.encode(IM_END, parse_special=True)
         self.last_prompt: list[int] = []
+        self.last = {}
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, keep=0):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
+        emitted = 0
         for t in self.script[:max_new]:
             if cancel.is_set():
-                return
+                break
             if self.delay:
                 time.sleep(self.delay)
+            emitted += 1
             yield t
+        self.last = {"generated": emitted, "prompt_tokens": len(ids), "prompt_ms": 0.0, "decode_ms": 0.0,
+                     "finish": "stop" if emitted and self.script[emitted - 1] in self.stop_ids else "length",
+                     "sess": len(ids) + emitted, "reused": keep, "prefilled": max(0, len(ids) - 1 - keep)}
+
+    @property
+    def stop_ids(self):
+        return set(self.tok.encode(IM_END, parse_special=True) + self.tok.encode("<|endoftext|>", parse_special=True))
 
 
 class StrataEngine:
