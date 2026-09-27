@@ -501,7 +501,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         gr_silu(m.lo, m.lo16, ts, m.cs);
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, ts, su, err)) return false;
                         if (!bf16_proj(m.gemm, wi, m.xn16, m.inj + t0 * HC, ts, si, err)) return false;
-                        gr_mix(m.xn, m.gated, m.mixed + t0 * N, m.mixed_bf + t0 * N, ts, m.cs, m.mixed_h + t0 * N);
+                        // R11 FIX: m.mixed is TILE-sized per-tile scratch (write-only, R10.5); it must not be
+                        // indexed with the chunk offset t0 - for t0 > 0 that writes past the buffer into
+                        // mixed_bf/mixed_h/bo and corrupts the router, the shared expert and every native
+                        // projection downstream (the "!!!!!"/degenerate-logits failure on long prefills).
+                        gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf + t0 * N, ts, m.cs, m.mixed_h + t0 * N);
                         if (!bf16_proj(m.gemm, wr, m.mixed_bf + t0 * N, m.logits, ts, v.name("ffn_gate_inp.weight"), err)) return false;
                         route(m.logits, m.ids, m.w + t0 * K, ts, m.cs);
                         cudaMemcpyAsync(m.ids_host.data() + (size_t) t0 * K, m.ids, (size_t) ts * K * 4,
@@ -693,7 +697,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         gr_silu(m.lo, m.lo16, ts, m.cs);
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, ts, su, err)) return false;
                         if (!bf16_proj(m.gemm, wi, m.xn16, m.inj + t0 * HC, ts, si, err)) return false;
-                        gr_mix(m.xn, m.gated, m.mixed + t0 * N, m.mixed_bf + t0 * N, ts, m.cs, m.mixed_h + t0 * N);
+                        gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf + t0 * N, ts, m.cs, m.mixed_h + t0 * N);
                         if (!qsa_l) {
                             // ============ GDN ============
                             float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
