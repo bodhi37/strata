@@ -73,7 +73,12 @@ class MockEngine:
 
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
-    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough."""
+    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
+
+    Per-request sampling rides the same line as engine-side keys between max_new and the ids
+    (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
+    engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
+    """
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
@@ -105,11 +110,51 @@ class StrataEngine:
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
 
+    @staticmethod
+    def sampling_keys(sampling: dict) -> str:
+        keys = ""
+        t = sampling.get("temperature")
+        if isinstance(t, (int, float)) and float(t) > 0.0:
+            keys += f" temperature={float(t)!r}"
+        tp = sampling.get("top_p")
+        if isinstance(tp, (int, float)) and float(tp) < 1.0:
+            keys += f" top_p={float(tp)!r}"
+        tk = sampling.get("top_k")
+        if isinstance(tk, int) and 1 <= tk <= 64:
+            keys += f" top_k={tk}"        # the engine's sampled path takes 1..64; outside it keeps its 20
+        mp = sampling.get("min_p")
+        if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
+            keys += f" min_p={float(mp)!r}"
+        rp = sampling.get("repetition_penalty")
+        rp_on = isinstance(rp, (int, float)) and float(rp) != 1.0
+        pf = sampling.get("frequency_penalty")
+        pf_on = isinstance(pf, (int, float)) and float(pf) != 0.0
+        pp = sampling.get("presence_penalty")
+        pp_on = isinstance(pp, (int, float)) and float(pp) != 0.0
+        if rp_on:
+            keys += f" penalty_repeat={float(rp)!r}"
+        if pf_on:
+            keys += f" penalty_freq={float(pf)!r}"
+        if pp_on:
+            keys += f" penalty_present={float(pp)!r}"
+        if rp_on or pf_on or pp_on:
+            # a penalty without a window counts over nothing: the engine's default is the last 64 tokens
+            pln = sampling.get("penalty_last_n")
+            if isinstance(pln, int) and not isinstance(pln, bool) and pln > 0:
+                keys += f" penalty_last_n={pln}"
+            else:
+                keys += " penalty_last_n=64"
+        seed = sampling.get("seed")
+        if isinstance(seed, int) and seed > 0:
+            keys += f" seed={seed}"
+        return keys
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
-        head = f"GENI {int(max_new)} {embeddings}" if embeddings else f"GEN {int(max_new)}"
+        head = f"GENI {int(max_new)} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         self.proc.stdin.flush()
         done = False
@@ -313,8 +358,9 @@ class Detokenizer:
 
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
-                 vision: Vision | None = None):
+                 vision: Vision | None = None, sampling_defaults: dict | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -402,6 +448,9 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+        if self.sampling_defaults:     # config defaults; the request's own fields win (explicit 0 stays greedy)
+            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
+            sampling = {**self.sampling_defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -771,6 +820,59 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
+def sampling_defaults_from_config(cfg: dict) -> dict:
+    """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
+    a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
+    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
+    always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
+    A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
+    are named at startup and ignored."""
+    out = {}
+    for key, value in (cfg.get("sampling") or {}).items():
+        if value is None:
+            continue
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if key == "temperature":
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+            out[key] = float(value)
+        elif key == "top_p":
+            if not number or not 0 < value <= 1:
+                raise SystemExit(f"[strata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+            out[key] = float(value)
+        elif key == "min_p":
+            if not number or not 0 <= value <= 1:
+                raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+            out[key] = float(value)
+        elif key == "top_k":
+            if not number or value != int(value) or not 1 <= value <= 64:
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            out[key] = int(value)
+        elif key == "presence_penalty":
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+            out[key] = float(value)
+        elif key == "frequency_penalty":
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+            out[key] = float(value)
+        elif key == "repetition_penalty":
+            if not number or value <= 0:
+                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+            out[key] = float(value)
+        elif key == "penalty_last_n":
+            if not number or value != int(value) or value < 0:
+                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+            out[key] = int(value)
+        elif key == "seed":
+            if not number or value != int(value) or value <= 0:
+                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+            out[key] = int(value)
+        else:
+            print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -811,6 +913,10 @@ def main() -> int:
             ap.error("--engine strata needs --config")
         vision = None
         env = child_env(cfg)
+        sampling_defaults = sampling_defaults_from_config(cfg)
+        if sampling_defaults:
+            pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
+            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
@@ -818,11 +924,12 @@ def main() -> int:
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
     else:
-        engine, vision = MockEngine(tok, a.script), None
+        engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision)
+                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  sampling_defaults=sampling_defaults)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     httpd = serve(svc, host=a.host, port=a.port)
     print(f"ready: http://{a.host}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
