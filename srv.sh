@@ -11,7 +11,7 @@ SESSION="srv${PORT}"
 
 stop_server() {
   tmux kill-session -t "$SESSION" 2>/dev/null
-  for pid in $(pgrep -f 'serve[r]/server\.py'); do kill "$pid" 2>/dev/null; done
+  for pid in $(pgrep -f 'serv[e]/server\.py'); do kill "$pid" 2>/dev/null; done
   for pid in $(pgrep -f 'strat[a]/engine/strata '); do kill "$pid" 2>/dev/null; done
   sleep 3
   for pid in $(pgrep -f 'strat[a]/engine/strata '); do kill -9 "$pid" 2>/dev/null; done
