@@ -44,7 +44,7 @@ model - is set up for you.
    - **Images?** Whether it should also read pictures
 
 Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens a chat page at `http://127.0.0.1:8080`.
+where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
 
 **Next time**, just double-click `START-HERE.bat` again: it starts right away, nothing is downloaded twice. Close its
 window to stop the model.
@@ -91,7 +91,8 @@ Not sure? Take **IQ2_XS**. You can add another one later with `START-HERE.bat --
 
 ## Using it
 
-- **Chat in the browser:** `http://127.0.0.1:8080` - a simple chat page (it opens by itself when the model starts).
+- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
+  live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
 - **Chat in the terminal:** `.venv\Scripts\python chat.py`
 - **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
   **`http://127.0.0.1:8080/v1`**, any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages`.

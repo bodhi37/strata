@@ -126,5 +126,69 @@ class MaxTokens(unittest.TestCase):
             del os.environ["STRATA_DEBUG"]
 
 
+class WebApp(unittest.TestCase):
+    """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def get(self, path, headers=None):
+        req = urllib.request.Request(self.base + path, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers.get("Content-Type", ""), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Content-Type", ""), e.read()
+
+    def test_page_and_files(self):
+        code, ctype, body = self.get("/")
+        self.assertEqual(code, 200)
+        self.assertIn("text/html", ctype)
+        self.assertIn(b"/web/app.js", body)
+        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
+                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
+            with self.subTest(path=path):
+                code, ctype, _ = self.get(path)
+                self.assertEqual(code, 200)
+                self.assertIn(want, ctype)
+
+    def test_only_the_app_files_are_served(self):
+        for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
+                     "/fonts/missing.woff2", "/fonts/x.ttf"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(path)[0], 404)
+
+    def test_metrics(self):
+        data = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
+        urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data,
+                                                      headers={"Content-Type": "application/json"}), timeout=10).read()
+        code, ctype, body = self.get("/metrics")
+        self.assertEqual(code, 200)
+        m = json.loads(body)
+        for key in ("engine", "live", "requests", "hardware", "hardware_static", "history"):
+            self.assertIn(key, m)
+        self.assertEqual(m["engine"]["max_context"], CTX)
+        self.assertEqual(m["live"]["state"], "idle")
+        self.assertEqual(m["requests"][0]["output_tokens"], 5)
+
+    def test_metrics_need_the_key_when_one_is_set(self):
+        self.svc.api_key = "secret"
+        try:
+            self.assertEqual(self.get("/metrics")[0], 401)
+            self.assertEqual(self.get("/metrics", {"Authorization": "Bearer secret"})[0], 200)
+            self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
+        finally:
+            self.svc.api_key = ""
+
+
 if __name__ == "__main__":
     unittest.main()

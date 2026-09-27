@@ -130,8 +130,16 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, a small
-page that shows it is running and lets you chat. The API is at `http://127.0.0.1:8080/v1` for your apps.
+download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
+app. It has three tabs:
+- **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
+  images are on, and sampling and thinking-level settings. Chats stay in your browser.
+- **Monitor:** what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s); GPU load,
+  VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
+- **About:** the model and engine settings, and the addresses to connect other apps.
+
+`http://127.0.0.1:8080/?q=your question` opens it with a new chat already asking. The API is at
+`http://127.0.0.1:8080/v1` for your apps.
 
 **Every time after that**, `START-HERE.bat` just starts the model (30-90 s to load 34-43 GB into RAM). Nothing is
 downloaded again. Closing the window stops the model.
@@ -176,6 +184,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | Model list / health | `GET /v1/models`, `GET /health` |
 | What the model is doing right now | `GET /status` |
+| Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{

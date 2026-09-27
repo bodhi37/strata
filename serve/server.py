@@ -19,6 +19,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import collections
 import base64
 import hashlib
 import json
@@ -88,7 +89,17 @@ class StrataEngine:
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
+        self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+        try:                             # a ready-made engine's BUILD.json says its version
+            self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+        except (OSError, ValueError):
+            self.info["version"] = None
         for line in self.proc.stdout:
+            if line.startswith("INFO "):
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -109,6 +120,8 @@ class StrataEngine:
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
+        if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
+            self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -153,6 +166,7 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        self.progress = None
         head = f"GENI {int(max_new)} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
@@ -174,7 +188,10 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     yield int(line[2:])
-                elif line.startswith("PP "):             # prompt progress, one per chunk: also a heartbeat (the
+                elif line.startswith("PP "):
+                    f = line.split()
+                    if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
+                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
@@ -365,9 +382,51 @@ class Service:
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.history = collections.deque(maxlen=30)     # the last finished requests, newest last (GET /metrics)
         self.status_lock = threading.Lock()
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def start_telemetry(self):
+        """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
+        if getattr(self, "telemetry", None) is None:
+            from serve.telemetry import Telemetry
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s()})
+
+    def _tok_s(self):
+        with self.status_lock:
+            s = dict(self.status)
+        if not s.get("busy") or not s.get("first_token"):
+            return 0.0
+        return s["generated"] / max(1e-6, time.time() - s["first_token"])
+
+    def metrics(self) -> dict:
+        """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
+        the hardware (with a minute of history per series)."""
+        with self.status_lock:
+            s = dict(self.status)
+            hist = list(self.history)
+        now = time.time()
+        progress = getattr(self.engine, "progress", None)
+        if s.get("busy") and s.get("first_token") is None:
+            state = "reading"
+        elif s.get("busy"):
+            state = "generating"
+        else:
+            state = "idle"
+        live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
+                "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
+                "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
+                "max_tokens": s.get("max_tokens") if s.get("busy") else None,
+                "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
+                "tok_s": round(self._tok_s(), 1) if state == "generating" else None}
+        if state == "reading" and progress:
+            live["prompt_read"], live["prompt_total"] = progress
+        engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+                  **dict(getattr(self.engine, "info", {}) or {})}
+        tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+        return {"engine": engine, "live": live, "requests": hist[::-1], "hardware": tel["now"], "hardware_static":
+                tel["static"], "history": tel["history"], "time": now}
 
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
@@ -497,6 +556,14 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
                 if self.status.get("busy"):
+                    last = dict(getattr(self.engine, "last", {}) or {})
+                    started = self.status.get("started", time.time())
+                    self.history.append({
+                        "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                        "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
+                        "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                        "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                        if n and last.get("generated") and last.get("decode_ms") else None})
                     now = time.time()
                     el = now - self.status.get("started", now)
                     ft = self.status.get("first_token")
@@ -713,8 +780,46 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/fonts/"):
+                # the web app's fonts, only if they are installed locally (serve/web/fonts); the page falls back
+                # to the system font without them
+                name = path[len("/fonts/"):]
+                f = ROOT / "serve" / "web" / "fonts" / name
+                if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                body = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "font/woff2")
+                self.send_header("Cache-Control", "max-age=86400")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path.startswith("/web/"):
+                # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
+                name = path[len("/web/"):]
+                types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                         ".svg": "image/svg+xml"}
+                f = ROOT / "serve" / "web" / name
+                ext = os.path.splitext(name)[1]
+                if "/" in name or "\\" in name or ext not in types or not f.is_file():
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                body = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", types[ext])
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/metrics":
+                if self._authorized():
+                    self._json(200, svc.metrics())
+                return
             if path == "":
-                body = (ROOT / "serve" / "index.html").read_bytes()
+                body = (ROOT / "serve" / "web" / "index.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -815,6 +920,7 @@ class Server(ThreadingHTTPServer):
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
