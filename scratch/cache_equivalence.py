@@ -19,6 +19,7 @@ import random
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 IM_END = 151645  # <|im_end|>
 
@@ -65,19 +66,34 @@ class Engine:
             self.p.kill()
 
 
-def build_prompts(tok_dir, n2_text="  The reef itself was older than the charts claimed; storms had redrawn it twice."):
-    """Natural-text prompt segments (near-uniform logits on random ids turn argmax into coin
-    flips; real text gives confident logits so only real state divergence can flip a token)."""
-    from tokenizers import Tokenizer
-    tk = Tokenizer.from_file(tok_dir.rstrip("/") + "/tokenizer.json")
+def build_prompts(tok_dir):
+    """Chat-framed natural-text prompts (near-uniform logits on random ids turn argmax into coin
+    flips; real text with real questions gives confident logits and substantive generations, so
+    only real state divergence can flip a token).  p1 ends at the assistant generation prompt;
+    s2 continues after the reply's <|im_end|>, exactly like the server's seam."""
+    import json
+    import sys
+    sys.path.insert(0, "tools")
+    import strata_tokenizer as ST
+    vocab = json.loads((Path(tok_dir) / "vocab.json").read_text(encoding="utf-8"))
+    tokens = [None] * len(vocab)
+    for t, i in vocab.items():
+        tokens[i] = t
+    merges = (Path(tok_dir) / "merges.txt").read_text(encoding="utf-8").split("\n")
+    types = json.loads((Path(tok_dir) / "token_type.json").read_text())
+    tk = ST.Tokenizer(tokens, merges, types)
     passage = ("The lighthouse keeper Elara kept a ledger of every ship that passed the reef. In forty years "
                "she had logged 12,304 vessels and saved 97 crews, and she never once left the lamp unlit. "
-               "Her cat Barnaby supervised from the windowsill each evening.")
-    p1 = tk.encode(passage).ids
-    s2 = tk.encode(n2_text).ids
+               "Her cat Barnaby supervised from the windowsill each evening. ")
+    p1 = tk.encode("<|im_start|>user\n" + passage +
+                   "Now answer: what did Elara log every single day, and how many crews did she save? "
+                   "Reply with two short sentences.<|im_end|>\n<|im_start|>assistant\n", parse_special=True)
+    s2 = tk.encode("\n<|im_start|>user\nAnd what did Barnaby do while she worked? One short sentence."
+                   "<|im_end|>\n<|im_start|>assistant\n", parse_special=True)
     rng = random.Random(7)
-    disjoint = tk.encode("Completely unrelated filler about quantum kettles and municipal bicycle policy. "
-                         "The council met on Tuesday and voted nine to four against the proposal. ").ids
+    disjoint = tk.encode("<|im_start|>user\nCompletely unrelated filler about quantum kettles and municipal "
+                         "bicycle policy. The council met on Tuesday and voted nine to four against the "
+                         "proposal.<|im_end|>\n<|im_start|>assistant\n", parse_special=True)
     disjoint = (disjoint * 2)[:96]
     return p1, s2, disjoint
 
