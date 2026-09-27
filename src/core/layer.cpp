@@ -492,7 +492,7 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     p.pages = (max_cells + s.page_size - 1) / s.page_size;
     p.slots = p.pages;
     p.pooled_rows = max_cells / s.idx_block + 2;
-    if (g_kv_resident <= 0) return p;
+    if (g_kv_resident <= 0 || ring_cells < 0) return p;   // ring_cells < 0: always fully resident
     // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers
     static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
     static const bool main_off = std::getenv("STRATA_KV_MAIN_OFF") != nullptr;
@@ -599,8 +599,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
         if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess)
+            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+            if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+                                 "(lower the context, or run without --kv-resident)\n", (double) bytes / 1073741824.0);
             return 0;
+        }
         g_kv_host_bytes += bytes;
         Cursor hc{d};
         if (g_kv_int8) {

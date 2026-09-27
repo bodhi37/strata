@@ -158,11 +158,22 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     const strata::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[0].max_cells;
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
-    // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume
-    const int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
-    const uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+    // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
+    // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
+    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
+    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) {
+        if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
+        std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+        cudaGetLastError();
+        cudaFree(state_arena_);
+        st_ = QsaState{};
+        ring = -1;   // fully resident
+        sb = qsa_state_bytes(g, max_cells, false, ring);
+        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
+    }
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
