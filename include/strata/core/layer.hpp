@@ -207,6 +207,10 @@ struct QsaState {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
+    /// PR #21: Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
+    bool kv_q4 = false;
+    uint8_t* k_q4 = nullptr;
+    uint8_t* v_q4 = nullptr;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
@@ -269,6 +273,13 @@ uint64_t qsa_kv_host_bytes();
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
 bool qsa_kv_int8();
+/// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
+void qsa_set_kv_q4(bool enabled);
+bool qsa_kv_q4();
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
+inline int qsa_kv_format(const QsaState& st) {
+    return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+}
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.

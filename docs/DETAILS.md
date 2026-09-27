@@ -42,6 +42,11 @@ attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU.
 costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
 it on.
 
+**4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
+halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
+is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
+Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
+
 Time to first token is prompt length / prompt speed: about 7 s at 4K, 55 s at 32K, 4 minutes at 128K and 9 minutes at
 262K. The raw numbers: [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 

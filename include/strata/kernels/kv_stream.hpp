@@ -36,8 +36,14 @@ struct KvHostPools {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;  ///< int8 mode: fp16 scale per 64 values
     uint16_t* v_scale = nullptr;
-    bool present() const { return k_pool != nullptr || k_q != nullptr; }
+    uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
+    uint8_t* v_q4 = nullptr;
+    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
 };
+
+/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0.
+/// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)
+enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2 };
 
 /// The residency map of a streamed layer, all device memory at fixed addresses (the graphs bake them in).
 struct KvStreamMap {
@@ -62,7 +68,7 @@ void kv_stream_reset(const KvStreamMap& m, void* stream);
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
 /// (n_q x (cap / page_size + 2)); a call that cannot sets ctl[3] (see `kv_stream_counters`).
-void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, bool int8,
+void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream);
 
@@ -71,12 +77,12 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
 
 /// Copy blocks [b0, b1) of the host copy into the pool pages `page_table` names (host-side table `phys(b)`
 /// computed as `b % n_slots`: the ring restore). Not capturable.
-void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, bool int8, int64_t b0, int64_t b1,
+void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                      int64_t n_slots, const QsaShapes& s, void* stream);
 
 /// Copy the first `n_blocks` blocks of the host copy into a fully resident (identity-layout) pool: the prompt
 /// path's staging of one layer. Not capturable (DMA).
-void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, bool int8, int64_t n_blocks,
+void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream);
 
 struct KvStreamCounters {
@@ -87,6 +93,6 @@ struct KvStreamCounters {
 KvStreamCounters kv_stream_counters(const KvStreamMap& m);
 
 /// Bytes of one block (page) of K and V together.
-uint64_t kv_block_bytes(const QsaShapes& s, bool int8);
+uint64_t kv_block_bytes(const QsaShapes& s, int fmt);
 
 }  // namespace strata::kernels

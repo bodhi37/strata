@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -133,7 +134,10 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
     own.owned = o_borrowed.owned;
     Alloc& o = stage_own() ? own : o_borrowed;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
-    if (q0.kv_int8) {
+    if (q0.kv_q4) {
+        st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_int8) {
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
@@ -146,6 +150,7 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
 strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
+    p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
     p.page_table = table;
     return p;
 }
@@ -424,14 +429,23 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
                     if (staged)
-                        strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host, st.kv_int8,
+                        strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                            core::qsa_kv_format(st),
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
-                    kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                              st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                              &st.host, staged ? &m.stage : nullptr);
+                    if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): rotated K and V, the queries below too, the output back
+                        strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                      &st.host, staged ? &m.stage : nullptr);
+                    } else {
+                        kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                  st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                  &st.host, staged ? &m.stage : nullptr);
+                    }
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
+                    if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
@@ -526,6 +540,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s,
                                                                m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                     }
+                    if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;

@@ -1,5 +1,6 @@
 // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 
 #include <cuda_runtime.h>
@@ -29,10 +30,15 @@ struct Runs {
     int n;
 };
 
-Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, bool int8, const QsaShapes& s) {
+Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
     const int rows = (int) (s.n_head_kv * s.page_size);
     Runs r{};
-    if (int8) {
+    if (fmt == kKvQ4) {
+        const int bytes = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
+        r.src[0] = (const uint8_t*) host.k_q4; r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
+        r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
+        r.n = 2;
+    } else if (fmt == kKvInt8) {
         const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
         r.src[0] = (const uint8_t*) host.k_q;     r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
         r.src[1] = (const uint8_t*) host.v_q;     r.dst[1] = (uint8_t*) slots.v_q;     r.len[1] = codes;
@@ -183,9 +189,10 @@ __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slot
 
 }  // namespace
 
-uint64_t kv_block_bytes(const QsaShapes& s, bool int8) {
+uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
     const uint64_t rows = (uint64_t) (s.n_head_kv * s.page_size);
-    return int8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
+    if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+    return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }
 
@@ -194,7 +201,7 @@ void kv_stream_reset(const KvStreamMap& m, void* stream) {
     check("reset");
 }
 
-void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, bool int8,
+void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream) {
     if (n_q <= 0) return;
@@ -204,7 +211,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, int8, s));
+    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
 }
 
@@ -213,9 +220,9 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
     check("ring table");
 }
 
-void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, bool int8, int64_t b0, int64_t b1,
+void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                      int64_t n_slots, const QsaShapes& s, void* stream) {
-    const Runs r = runs_of(slots, host, int8, s);
+    const Runs r = runs_of(slots, host, fmt, s);
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
         for (int a = 0; a < r.n; ++a)
@@ -226,10 +233,10 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, bool in
     }
 }
 
-void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, bool int8, int64_t n_blocks,
+void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream) {
     if (n_blocks <= 0) return;
-    const Runs r = runs_of(stage, host, int8, s);
+    const Runs r = runs_of(stage, host, fmt, s);
     for (int a = 0; a < r.n; ++a)
         if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
                             (cudaStream_t) stream) != cudaSuccess)

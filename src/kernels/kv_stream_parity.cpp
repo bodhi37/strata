@@ -8,7 +8,8 @@
 //   2. the residency map is consistent after every call (slot_block and page_table invert each other);
 //   3. no call overflowed, and the hit/miss counters add up;
 //   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
-// INT8 and FP16 pools both.
+// INT8, FP16 and Q4_0 (PR #21) pools.
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -48,9 +49,13 @@ template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the dev
 
 struct Pools {   // one K/V pool set of `pages` pages
     k::KvHostPools p;   // reused as a plain pointer bundle
-    void alloc(int64_t pages, const k::QsaShapes& s, bool int8, bool host) {
+    void alloc(int64_t pages, const k::QsaShapes& s, int fmt, bool host) {
         const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
-        if (int8) {
+        if (fmt == k::kKvQ4) {
+            const size_t b = rows * k::kv_q4_bytes_per_head((int) s.head_dim);
+            p.k_q4 = host ? halloc<uint8_t>(b) : dalloc<uint8_t>(b);
+            p.v_q4 = host ? halloc<uint8_t>(b) : dalloc<uint8_t>(b);
+        } else if (fmt == k::kKvInt8) {
             p.k_q = host ? halloc<int8_t>(rows * s.head_dim) : dalloc<int8_t>(rows * s.head_dim);
             p.v_q = host ? halloc<int8_t>(rows * s.head_dim) : dalloc<int8_t>(rows * s.head_dim);
             p.k_scale = host ? halloc<uint16_t>(rows * 4) : dalloc<uint16_t>(rows * 4);
@@ -63,14 +68,15 @@ struct Pools {   // one K/V pool set of `pages` pages
     k::QsaAttnPools attn(const int32_t* table) const {
         k::QsaAttnPools a;
         a.k_pool = p.k_pool; a.v_pool = p.v_pool; a.k_q = p.k_q; a.v_q = p.v_q; a.k_scale = p.k_scale;
-        a.v_scale = p.v_scale; a.page_table = table;
+        a.v_scale = p.v_scale; a.k_q4 = p.k_q4; a.v_q4 = p.v_q4; a.page_table = table;
         return a;
     }
 };
 
 void append(const Pools& pl, const int32_t* table, const int32_t* step, const float* kc, const float* vc,
-            const k::QsaShapes& s, bool int8, const k::KvHostPools* host) {
-    if (int8) k::kv_append_q8_step(pl.p.k_q, pl.p.v_q, pl.p.k_scale, pl.p.v_scale, table, step, kc, vc, s, nullptr, host);
+            const k::QsaShapes& s, int fmt, const k::KvHostPools* host) {
+    if (fmt == k::kKvQ4) k::kv_append_q4_step(pl.p.k_q4, pl.p.v_q4, table, step, kc, vc, s, nullptr, host);
+    else if (fmt == k::kKvInt8) k::kv_append_q8_step(pl.p.k_q, pl.p.v_q, pl.p.k_scale, pl.p.v_scale, table, step, kc, vc, s, nullptr, host);
     else k::kv_append_step(pl.p.k_pool, pl.p.v_pool, table, step, kc, vc, s, nullptr, host);
 }
 
@@ -96,18 +102,19 @@ std::vector<int32_t> selection(int64_t n_kv, int64_t width, std::mt19937& rng) {
     return ids;
 }
 
-bool run(bool int8) {
+bool run(int fmt) {
+    const char* name = fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
     k::QsaShapes s = k::qsa_real_shapes();
     const int64_t N = 40000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;   // must evict: slots < blocks
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s), NQ = 8;
     const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head;
-    std::mt19937 rng(int8 ? 7 : 11);
+    std::mt19937 rng(7 + 4 * fmt);
     std::normal_distribution<float> nd(0.f, 1.f);
 
     Pools ref, slots, host;
-    ref.alloc(n_blocks, s, int8, false);
-    slots.alloc(n_slots, s, int8, false);
-    host.alloc(n_blocks, s, int8, true);
+    ref.alloc(n_blocks, s, fmt, false);
+    slots.alloc(n_slots, s, fmt, false);
+    host.alloc(n_blocks, s, fmt, true);
     int32_t* ident = dalloc<int32_t>(n_blocks);
     {
         std::vector<int32_t> t(n_blocks);
@@ -143,8 +150,8 @@ bool run(bool int8) {
         ck(cudaMemcpy(kc, hk.data(), hk.size() * 4, cudaMemcpyHostToDevice), "k");
         ck(cudaMemcpy(vc, hv.data(), hv.size() * 4, cudaMemcpyHostToDevice), "v");
         ck(cudaMemcpy(step, st, sizeof(st), cudaMemcpyHostToDevice), "step");
-        append(ref, ident, step, kc, vc, s, int8, nullptr);
-        append(slots, m.page_table, step, kc, vc, s, int8, &host.p);
+        append(ref, ident, step, kc, vc, s, fmt, nullptr);
+        append(slots, m.page_table, step, kc, vc, s, fmt, &host.p);
         if (pos % 131 != 130 && pos != N - 1) continue;
         // a batch: n_q queries at the last n_q positions (as a verify window), each with its own selection
         const int n_q = 1 + (int) (rng() % NQ);
@@ -163,13 +170,13 @@ bool run(bool int8) {
         ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps");
         ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
         k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, n_q, nullptr);
-        k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, int8, ids, steps, n_q, cap, s, nullptr);
+        k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, fmt, ids, steps, n_q, cap, s, nullptr);
         k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, scratch, out_str, n_q, nullptr);
         ck(cudaDeviceSynchronize(), "batch");
         ck(cudaMemcpy(a.data(), out_ref, (size_t) n_q * NH * D * 4, cudaMemcpyDeviceToHost), "a");
         ck(cudaMemcpy(b2.data(), out_str, (size_t) n_q * NH * D * 4, cudaMemcpyDeviceToHost), "b");
         if (std::memcmp(a.data(), b2.data(), (size_t) n_q * NH * D * 4) != 0) {
-            if (bad++ < 5) std::fprintf(stderr, "  %s pos %lld n_q %d: streamed attention differs\n", int8 ? "int8" : "fp16", (long long) pos, n_q);
+            if (bad++ < 5) std::fprintf(stderr, "  %s pos %lld n_q %d: streamed attention differs\n", name, (long long) pos, n_q);
         }
         // the map inverts itself
         ck(cudaMemcpy(pt.data(), m.page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "pt");
@@ -188,7 +195,7 @@ bool run(bool int8) {
     }
     const k::KvStreamCounters c = k::kv_stream_counters(m);
     std::printf("  %s: %d batches, %llu block lookups, %llu misses (%.1f%% hit), overflow %d, %d failures\n",
-                int8 ? "int8" : "fp16", batches, (unsigned long long) c.lookups, (unsigned long long) c.misses,
+                name, batches, (unsigned long long) c.lookups, (unsigned long long) c.misses,
                 c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0, (int) c.overflow, bad);
     if (c.overflow || c.calls != (uint64_t) batches || c.misses == 0 || c.misses >= c.lookups) ++bad;
 
@@ -196,10 +203,10 @@ bool run(bool int8) {
     {
         const int64_t R = 1500, b1 = n_blocks, b0 = b1 - R;
         Pools ring;
-        ring.alloc(R, s, int8, false);
+        ring.alloc(R, s, fmt, false);
         int32_t* rt = dalloc<int32_t>(n_blocks);
         k::kv_ring_table(rt, n_blocks, R, nullptr);
-        k::kv_ring_restore(ring.attn(rt), host.p, int8, b0, b1, R, s, nullptr);
+        k::kv_ring_restore(ring.attn(rt), host.p, fmt, b0, b1, R, s, nullptr);
         const int64_t width = cap;
         std::vector<int32_t> hids((size_t) cap), hst = {(int32_t) (N - 1), (int32_t) N, (int32_t) (N / 4), (int32_t) width};
         for (int64_t i = 0; i < width; ++i) hids[i] = (int32_t) (N - width + i);   // the window's last cells
@@ -211,7 +218,7 @@ bool run(bool int8) {
         ck(cudaMemcpy(a.data(), out_ref, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "a");
         ck(cudaMemcpy(b2.data(), out_str, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "b");
         const bool ok = std::memcmp(a.data(), b2.data(), (size_t) NH * D * 4) == 0;
-        std::printf("  %s ring restore: %s\n", int8 ? "int8" : "fp16", ok ? "identical" : "DIFFERS");
+        std::printf("  %s ring restore: %s\n", name, ok ? "identical" : "DIFFERS");
         if (!ok) ++bad;
     }
     return bad == 0;
@@ -220,8 +227,8 @@ bool run(bool int8) {
 
 int main() {
     std::printf("kv_stream_parity: streamed vs resident KV, bitwise\n");
-    const bool a = run(true), b = run(false);
-    if (!a || !b) ++g_fail;
+    const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4);
+    if (!a || !b || !c) ++g_fail;
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
