@@ -28,6 +28,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -534,7 +535,13 @@ private:
     /// 2.08 MiB reads at QD8 move 1000-1080 MB/s, so this drive's per-request overhead, not its queue depth,
     /// dominates at small sizes.  Left at 1 (whole blob) and kept as the A/B arm so the next agent does not
     /// re-derive it.
-    static constexpr int kSplit = 1;
+    // R10: runtime-tunable (STRATA_RSPLIT, default 1).  R7 measured kSplit 4 (512 KiB) WORSE (8.4 vs 10.7
+    // tok/s) and left it at 1; kSplit 2 (two ~1.09 MiB halves, issued concurrently) was never tried and the
+    // drive's size/latency curve (2 MiB QD8 ~1.0-1.1 GB/s, 266 KiB ~0.68) puts it at the sweet spot.
+    static int kSplit() {
+        static const int v = [] { const char* e = std::getenv("STRATA_RSPLIT"); return e ? std::max(1, std::atoi(e)) : 1; }();
+        return v;
+    }
     static constexpr uint64_t kChunk = 512 * 1024;
     static constexpr int kMaxChunks = 16;                  // (max_blob + kChunk - 1) / kChunk, bounded
     struct PfJob { uint8_t* dst; uint64_t off, len; };     ///< one sub-read of one blob

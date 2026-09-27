@@ -582,6 +582,17 @@ def make_handler(svc: Service):
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except (BrokenPipeError, ConnectionResetError):
+                # R10: a client that vanishes mid-stream (bench timeouts, curl -m) must not take the
+                # SERVER down with it.  An unhandled write error here used to kill the wrapper thread,
+                # which closed the engine's stdin, which gracefully exited the ENGINE - i.e. a single
+                # dropped client connection restarted the whole model.
+                pass
+            except Exception as e:   # never let one bad request kill the resident engine
+                try:
+                    self._json(500, {"error": {"type": "server_error", "message": f"{type(e).__name__}: {e}"}})
+                except Exception:
+                    pass
 
         def _sse(self):
             self.send_response(200)
