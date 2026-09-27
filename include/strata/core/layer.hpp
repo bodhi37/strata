@@ -36,6 +36,7 @@
 #include "strata/core/weights.hpp"
 
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 
@@ -206,9 +207,23 @@ struct QsaState {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
-    int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page
+    /// PR #21: Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
+    bool kv_q4 = false;
+    uint8_t* k_q4 = nullptr;
+    uint8_t* v_q4 = nullptr;
+    int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
+
+    /// KV STREAMING (docs/kv-streaming-design.md, `kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
+    /// table (n_slots == n_pages, no host copy). 1: streamed - the authoritative K/V in `host`, `n_slots` pages
+    /// in VRAM, `map` resolves the selection's blocks on device. 2: a ring (the MTP drafter's window) - `n_slots`
+    /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
+    int kv_mode = 0;
+    int64_t n_slots = 0;
+    strata::kernels::KvHostPools host;
+    strata::kernels::KvStreamMap map;
+    int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
@@ -242,13 +257,35 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true);
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
+/// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
+/// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
+/// resident state).
+void qsa_set_kv_resident(int64_t cells);
+int64_t qsa_kv_resident();
+/// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
+/// in whole blocks) must fit at once, with room to spare.
+int64_t qsa_kv_resident_min();
+/// Pinned host bytes the streamed states hold (their host copies).
+uint64_t qsa_kv_host_bytes();
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
 bool qsa_kv_int8();
+/// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
+void qsa_set_kv_q4(bool enabled);
+bool qsa_kv_q4();
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
+inline int qsa_kv_format(const QsaState& st) {
+    return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+}
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+/// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
+strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
+void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
+                    int64_t cap, void* stream);
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);

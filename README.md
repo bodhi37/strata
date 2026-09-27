@@ -39,12 +39,12 @@ model - is set up for you.
 2. Double-click **`START-HERE.bat`**.
 3. Answer 4 questions - or just press Enter each time for the recommended choice:
    - **Which model?** The original, or Swift 1.5 (a version that thinks shorter and answers sooner)
-   - **Which size?** Q2_0, IQ2_XS or IQ3_XXS - see [which model](#which-model-should-i-pick)
+   - **Which size?** Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [which model](#which-model-should-i-pick)
    - **How much context?** How much text it can keep in mind at once (it suggests one for your card)
    - **Images?** Whether it should also read pictures
 
 Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens a chat page at `http://127.0.0.1:8080`.
+where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
 
 **Next time**, just double-click `START-HERE.bat` again: it starts right away, nothing is downloaded twice. Close its
 window to stop the model.
@@ -60,6 +60,7 @@ Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
 | **Q2_0** | 95 tokens/s | 65 tokens/s | 539 tokens/s |
 | **IQ2_XS** | 78 tokens/s | 52 tokens/s | 463 tokens/s |
 | **IQ3_XXS** | 66 tokens/s | 45 tokens/s | 410 tokens/s |
+| **IQ3_S** | 54 tokens/s | 42 tokens/s | 374 tokens/s |
 
 - **Writes answers** = how fast the reply appears (tokens per second).
 - **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history).
@@ -76,7 +77,8 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 | --- | ---: | --- | --- | --- |
 | **Q2_0** | 66 GB | fastest | good | you want speed |
 | **IQ2_XS** | 68 GB | fast | better | you want a good all-rounder (**recommended**) |
-| **IQ3_XXS** | 76 GB | slower | best | you want the best answers (uses 43 GB of your 64 GB RAM) |
+| **IQ3_XXS** | 76 GB | slower | great | you want better answers (uses 43 GB of your 64 GB RAM) |
+| **IQ3_S** | 84 GB | slowest | best: matches the full model on the published tests | you want the very best answers (original model only; uses 50 GB of your 64 GB RAM, so close other big programs) |
 
 **The version:**
 
@@ -89,7 +91,8 @@ Not sure? Take **IQ2_XS**. You can add another one later with `START-HERE.bat --
 
 ## Using it
 
-- **Chat in the browser:** `http://127.0.0.1:8080` - a simple chat page (it opens by itself when the model starts).
+- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
+  live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
 - **Chat in the terminal:** `.venv\Scripts\python chat.py`
 - **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
   **`http://127.0.0.1:8080/v1`**, any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages`.
@@ -98,8 +101,8 @@ Not sure? Take **IQ2_XS**. You can add another one later with `START-HERE.bat --
 - **Pictures:** in the chat page click **Picture**; in `chat.py` type `/image <path>`; in apps just attach them.
 - **From your phone or another PC:** see the [details](docs/DETAILS.md#using-it) (set an API key first).
 
-**Good to know:** it answers one request at a time, and it re-reads the whole conversation for every answer. So in
-very long chats you wait longer before it starts writing: about 1 minute per 30,000 tokens of conversation.
+**Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute per
+30,000 tokens); after that it keeps the conversation and reads only what is new, so follow-ups start in seconds.
 
 ## Something went wrong?
 

@@ -21,6 +21,7 @@ tokens, MTP speculative decoding on. "262K" is the model's full context window (
 | **Q2_0** | 389 | 539 | 571 | 561 | 543 | 496 |
 | **IQ2_XS** | 332 | 463 | 495 | 486 | 472 | 437 |
 | **IQ3_XXS** | 285 | 410 | 435 | 427 | 414 | - |
+| **IQ3_S** | 260 | 374 | 397 | - | 378 | - |
 
 ### Output (tokens/s)
 
@@ -29,9 +30,22 @@ tokens, MTP speculative decoding on. "262K" is the model's full context window (
 | **Q2_0** | 88.7 | 94.6 | 87.5 | 76.4 | 65.1 | 56.3 |
 | **IQ2_XS** | 82.0 | 78.0 | 65.3 | 63.7 | 52.0 | 48.0 |
 | **IQ3_XXS** | 64.6 | 65.6 | 57.3 | 54.4 | 44.8 | - |
+| **IQ3_S** | 51.2 | 54.4 | 51.1 | - | 42.2 | - |
 
-IQ3_XXS at 262K is not measured: with its 43 GB of experts, a 260K-token context brings a 64 GB PC to its memory
-limit. Use up to 128K with IQ3_XXS on 64 GB.
+IQ3_XXS and IQ3_S at 262K are not measured: with their 43 / 50 GB of experts, a 260K-token context brings a 64 GB PC
+to its memory limit. Use up to 128K with them on 64 GB (setup caps it). IQ3_S (engine 0.1.4 or newer) is only published
+for the original model, not for Swift 1.5.
+
+**KV streaming (engine 0.1.5):** at 64K and more, setup keeps the context's KV cache in RAM and only the part the
+attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Q2_0 at 262K: 50.9 -> 62.6 tokens/s
+(1,589 -> 3,872 experts in VRAM); at 128K about +6%. The attention reads exactly the same values (only where the KV lives changes); it
+costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
+it on.
+
+**4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
+halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
+is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
+Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
 
 Time to first token is prompt length / prompt speed: about 7 s at 4K, 55 s at 32K, 4 minutes at 128K and 9 minutes at
 262K. The raw numbers: [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
@@ -116,8 +130,16 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, a small
-page that shows it is running and lets you chat. The API is at `http://127.0.0.1:8080/v1` for your apps.
+download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
+app. It has three tabs:
+- **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
+  images are on, and sampling and thinking-level settings. Chats stay in your browser.
+- **Monitor:** what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s); GPU load,
+  VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
+- **About:** the model and engine settings, and the addresses to connect other apps.
+
+`http://127.0.0.1:8080/?q=your question` opens it with a new chat already asking. The API is at
+`http://127.0.0.1:8080/v1` for your apps.
 
 **Every time after that**, `START-HERE.bat` just starts the model (30-90 s to load 34-43 GB into RAM). Nothing is
 downloaded again. Closing the window stops the model.
@@ -161,6 +183,8 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | Model list / health | `GET /v1/models`, `GET /health` |
+| What the model is doing right now | `GET /status` |
+| Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -186,6 +210,11 @@ print(r.choices[0].message.content)
   Without a setting the model uses its own default, **high**. `none` answers at once (fastest); `low` keeps the thinking
   short. The levels are instructions the model was trained with, not a hard token limit: on easy questions all three
   think briefly, on hard ones `high` thinks longest and is most accurate.
+- **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
+  (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
+  long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
+  15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
+  connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut.
 - **From other devices / the internet.** The server listens on your PC only (`127.0.0.1`). To reach it from elsewhere,
@@ -194,9 +223,21 @@ print(r.choices[0].message.content)
   add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
   clients then send it as their API key.
 
-**Current limits (v1):** one request at a time; greedy decoding (temperature is ignored); every request processes its
-whole prompt again (no conversation cache yet, so long chats have a long time-to-first-token); images only when set up
-with them (below); no video.
+**Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
+live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
+assistant turn and every 16K prompt tokens). A checkpoint is used only when the prompt starts with exactly its tokens
+and pictures. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--turn-token ID`.
+
+**Current limits (v1):** one request at a time, and one conversation cached at a time (switching between two chats
+re-reads the other one); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result
+is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
+engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
+(`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`); a request's own fields always win, and with no
+block at all a request without sampling keys decodes greedy. The penalties (`presence_penalty`, `frequency_penalty`,
+`repetition_penalty`, with `penalty_last_n` capping how many recent tokens they count over, default 64 when any
+penalty is set) ride the same path; they count the tokens the request has consumed, so a repetition penalty
+suppresses what the model itself just said, not the prompt alone.
 
 ---
 
@@ -289,6 +330,7 @@ test images.
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow (10-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
+| A request never finishes (older engines, mostly with pictures) | Run `START-HERE.bat` once to get engine 0.1.2 or newer. It keeps a real margin of VRAM free: the log says `... MiB of VRAM free with everything loaded` and warns when it is close to 0. |
 | Anything else | The engine log is `strata-<model>.log` in this folder. |
 
 ---
@@ -298,13 +340,15 @@ test images.
 <p align="center"><img src="paper/tiers.svg" width="760" alt="memory tiers"></p>
 
 - **GPU (VRAM):** attention and DeltaNet mixers, the gated-residual weights, routers, shared experts, output head, the MTP
-  draft layer, the KV cache, and an **expert cache** that fills the rest of VRAM with the most-used experts (it adapts to
+  draft layer, the KV cache (from 64K: only its most-read part, the rest streams from RAM), and an **expert cache** that fills the rest of VRAM with the most-used experts (it adapts to
   the conversation while you chat).
 - **RAM:** all 24,576 experts, pinned. The CPU computes the experts that are not on the GPU **in place**, at the same time
   as the GPU works on the cached ones (AVX-512 / AVX2 kernels, ggml's for the i-quants).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them. 2.4-3.2
-  tokens per pass on average.
+  tokens per pass on average. When the reply repeats the context (code edits, quoted text), **prompt lookup** (engine
+  0.1.7) drafts up to 5 tokens from the earlier copy, but only where its measured acceptance and cost say it pays:
+  code edits 6-11% faster, other text unchanged. The drafts are checked like the MTP's, so the output is the same.
 - **Prompts** are processed in 2,048-token chunks with the experts streamed to the GPU over PCIe.
 
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
@@ -323,3 +367,5 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
   `third_party/ggml/LICENSE`.
 - Ideas from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
+- The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see
+  `serve/web/fonts/OFL.txt`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).

@@ -177,6 +177,8 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/native_qsa_score.cu
                           src/kernels/cuda/ple.cu
                           src/kernels/cuda/kv_q8.cu
+                          src/kernels/cuda/kv_stream.cu
+                          src/kernels/cuda/kv_q4.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/fused_gdn.cu
@@ -250,7 +252,7 @@ if(STRATA_ENABLE_CUDA)
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill CUDA::cudart)
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec CUDA::cudart)
 
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
@@ -356,6 +358,18 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(kv_q8_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME kv_q8_parity COMMAND kv_q8_parity)
 
+  # KV streaming (docs/kv-streaming-design.md): streamed vs resident attention, bitwise (GPU, synthetic, no model).
+  add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
+  target_include_directories(kv_stream_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(kv_stream_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
+
+  # PR #21: Q4_0 KV with Walsh-Hadamard rotation vs a host reference (GPU, synthetic, no model).
+  add_executable(kv_q4_parity src/kernels/kv_q4_parity.cpp)
+  target_include_directories(kv_q4_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(kv_q4_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS)
   add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
@@ -417,7 +431,7 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
-add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp)
+add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
@@ -426,6 +440,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(controller_test src/spec/controller_test.cpp)
   target_link_libraries(controller_test PRIVATE strata_spec)
   add_test(NAME controller_test COMMAND controller_test)
+  add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
+  target_link_libraries(draft_policy_test PRIVATE strata_spec)
+  add_test(NAME draft_policy_test COMMAND draft_policy_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

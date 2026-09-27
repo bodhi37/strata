@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -124,6 +125,139 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
     cudaFree(d_o);
     if (d_h) cudaFree(d_h);
     return bad;
+}
+
+// The Philox draw, host side - a transcription of the kernel's `philox_uniform` so the SAMPLED pick (not
+// just the greedy argmax) can be pinned against a reference.  `__umulhi(a, b)` is the high half of a 32x32
+// multiply, spelled `(uint32_t)(((uint64_t) a * b) >> 32)` here.
+struct PhiloxRound {
+    uint32_t& c0; uint32_t& c1; uint32_t& c2; uint32_t& c3;
+    void step(uint32_t k0, uint32_t k1) const {
+        const uint32_t hi0 = (uint32_t) (((uint64_t) 0x9E3779B9u * c0) >> 32);
+        const uint32_t hi1 = (uint32_t) (((uint64_t) 0xBB67AE85u * c2) >> 32);
+        const uint32_t lo0 = 0x9E3779B9u * c0;
+        const uint32_t lo1 = 0xBB67AE85u * c2;
+        const uint32_t n0 = hi1 ^ c1 ^ k0;
+        const uint32_t n1 = lo1;
+        const uint32_t n2 = hi0 ^ c3 ^ k1;
+        const uint32_t n3 = lo0;
+        c0 = n0; c1 = n1; c2 = n2; c3 = n3;
+    }
+};
+
+float host_philox_uniform(uint64_t seed, uint64_t counter) {
+    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
+    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
+    PhiloxRound r{c0, c1, c2, c3};
+    for (int i = 0; i < 10; ++i) r.step((uint32_t) i, 0u);
+    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
+}
+
+// The full SAMPLED chain, host side - the kernel's `sampler_kernel` in serial form: penalties on the raw
+// logits during the top_k selection (ties to the lowest index), the min_p prefix cut, top_p's cut in double,
+// then penalties AGAIN on the temperature-scaled survivors (docs/sampling.md's after-temperature pass), and
+// one Philox draw at (seed, counter + row).
+int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
+                      const strata::kernels::SamplerParams& p, int row) {
+    auto penal = [&](float logit, int count) {
+        if (count <= 0) return logit;
+        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
+        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+        return logit;
+    };
+    auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
+    const int nv = (int) l.size();
+    const int KMAX = 64;
+    const int k = p.top_k > 0 ? (p.top_k < KMAX ? p.top_k : KMAX) : 0;
+    std::vector<int> sel_ids;
+    std::vector<float> sel_logit;
+    std::vector<char> taken((size_t) nv, 0);
+    for (int i = 0; i < k; ++i) {
+        int best = -1; float bv = 0;
+        for (int v = 0; v < nv; ++v) {
+            if (taken[(size_t) v]) continue;
+            const float s = penal(l[(size_t) v], count(v));
+            if (best < 0 || s > bv) { best = v; bv = s; }
+        }
+        taken[(size_t) best] = 1;
+        sel_ids.push_back(best); sel_logit.push_back(bv);
+    }
+    int n_minp = (int) sel_ids.size();
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + std::log(p.min_p);
+        for (int i = 0; i < (int) sel_ids.size(); ++i)
+            if (sel_logit[(size_t) i] < thresh) { n_minp = i; break; }
+    }
+    int n_keep = n_minp;
+    if (p.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < n_minp; ++i) sum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]);
+        double cum = 0.0;
+        int cut = n_minp;
+        for (int i = 0; i < n_minp; ++i) {
+            cum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]) / sum;
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < n_minp ? p.min_keep : n_minp;
+        n_keep = cut;
+    }
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    auto scaled = [&](int i) { return penal(sel_logit[(size_t) i] * inv_t, count(sel_ids[(size_t) i])); };
+    float smx = scaled(0);
+    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) sum += std::exp((double) scaled(i) - (double) smx);
+    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t) row);
+    double cum = 0.0;
+    int pick = sel_ids[(size_t) (n_keep - 1)];
+    for (int i = 0; i < n_keep; ++i) {
+        cum += std::exp((double) scaled(i) - (double) smx) / sum;
+        if ((double) u < cum) { pick = sel_ids[(size_t) i]; break; }
+    }
+    return pick;
+}
+
+// Survivors after the min_p + top_p cuts, in the sampled chain - the quantity an order or a threshold
+// actually changes, used to assert a fixture can SEE the feature before asserting the kernel matches.
+int sampled_cut(const std::vector<float>& l, const std::vector<int>& hist, const strata::kernels::SamplerParams& p) {
+    auto penal = [&](float logit, int count) {
+        if (count <= 0) return logit;
+        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
+        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+        return logit;
+    };
+    auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
+    const int nv = (int) l.size();
+    const int KMAX = 64;
+    const int k = p.top_k > 0 ? (p.top_k < KMAX ? p.top_k : KMAX) : 0;
+    std::vector<float> sel;
+    std::vector<char> taken((size_t) nv, 0);
+    for (int i = 0; i < k; ++i) {
+        int best = -1; float bv = 0;
+        for (int v = 0; v < nv; ++v) {
+            if (taken[(size_t) v]) continue;
+            const float s = penal(l[(size_t) v], count(v));
+            if (best < 0 || s > bv) { best = v; bv = s; }
+        }
+        taken[(size_t) best] = 1; sel.push_back(bv);
+    }
+    int n_minp = (int) sel.size();
+    if (p.min_p > 0.0f) {
+        const float thresh = sel[0] + std::log(p.min_p);
+        for (int i = 0; i < (int) sel.size(); ++i)
+            if (sel[(size_t) i] < thresh) { n_minp = i; break; }
+    }
+    if (p.top_p >= 1.0f) return n_minp;
+    double sum = 0.0;
+    for (int i = 0; i < n_minp; ++i) sum += std::exp((double) sel[(size_t) i] - (double) sel[0]);
+    double cum = 0.0;
+    int cut = n_minp;
+    for (int i = 0; i < n_minp; ++i) {
+        cum += std::exp((double) sel[(size_t) i] - (double) sel[0]) / sum;
+        if (cum >= (double) p.top_p) { cut = i + 1; break; }
+    }
+    if (cut < p.min_keep) cut = p.min_keep < n_minp ? p.min_keep : n_minp;
+    return cut;
 }
 
 }  // namespace
@@ -324,6 +458,116 @@ int main(int argc, char** argv) {
 
         strata::kernels::SamplerParams p2 = p0; p2.greedy = true; p2.temperature = 1.0f;
         bad += run("T=1 greedy=true  is the argmax", l, NT3, p2, want);
+    }
+
+    // ---- fixture 6: PENALTIES IN THE SAMPLED CHAIN.  Fixture 4 pins the greedy (argmax) path; the sampled
+    // chain applies penalties a SECOND time - after the temperature scaling, on the survivors - so it gets its
+    // own reference (the full chain with the host Philox) and its own observability check: with the penalties
+    // on, the history row's favourite must LOSE a pick it would win penalty-free.
+    {
+        const int NV2 = 8, NT2 = 2;
+        strata::kernels::SamplerParams p;
+        p.top_k = 5; p.top_p = 0.9f; p.temperature = 0.8f; p.seed = 9; p.counter = 0;
+        p.penalty_last_n = 4; p.penalty_repeat = 3.0f; p.penalty_freq = 0.2f; p.penalty_present = 0.6f;
+
+        std::vector<float> l((size_t) NV2 * NT2, -8.0f);
+        std::vector<int> hist((size_t) NT2 * 4, -1);
+        for (int t = 0; t < NT2; ++t) {
+            float* row = l.data() + (size_t) t * NV2;
+            row[0] = 9.0f; row[1] = 4.5f; row[2] = 4.4f; row[3] = 4.3f;   // token 0 leads clean (9 vs 4.5)
+            hist[(size_t) t * 4 + 0] = 0;                                  // and falls to 2.2/2.0 penalised
+            hist[(size_t) t * 4 + 1] = t == 1 ? 0 : -1;                    // (repeat 3, freq, presence)
+        }
+        std::vector<int> want((size_t) NT2), clean((size_t) NT2);
+        strata::kernels::SamplerParams clean_p = p;
+        clean_p.penalty_last_n = 0; clean_p.penalty_repeat = 1.0f;
+        clean_p.penalty_freq = 0.0f; clean_p.penalty_present = 0.0f;
+        for (int t = 0; t < NT2; ++t) {
+            const std::vector<float> row(l.begin() + (size_t) t * NV2, l.begin() + (size_t) (t + 1) * NV2);
+            const std::vector<int> h(hist.begin() + (size_t) t * 4, hist.begin() + (size_t) (t + 1) * 4);
+            want[(size_t) t] = sampled_reference(row, h, p, t);
+            clean[(size_t) t] = sampled_reference(row, h, clean_p, t);
+        }
+        const bool visible = want[0] != clean[0] || want[1] != clean[1];
+        std::printf("  %-34s %s (penalised picks %d/%d, clean %d/%d)\n",
+                    "sampled penalties are observable", visible ? "yes" : "*** NO ***", want[0], want[1],
+                    clean[0], clean[1]);
+        if (!visible) ++bad;
+        else bad += run("sampled chain: penalties + top_k/p", l, NT2, p, want, hist, 4);
+    }
+
+    // ---- fixture 7: MIN_P.  The cut is a PREFIX of the descending top_k list (logit >= max + log(min_p)),
+    // so the fixture asserts the survivor count moves with the threshold (the observability half) and that
+    // the kernel's pick equals the reference's through the full sampled chain (the correctness half).
+    {
+        const int NV3 = 8, NT3 = 2;
+        std::vector<float> l((size_t) NV3 * NT3, -8.0f);
+        for (int t = 0; t < NT3; ++t) {
+            float* row = l.data() + (size_t) t * NV3;
+            row[0] = 4.0f; row[1] = 3.5f; row[2] = 3.2f; row[3] = 3.1f;   // gaps keep the cut off the
+            row[4] = 2.0f;                                                // logf/rounding knife edge
+        }
+        strata::kernels::SamplerParams base;
+        base.top_k = 6; base.top_p = 1.0f; base.temperature = 0.9f; base.seed = 77;
+
+        int c0 = 0, c05 = 0, c09 = 0;
+        for (int t = 0; t < NT3; ++t) {
+            const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
+            strata::kernels::SamplerParams q = base; q.min_p = 0.0f;
+            c0 += sampled_cut(row, {}, q);
+            q.min_p = 0.5f; c05 += sampled_cut(row, {}, q);
+            q.min_p = 0.9f; c09 += sampled_cut(row, {}, q);
+        }
+        const bool visible = c0 > c05 && c05 > c09 && c09 >= NT3;
+        std::printf("  %-34s %s (survivors: min_p 0 -> %d, 0.5 -> %d, 0.9 -> %d)\n",
+                    "min_p cut is observable", visible ? "yes" : "*** NO ***", c0, c05, c09);
+        if (!visible) ++bad;
+
+        for (float mp : {0.0f, 0.5f, 0.9f}) {
+            strata::kernels::SamplerParams q = base; q.min_p = mp;
+            std::vector<int> want((size_t) NT3);
+            for (int t = 0; t < NT3; ++t) {
+                const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
+                want[(size_t) t] = sampled_reference(row, {}, q, t);
+            }
+            char name[64];
+            std::snprintf(name, sizeof name, "sampled chain: min_p=%.1f", (double) mp);
+            bad += run(name, l, NT3, q, want);
+        }
+    }
+
+    // ---- fixture 8: THE PENALTY WINDOW IS THE TAIL.  With an 8-entry history and penalty_last_n = 4, only
+    // the LAST four entries count: a token punished in the old half must come back to full strength, and one
+    // punished in the tail half stays down.  The reference counts the same tail; the observability check runs
+    // the reference once more WITHOUT the clamp (counting all 8) and requires the picks to differ.
+    {
+        const int NV4 = 8;
+        strata::kernels::SamplerParams p;
+        p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
+        p.penalty_last_n = 4; p.penalty_repeat = 3.0f; p.penalty_freq = 0.3f; p.penalty_present = 0.5f;
+
+        std::vector<float> l((size_t) NV4, -8.0f);
+        l[0] = 6.0f; l[3] = 6.5f;                       // token 0 leads clean; token 3 is the tail offender
+        std::vector<int> hist = {0, 0, 0, 0, 3, 3, 3, 3};   // token 0 old (out), token 3 in the tail
+
+        auto pick_clamped = [&](bool clamp) {
+            int best = 0; float bv = 0; bool first = true;
+            for (int v = 0; v < NV4; ++v) {
+                int c = 0;
+                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8) + i)] == v) ++c;
+                float logit = l[(size_t) v];
+                if (c > 0) { logit = logit <= 0.0f ? logit * p.penalty_repeat : logit / p.penalty_repeat;
+                             logit -= (float) c * p.penalty_freq + p.penalty_present; }
+                if (first || logit > bv) { bv = logit; best = v; first = false; }
+            }
+            return best;
+        };
+        const int want = pick_clamped(true), unclamped = pick_clamped(false);
+        const bool visible = want != unclamped;
+        std::printf("  %-34s %s (clamped pick %d, full-history pick %d)\n",
+                    "penalty window clamp is observable", visible ? "yes" : "*** NO ***", want, unclamped);
+        if (!visible) ++bad;
+        else bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);
     }
 
     // A continuous stream and individual decode calls consume the same draw counters.

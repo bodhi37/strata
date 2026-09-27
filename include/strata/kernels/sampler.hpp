@@ -1,12 +1,10 @@
 // include/strata/kernels/sampler.hpp - the sampler chain, host-callable (P2.S2).
 //
-//     penalties  ->  top_k  ->  top_p  ->  temperature  ->  pick
+//     penalties -> top_k -> min_p -> top_p -> temperature -> penalties -> pick
 //
-// The ORDER is specified in docs/sampling.md, transcribed from llama.cpp's own chain.  Two facts there are
-// easy to get backwards: temperature comes AFTER the truncation filters, and penalties come AFTER temperature.
-//
-// PENALTIES ARE NOT IMPLEMENTED YET: they need the token history, which is not in this signature, so a caller
-// passing a non-zero `penalty_last_n` gets a loud failure rather than a silently unpenalised sample.
+// The ORDER is specified in docs/sampling.md, transcribed from llama.cpp's own chain.  Three facts there are
+// easy to get backwards: temperature comes AFTER the truncation filters, penalties come AFTER temperature as
+// well as before the selection, and min_p cuts BEFORE top_p (both on the pre-temperature logits).
 #pragma once
 
 #include <cstdint>
@@ -16,6 +14,7 @@ namespace strata::kernels {
 struct SamplerParams {
     int top_k = 20;              // 0 disables the filter
     float top_p = 0.95f;         // 1.0 disables the filter
+    float min_p = 0.0f;          // 0 disables; keeps tokens with p >= min_p * p_max (a prefix of the top_k list)
     float temperature = 1.0f;    // <= 0 means greedy
     int min_keep = 1;            // top_p keeps at least this many
     int penalty_last_n = 0;      // 0 disables; the window over `history` to count occurrences in
