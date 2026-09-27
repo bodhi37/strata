@@ -63,8 +63,7 @@ public:
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
     void set_sampling(const strata::kernels::SamplerParams& sp) {
-        sampling_ = sp;
-        draw_counter_ = 0;   // each request's sampling starts its own draw sequence
+        sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
     }
 
     /// The penalty-history row for `sampling_.penalty_last_n`: ONE row of `history_len` int32 slots, most
@@ -106,7 +105,6 @@ private:
         s.temperature = 0.0f;
         return s;
     }();   ///< greedy by default; per-request via set_sampling
-    uint64_t draw_counter_ = 0;   ///< advanced by T on every sampled window; reset by set_sampling
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool capture_commit(std::string& err);

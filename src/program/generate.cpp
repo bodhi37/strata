@@ -41,6 +41,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
@@ -250,10 +251,11 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
-    /// The suffix drafter: when the text being written repeats an earlier stretch of the context (code edits, quoted
-    /// input, tool-call JSON) by at least this many tokens, the window is filled with what followed it there instead
-    /// of the MTP's drafts, up to --spec - 1 of them, as long as the MTP's own first guess agrees.  0 = MTP only.
-    int suffix_draft = 0;
+    /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
+    /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
+    /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
+    /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
+    int suffix_draft = 3;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
 };
@@ -322,7 +324,8 @@ void usage() {
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
-                 "  --suffix-draft N     draft from an earlier repeat of the last N+ tokens of context (0 = MTP only)\n"
+                 "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+                 "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
@@ -732,6 +735,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
+    // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
+    // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
+    if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
+        o.mtp_max_t = o.spec;
+        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+    }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         if (o.no_ple || o.ple_gguf.empty()) {
@@ -2174,6 +2184,7 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -2552,13 +2563,20 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
-                // a repeat of earlier context proposes more than the MTP is confident about: take it, but only where the
-                // MTP's own first guess agrees (a repeat the model is not following costs a whole window)
+                // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
+                // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
+                int sfx_match = 0;
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
-                    if (k + 1 > T && sbuf[0] == drafts[0]) { T = k + 1; from_sfx = true; }
+                    sfx_match = sfx.last_match();
+                    if (k > 0 && sbuf[0] == drafts[0]) {
+                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                        if (pk.lookup) { T = pk.t; from_sfx = true; }
+                    }
                 }
+                const bool timed_round = !first_window;
+                const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
@@ -2621,6 +2639,9 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (timed_round && !eos)
+                    policy.observe(from_sfx, T, a, sfx_match,
+                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
@@ -3181,6 +3202,7 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {
@@ -3198,10 +3220,16 @@ int main(int argc, char** argv) {
             }
             if (first_window) T = 1;
             bool from_sfx = false;
+            int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
-                if (k + 1 > T && (!use_mtp || sbuf[0] == drafts[0])) { T = k + 1; from_sfx = true; }
+                sfx_match = sfx.last_match();
+                if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    if (pk.lookup) { T = pk.t; from_sfx = true; }
+                }
             }
+            const bool timed_round = !first_window;
             ++window_hist[(size_t) T];
             if (p + T > o.max_context) {
                 std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) p);
@@ -3272,7 +3300,9 @@ int main(int argc, char** argv) {
             }
             x = outv[(size_t) a];
             p += a + 1;
-            total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            total_ms += round_ms;
+            if (timed_round) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
