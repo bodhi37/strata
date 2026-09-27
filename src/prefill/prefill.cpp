@@ -300,9 +300,9 @@ bool Prefill::alloc_all(std::string& err) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    take_stage(o, *m.ss, s, m.stage, ok);
     if (ok && m.stage.present()) {
-        const int64_t pages = ss.qsa_states[0].n_pages;
+        const int64_t pages = m.ss->qsa_states[0].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
         if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||

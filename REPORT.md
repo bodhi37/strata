@@ -127,7 +127,116 @@ coverage only 18% of layers need a read at all, and the ring-wait would fall fro
 
 ---
 
-## 0.6 R13 TAKEOVER (2026-09-27 evening) — environment fixes, honest baseline, and where the wall actually is
+## 0.7 R14 SESSION (2026-09-27/28) — upstream v0.1.8 merged, the wall measured from the inside, long context proven on q4_0 KV
+
+### 0.7.1 Upstream sync (the big merge)
+
+Merged `origin/main` (v0.1.8) into `r9-hillclimb` on branch **`r14-upstream`** (commit `44c8724`).
+Conflict policy: **keep our R7-R13 engine work** (host hot tier, O_DIRECT ring, prefill staging readers,
+two-pass dispatch, exact-commit verify windows, pinned-slot refill, R9/R10 pool park, R10 tile prefill,
+R11 OOB fix) and **port upstream's features into it**:
+
+| upstream feature | what we did |
+| --- | --- |
+| **GPU hit-path warning removed** (issue #23: teacher-forced parity 95-98% same top-1, PPL equal) | warning gone from startup; VRAM tier officially usable |
+| **Q4_0 KV + FWHT-256** (`--kv q4_0`, PR #21) | merged; **ported into our tile-based prefill QSA path** (fwht256 on K/V/Q/attn, `kv_append_q4` with host+staging pointers) |
+| **KV streaming** (`--kv-resident`, 0.1.5/0.1.6) | merged; staged-pool plumbing (`take_stage`, `pools_of`, `kv_stage_from_host`) wired into the tile prefill |
+| **Conversation cache** (`--prompt-cache N`, checkpoints) | **replaces our sess_record/GEN KEEP client** (engine-side beats server-side); `RESUME <n>` / `REUSED <n>` protocol |
+| **Prompt-lookup suffix drafter** (`--suffix-draft N` + DraftPolicy) | merged into the serve loop alongside our exact-commit logic |
+| **Per-request sampling** (temperature/top_p/top_k/min_p/penalties) | merged (req_sp → ver.set_sampling) |
+| **server.py rewrite** (web app, telemetry, disconnect-safe) | taken wholesale (same `--config/--port` CLI; srv.sh/guard-launch.sh unchanged) |
+
+Kept our exact-commit window commit (`nk = e+2 or a+1`) over upstream's blanket `commit(a+1)`: it commits
+exactly the emitted stream, and `consumed`/`live` bookkeeping is aligned to it; the end-of-request
+pending-token fix-up commits the final proposal so the cache covers the whole emitted stream.
+
+**Parity suite post-merge (all PASS):** `sampler_parity --selftest`, `kv_q4_parity --selftest`
+(Q4_0 blocks bitwise equal to the host quantizer), `kv_stream_parity --selftest` (streamed vs resident
+KV bitwise, fp16 AND q4_0, 89.7-89.9% block hits, 0 failures), `native_expert_parity` on IQ3_XXS/IQ4_NL
+(cpu-gpu rel 1.44e-2 = activation-rounding noise).
+**Open item:** IQ3_M layers 0-5 (Q5_0 down): layer 0 ok (1.84e-2), **layer 5 gpu rel 3.20e-2 FAIL** —
+pre-existing (the Q5_0 kernel predates the merge; the test had never been run on those shards), CPU path
+correct; matters only for VRAM-cached Q5_0 experts in the IQ3_M bake-off.
+
+### 0.7.2 OOM incident and the guard
+
+The 23:27 OOM killed the engine + my shell tree: **two concurrent engines** (an orphaned startup attempt
+plus a new launch) — the exact failure mode §1 warns about. Second OOM at 01:10 was MARGINAL: the engine
+at its normal 25.7 GiB anon footprint was already swapping 1.2 GiB when an 84.9k-token request landed on
+top of a heavier desktop; `--prompt-cache 6` checkpoints (~118 MB each, host RAM) contributed.
+**Fixes:** `guard-launch.sh` (singleton engine check + ≥24 GiB RAM check + persistence mode + 10 s settle
+before every launch; `stop` subcommand), and long-context configs use `--hot-ram-gib 24.0` +
+`--prompt-cache 2`. The stale-binary trap also bit once (`build/strata` linked but `engine/strata` not
+copied — build-engine.sh does the copy+setcap; direct `cmake --build` does not).
+
+### 0.7.3 Decode: every remaining knob measured (all neutral or floor-only)
+
+Single-shot 6-topic 200-tok sweep (warm), one engine, one client:
+
+| config | min | median | max | verdict |
+| --- | ---: | ---: | ---: | --- |
+| r13-base (800 slots, spec 4) | 4.32 | 7.72 | 8.63 | baseline post-merge, coherent |
+| +1200 VRAM slots (2.43 GiB) | 4.48 | 8.10 | 8.95 | **neutral** (+400 blobs ≈ +0.7% coverage, inside noise; 1300 slots leaves 87 MiB VRAM = stall risk) |
+| +dynamic LRU tier +prefill admit | — | — | — | neutral (multi-turn t2+ avg 12.4 vs static 13.1) |
+| +spec 6 +suffix-draft 3 | **6.99** | 7.92 | 9.01 | **floor +2.6 tok/s** (worst-topic cold starts); median flat — MTP acceptance 42% is the ceiling, suffix drafter fired on 4/110 windows |
+| +pcie-frac 1.0 | 7.03 | 7.61 | 9.78 | neutral (PCIe offload can't bypass the serial drive latency, confirming R7) |
+| +fresh profile (profile-r14.bin from fresh counts) | 4.66 | 7.34 | 8.33 | neutral within run noise |
+
+Multi-turn (3-turn conversations, full history resent — `scratch/r14_multiturn_bench.py`):
+turn-2/3 decode climbs to **9.3-17.1 tok/s** as the working set warms (turn 1 is prefill-dominated).
+
+### 0.7.4 The wall, measured from the inside (replaces §3's arithmetic)
+
+From the per-request telemetry (R7 lines) on a 200-token request:
+
+* 280.9 expert requests/token; hot tier serves **93.6%**; **21.9 disk misses/token** at ~3.5 ms QD1 ≈
+  **77 ms/token of ringwait = 85% of decode time**. Compute+attention+draft ≈ 18 ms/token.
+* Fresh-profile coverage curve (measured from 737k routed entries): **12k blobs (24.3 GiB) → 93.3%**,
+  16k (32.4 GiB) → 98.2%, 18k (36.5 GiB) → 99.3%.
+* VRAM budget (measured): native projections 2975 MiB + MTP draft 950 + head 675 + dense pool ~1416 +
+  KV/graphs/context ~1900 ≈ **7.9 GiB non-expert** → only **~2.4-2.6 GiB (1100-1200 slots)** for the
+  expert tier on a 12 GiB card.
+* **Resident ceiling = 24.5 (RAM) + 2.6 (VRAM) ≈ 27.1 GiB → ~95% coverage → ~10-11 tok/s single-shot
+  ceiling for IQ3_XXS on this box.** The ≥99.1% coverage gate (§3) needs 34.8 GiB resident —
+  **physically unreachable at 30 GiB RAM + 12 GiB VRAM with 7.9 GiB of non-expert VRAM users.**
+  §3's "3,500-4,096 VRAM slots" assumed ~4.3 GiB of VRAM users; the real number is 7.9.
+* Remaining measured levers and their honest ROI: Q8-requantize the dense projections + dense pool
+  (−2.2 GiB VRAM → +1000 slots → ~+3-4 tok/s; requires shard surgery); more host RAM (+8 GiB DIMMs →
+  tier 24.5→32 GiB → 98.6% → ~25-30 tok/s); IQ2_XXS pack (arena 36 GiB → 81% resident → ~98.5% →
+  ~30 tok/s, at a large quality cost against the mission's intelligence-first ladder).
+
+### 0.7.5 Long context: the q4_0 KV payoff (`strata-r14-lc24-q4.json`)
+
+* **84,631-token needle test** (three needles planted at 10%/50%/90% depth + a cross-constraint CHECK):
+  **all three recalled + correct reasoning**, on `--kv q4_0`, decode coherent.
+* **102k cross-turn resume (the session's biggest win):** re-sending the same 101,950-token conversation,
+  the engine's conversation cache resumed **101,945 of 101,950 tokens in 479 ms** (`RESUME 101945`) —
+  a follow-up agentic turn on a 102k conversation pays 0.5 s of prompt processing instead of 9.4 minutes.
+  Decode at 102k context: **5.3-5.8 tok/s**, draft acceptance **76%** (329 of 432) on the repeated content.
+  A 17.3k-token suffix read after a 84.6k resume ran at **~1,440 tok/s** (warm tier + windows).
+* q4_0 KV freed **~750 MiB of VRAM** (1062 MiB free at startup vs 318 with int8 + dynamic tier).
+  With int8 KV the same request **OOM'd the verify graph at decode position 84,922** — q4_0 is what
+  makes 84k+ decode possible on this card.
+* Prefill cold at 84.6k-102k: **155-180 tok/s** (TTFT ~8-9.5 min). Drive-bound, and the telemetry shows
+  why: 809k streamed blobs across the long-context session (~2.8 blob-reads per prompt token) — the
+  non-tier ~12.5k unique blobs re-stream across all 11 chunks. The dynamic LRU capture helps only
+  marginally while the profile fill occupies the tier: for prefill-heavy long-context work, a trimmed
+  profile (~6k blobs) + wider LRU share is the untested config that could ~2x prefill.
+* Workload split, measured: admission ON helps the long-conversation pattern (warm resumes, suffix at
+  1.4k tok/s) and hurts the mixed short-topic pattern (LRU holds the long conversation's blobs; the
+  next topic switch pays: medicine 2.98 tok/s right after the 102k runs). Static profile tier is the
+  right choice for mixed short topics; admission for sustained long-context conversations.
+
+### 0.7.6 Next session starts here
+
+1. 80k/127k prefill with admission engaged at tier 24.0 (`strata-r14-lc24-q4.json` is the config) —
+   read `streamed`/`lru:` telemetry; if the capture works, prefill ~2x.
+2. Q8-requant of dense projections + dense pool (tools/make_*.py path) — the last real decode lever
+   (+1000 VRAM slots).
+3. IQ3_M bake-off caveat: fix/characterize the Q5_0 layer-5 gpu rel 3.2e-2 first.
+4. Agentic stress: reasoning_effort=xhigh, giant budgets (untested this session).
+
+---
 
 ### 0.6.1 Environment bugs found and fixed (each one blocked real work)
 
