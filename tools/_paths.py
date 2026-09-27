@@ -13,8 +13,8 @@ ENGINE = Path(__file__).resolve().parents[1]
 
 
 def gguf_py() -> str:
-    cands = [os.environ.get("STRATA_GGUF_PY"), ENGINE / "third_party" / "llama.cpp" / "gguf-py",
-             ENGINE.parents[1] / ".ref" / "llama.cpp" / "gguf-py"]
+    ref_cand = ENGINE.parents[1] / ".ref" / "llama.cpp" / "gguf-py" if len(ENGINE.parents) > 1 else None
+    cands = [os.environ.get("STRATA_GGUF_PY"), ENGINE / "third_party" / "llama.cpp" / "gguf-py", ref_cand]
     for c in cands:
         if c and (Path(c) / "gguf").is_dir():
             return str(c)

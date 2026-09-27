@@ -13,6 +13,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -419,10 +420,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
+                if (st.kv_q4) {
+                    for (int t = tb; t < te; ++t) {
+                        fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
+                        fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
+                    }
+                }
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
                 for (int t = tb; t < te; ++t) {
                     const int32_t* step_t = step_ + t * kStepCount;
-                    if (st.kv_int8)
+                    if (st.kv_q4)
+                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t,
+                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs);
+                    else if (st.kv_int8)
                         kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                     else
@@ -444,6 +454,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         return false;
                     }
                     norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
+                    if (st.kv_q4) {
+                        fwht256_inplace_cuda(qc, NH, cs);
+                    }
                 }
                 for (int t = tb; t < te; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
@@ -459,6 +472,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                if (st.kv_q4) {
+                    for (int t = tb; t < te; ++t) {
+                        fwht256_inplace_cuda(attn_ + t * NH * HD, NH, cs);
+                    }
+                }
                 for (int t = tb; t < te; ++t) {
                     if (native_qsa_enabled())
                         native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,

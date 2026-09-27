@@ -203,6 +203,10 @@ struct QsaState {
     uint16_t* v_pool = nullptr;
     /// Plan v0.3 P7: INT8 KV (qsa_set_kv_int8). Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64.
     bool kv_int8 = false;
+    /// Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4).
+    bool kv_q4 = false;
+    uint8_t* k_q4 = nullptr;
+    uint8_t* v_q4 = nullptr;
     int8_t* k_q = nullptr;
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
@@ -269,6 +273,8 @@ uint64_t qsa_kv_host_bytes();
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
 bool qsa_kv_int8();
+void qsa_set_kv_q4(bool enabled);
+bool qsa_kv_q4();
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.

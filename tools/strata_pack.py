@@ -41,8 +41,8 @@ from canonical_xcheck import (MAPPINGS, KV_IQ4NL, open_shard,             # noqa
 
 FORMAT_VERSION = 1
 ALIGN = 64                       # every plane starts on a 64-byte boundary (P1.S7)
-STRATA = pathlib.Path(__file__).resolve().parents[3]   # the development layout; build takes the shard from --gguf
-SHARD2 = STRATA / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"
+STRATA = pathlib.Path(__file__).resolve().parents[3] if len(pathlib.Path(__file__).resolve().parents) > 3 else None
+SHARD2 = (STRATA / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf") if STRATA else None
 
 EXPERT_RE = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
 EMBD_NAME = "token_embd.weight"

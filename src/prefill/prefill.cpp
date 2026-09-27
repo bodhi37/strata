@@ -12,6 +12,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -420,18 +421,27 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
-                    // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
-                    // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
-                    const bool staged = st.kv_mode == 1;
-                    if (staged)
-                        strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host, st.kv_int8,
-                                                            (p0 + s.page_size - 1) / s.page_size, s, m.cs);
-                    kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                              st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                              &st.host, staged ? &m.stage : nullptr);
+                    const bool staged = st.kv_mode == 1 && !st.kv_q4;
+                    if (st.kv_q4) {
+                        strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs);
+                    } else {
+                        // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
+                        // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
+                        if (staged)
+                            strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host, st.kv_int8,
+                                                                (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                        kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                  st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                  &st.host, staged ? &m.stage : nullptr);
+                    }
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
+                    if (st.kv_q4) {
+                        strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                    }
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
@@ -525,6 +535,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
                                                                m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s,
                                                                m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                    }
+                    if (st.kv_q4) {
+                        strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     }
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;

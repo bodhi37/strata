@@ -1,6 +1,7 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -30,9 +31,9 @@ __device__ __forceinline__ float warp_max(float v) {
 }
 
 // 8 consecutive values of one cell's key or value row for KV head `kvh`, dimensions [d0, d0+8).
-template <bool INT8>
+template <int KV_MODE>
 __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
-    if constexpr (!INT8) {
+    if constexpr (KV_MODE == 0) {
         const uint16_t* base = (value ? p.v_pool : p.k_pool) + row * HD + d0;
         const uint4 raw = *reinterpret_cast<const uint4*>(base);
         const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
@@ -42,7 +43,7 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
             out[2 * j] = f.x;
             out[2 * j + 1] = f.y;
         }
-    } else {
+    } else if constexpr (KV_MODE == 1) {
         const int8_t* codes = (value ? p.v_q : p.k_q) + row * HD + d0;
         const uint16_t sbits = (value ? p.v_scale : p.k_scale)[row * (HD / KV_Q8_GROUP) + d0 / KV_Q8_GROUP];
         const float sc = __half2float(__ushort_as_half(sbits));
@@ -50,10 +51,25 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
         const int8_t* c = reinterpret_cast<const int8_t*>(&raw);
 #pragma unroll
         for (int j = 0; j < 8; ++j) out[j] = (float) c[j] * sc;
+    } else {
+        constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+        const int b = d0 / QK4_0;
+        const int rem = d0 % QK4_0;
+        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>((value ? p.v_q4 : p.k_q4) + row * bytes_per_head) + b;
+        const float d = __half2float(__ushort_as_half(blk->d));
+        const int j = (rem == 0 || rem == 16) ? 0 : 8;
+        const uint8_t* bytes = blk->qs + j;
+        if (rem < 16) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] & 0x0F) - 8) * d;
+        } else {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] >> 4) - 8) * d;
+        }
     }
 }
 
-template <bool INT8>
+template <int KV_MODE>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
@@ -98,7 +114,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
             continue;
         }
         float k8[8];
-        load8<INT8>(p, false, srow[c], lane * 8, k8);
+        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
 #pragma unroll
         for (int h = 0; h < G; ++h) {
             const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8]);
@@ -128,11 +144,21 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
     for (int h = 0; h < G; ++h) acc[h] = 0.0f;
     for (int c = 0; c < n_here; ++c) {
         float v;
-        if constexpr (!INT8) {
+        if constexpr (KV_MODE == 0) {
             v = __half2float(__ushort_as_half(p.v_pool[srow[c] * HD + t]));
-        } else {
+        } else if constexpr (KV_MODE == 1) {
             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
             v = (float) p.v_q[srow[c] * HD + t] * sc;
+        } else {
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + srow[c] * bytes_per_head) + b;
+            const float d = __half2float(__ushort_as_half(blk->d));
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
         }
 #pragma unroll
         for (int h = 0; h < G; ++h) acc[h] = fmaf(sp[h][c], v, acc[h]);
@@ -176,7 +202,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
-    const bool int8 = pools.k_q != nullptr;
+    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0);
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
@@ -186,12 +212,15 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     cudaStream_t st = (cudaStream_t) stream;
-    if (int8)
-        attn_chunk_kernel<true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                          scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    if (kv_mode == 2)
+        attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 1)
+        attn_chunk_kernel<1><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else
-        attn_chunk_kernel<false><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        attn_chunk_kernel<0><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
                                                                                   attn, stride);
     const cudaError_t e = cudaGetLastError();
@@ -213,8 +242,8 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
-    const bool int8 = pools.k_q != nullptr;
-    if (int8 ? (!pools.v_q || !pools.k_scale || !pools.v_scale) : (!pools.k_pool || !pools.v_pool)) {
+    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0);
+    if (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale) : (!pools.k_pool || !pools.v_pool))) {
         std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
         std::exit(1);
     }
@@ -225,12 +254,15 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
-    if (int8)
-        attn_chunk_kernel<true><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                          scale, part_acc, part_m, part_l, n_chunks);
+    if (kv_mode == 2)
+        attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks);
+    else if (kv_mode == 1)
+        attn_chunk_kernel<1><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks);
     else
-        attn_chunk_kernel<false><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                           scale, part_acc, part_m, part_l, n_chunks);
+        attn_chunk_kernel<0><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks);
     attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

@@ -8,6 +8,7 @@
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -170,9 +171,11 @@ if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset,
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
 void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
-namespace { bool g_kv_int8 = false; }
+namespace { bool g_kv_int8 = false; bool g_kv_q4 = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
+void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
+bool qsa_kv_q4() { return g_kv_q4; }
 uint64_t gdn_buffers_bytes(const ModelGeometry& g) {    const int64_t C = g.ssm_conv_channels;    const int64_t V = g.ssm_value_dim;    const uint64_t parts[] = {        q8k_bytes(g.n_embd),
 // x_q8k
 (uint64_t) (g.n_embd / 32) * 34,
@@ -507,6 +510,9 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     return p;
 }
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages) {
+    if (g_kv_q4) {
+        return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    }
     return g_kv_int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                      : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
@@ -541,10 +547,15 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
     st.kv_int8 = g_kv_int8;
+    st.kv_q4 = g_kv_q4;
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
-    if (g_kv_int8) {
+    if (g_kv_q4) {
+        const uint64_t pool_bytes = (uint64_t) p.slots * s.n_head_kv * s.page_size * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+        st.k_q4 = c.take_bytes(pool_bytes);
+        st.v_q4 = c.take_bytes(pool_bytes);
+    } else if (g_kv_int8) {
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.v_q = c.take<int8_t>(rows * s.head_dim);
         st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
@@ -644,13 +655,18 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
-    const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
-    if (st.kv_int8) {
+    if (st.kv_q4) {
+        const size_t pool_bytes = (size_t) st.n_slots * s.n_head_kv * s.page_size * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+        cudaMemsetAsync(st.k_q4, 0, pool_bytes, cs);
+        cudaMemsetAsync(st.v_q4, 0, pool_bytes, cs);
+    } else if (st.kv_int8) {
+        const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
     } else {
+        const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
     }
@@ -666,7 +682,8 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     strata::kernels::QsaAttnPools pools;
     pools.page_table = st.page_table;
-    if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
+    if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
+    else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
     else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
     return pools;
 }
@@ -677,7 +694,6 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
     strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, st.kv_int8, ids, steps, n_q, cap,
                                        qsa_shapes(g), stream);
 }
-
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
 n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;
@@ -846,62 +862,132 @@ if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
 // launch is sized from a capacity in `st`/`b`, so this sequence can be captured and replayed.  The
 // host-scalar wrappers would be correct here today and silently wrong in a graph.
-if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
-    try {
-        native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
-            (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, (float) qsa_freq_base(), stream);
-    } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
-} else indexer_key_append(b.idx_raw, st.pos_dev, pos_base, (const float*) w_ikn->data, RMS_EPS, ib, s,
-                          st.cos_tab, st.sin_tab, stream);    }
+if (st.kv_q4) {
+    // In-place Hadamard rotation for K and V prior to 4-bit quantization
+    fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
+    fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+    kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream);
+} else if (st.kv_int8) {
+    kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
+} else {
+    kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
+}
+{
+    const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;
+    const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;
+    if (!st.kv_int8 && !st.kv_q4) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);
+    if (!st.kv_int8 && !st.kv_q4) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);
+    dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);
+    dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);
+}
+{
+    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+    if (native_qsa_indexer_enabled()) {
+        try {
+            native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
+                (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, (float) qsa_freq_base(), stream);
+        } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
+    } else {
+        indexer_key_append(b.idx_raw, st.pos_dev, pos_base, (const float*) w_ikn->data, RMS_EPS, ib, s,
+                           st.cos_tab, st.sin_tab, stream);
+    }
+}
 // ---- 6. the query projection, and the HALF-SPLIT into q and gate.
-//
-// **`attn_q` IS *NOT* ALWAYS Q2_0.**  It is Q2_0 on TWO of the twelve QSA layers, Q3_K on six and IQ4_XS on
-// four, and this line used to call `s2_gemv_q8` unconditionally - so TEN of the twelve layers decoded an
-// S4 code plane with a Q8_0 activation.  Both are "a quantized activation", both produce a plausible
-// vector, and the difference is 0.6-1.4%.
-if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,                        v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
-// `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
-// the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
-// case A) and needs no kernel.
-if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) g.head_dim * 4, (size_t) g.n_head, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
+if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,
+                    v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
+
+if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,
+                      (size_t) g.head_dim * 4, (size_t) g.n_head, cudaMemcpyDeviceToDevice,
+                      (cudaStream_t) stream) != cudaSuccess) {
+    err = "qsa_layer: the q/gate split failed";
+    return false;
+}
+if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
+if (st.kv_q4) {
+    // In-place Hadamard rotation for Q so Q*K^T is invariant
+    fwht256_inplace_cuda(b.qcur, g.n_head, stream);
+}
 // ---- 7. the indexer's query: BF16, then norm and rotate
 project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
 if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim)) return false;
-// ---- 8. score, select, gather, attend.  `max_blocks` and `cap` are CAPACITIES from the state, not this
-// token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
-// graph, and the kernels guard for the surplus.    const
-int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
-    if (g_fast_select) {
-        // Plan v0.3 P7: block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
-        qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
-        qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
+// ---- 8. score, select, gather, attend.
+const int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
+if (g_fast_select) {
+    qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
+    qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
+} else {
+    qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);
+    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
+}
+if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
+    strata::kernels::QsaAttnPools pools;
+    pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; pools.k_q = st.k_q; pools.v_q = st.v_q;
+    pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; pools.page_table = st.page_table;
+    pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4;
+    if (!st.kv_int8) { pools.k_q = nullptr; pools.v_q = nullptr; }
+    if (!st.kv_q4) { pools.k_q4 = nullptr; pools.v_q4 = nullptr; }
+    strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+    if (st.kv_q4) {
+        // Un-rotate attention output: A = H * A_rot
+        fwht256_inplace_cuda(b.attn, g.n_head, stream);
+    }
+} else {
+    if (st.kv_q4) kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,
+                                           b.k_scratch, b.v_scratch, stream);
+    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+    if (native_flash_attn_short) {
+        if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
+            err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
+            return false;
+        }
+        try {
+            native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
+                (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
+        } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
+        if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
+            err = v.name("native_flash_attn") + ": status readback failed"; return false;
+        }
     } else {
-    qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
+        qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
         strata::kernels::QsaAttnPools pools;
         pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; pools.k_q = st.k_q; pools.v_q = st.v_q;
+        pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4;
         pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; pools.page_table = st.page_table;
         if (!st.kv_int8) { pools.k_q = nullptr; pools.v_q = nullptr; }
+        if (!st.kv_q4) { pools.k_q4 = nullptr; pools.v_q4 = nullptr; }
         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
     } else {
-    if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    if (native_flash_attn_short) {
-    if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
-        err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
-        return false;
+        if (st.kv_q4) kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+        else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+        else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+        if (native_flash_attn_short) {
+            if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
+                err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
+                return false;
+            }
+            try {
+                native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
+                    (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
+            } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
+            if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
+                                cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
+                err = v.name("native_flash_attn") + ": status readback failed"; return false;
+            }
+        } else {
+            qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
+        }
     }
-    try {
-        native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
-            (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
-    } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
-    if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
-        err = v.name("native_flash_attn") + ": status readback failed"; return false;
+    if (st.kv_q4) {
+        // Un-rotate attention output
+        fwht256_inplace_cuda(b.attn, g.n_head, stream);
     }
-} else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
-    }
+}
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
 // ---- 9. Gate the attention output before its projection. Native CUDA keeps F32
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
