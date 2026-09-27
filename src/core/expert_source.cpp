@@ -1164,6 +1164,13 @@ bool ArenaExpertSource::dc_stage_admit(int64_t layer, int64_t expert, const uint
     if (s < 0) return false;
     std::memcpy(hot_arena_ + (uint64_t) s * dc_slot_bytes_, bytes, (size_t) len);
     hot_slot_[(size_t) idx] = (int64_t) ((uint64_t) s * dc_slot_bytes_);
+    // R10: prefill admissions enter with ZERO credit, not one.  A big prompt's sweep admits ~24k blobs
+    // against ~11.6k slots; with count=1 the flood tied the untouched profile blobs and the LRU
+    // tie-break evicted the PROFILE side (it is always older), so the decode after a prefill lost its
+    // hot set (measured: multi-topic median 7.4 tok/s with the flood, 8.4 with admissions off).  With
+    // count=0 the flood recycles among itself unless a later touch proves the blob hot - the same
+    // rule the decode ring earns its count=1 credit by.
+    dc_count_[(size_t) s] = 0;
     ++dc_stage_admits_;
     return true;
 }
@@ -1378,8 +1385,9 @@ void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k
         // kSplit 1 must be exactly one read of the whole blob - `kChunk` only caps the SPLIT case.  Getting
         // this wrong left the engine issuing five 512 KiB reads per blob, which measured 8.5 tok/s against
         // 10.7 for the whole-blob form.
-        const uint64_t step = kSplit <= 1 ? len
-                              : std::min<uint64_t>(kChunk, (len + (uint64_t) kSplit - 1) / (uint64_t) kSplit);
+        const int ksplit = kSplit();
+        const uint64_t step = ksplit <= 1 ? len
+                              : std::min<uint64_t>(kChunk, (len + (uint64_t) ksplit - 1) / (uint64_t) ksplit);
         for (uint64_t at = 0; at < len && njobs < kRingSlots * kMaxChunks; at += step) {
             const uint64_t n = std::min<uint64_t>(step, len - at);
             pf_jobs_[(size_t) njobs++] = {dst + at, off + at, n};

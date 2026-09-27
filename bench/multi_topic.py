@@ -18,7 +18,7 @@ TOPICS = [
 ]
 
 def ask(prompt, maxt):
-    body = {"model": "strata", "messages": [{"role": "user", "content": prompt}],
+    body = {"model": "x", "messages": [{"role": "user", "content": prompt}],
             "max_tokens": maxt, "reasoning_effort": "none"}
     req = urllib.request.Request(URL + "/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})

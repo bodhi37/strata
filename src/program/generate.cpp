@@ -1904,6 +1904,13 @@ int main(int argc, char** argv) {
                                  "--expert-cache\n");
             return 2;
         }
+        // R10: one pinned max-blob buffer for the lent-slot refills (see the refill loops).
+        uint8_t* refill_stage = nullptr;
+        {
+            const int64_t rb = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (rb > 0 && cudaHostAlloc((void**) &refill_stage, (size_t) rb, cudaHostAllocDefault) != cudaSuccess)
+                refill_stage = nullptr;
+        }
         strata::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -2188,9 +2195,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             for (const auto& [i, slot] : lent_now) {
-                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert))) {
+                const int64_t lb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                // R10: refill through the PINNED staging buffer + `read_blob` (one whole-blob pread, or a
+                // tier memcpy when resident).  The old form passed `blob()`'s FILE-MAPPED pointer straight to
+                // cudaMemcpy: for non-resident blobs the driver faulted 4 KiB pages over PCIe, and refilling
+                // 1100 slots after a borrow took 354 s (a 69-token prefill's whole request).
+                if (refill_stage == nullptr || srcp->read_blob(i / g.n_expert, i % g.n_expert, refill_stage) != lb ||
+                    !xcache.fill_slot_blocking(slot, refill_stage, err, lb)) {
                     request_failed("refilling a lent slot failed: " + err);
                     continue;
                 }
@@ -2382,6 +2393,13 @@ int main(int argc, char** argv) {
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+    // R10: one pinned max-blob buffer for the one-shot lent-slot refills.
+    uint8_t* refill_stage = nullptr;
+    {
+        const int64_t rb = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        if (rb > 0 && cudaHostAlloc((void**) &refill_stage, (size_t) rb, cudaHostAllocDefault) != cudaSuccess)
+            refill_stage = nullptr;
+    }
     strata::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -2444,9 +2462,9 @@ int main(int argc, char** argv) {
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {
-                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert))) {
+                const int64_t lb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                if (refill_stage == nullptr || srcp->read_blob(i / g.n_expert, i % g.n_expert, refill_stage) != lb ||
+                    !xcache.fill_slot_blocking(slot, refill_stage, err, lb)) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
