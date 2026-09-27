@@ -62,21 +62,29 @@ class MockEngine:
         self.script = tokenizer.encode(script, parse_special=True) + tokenizer.encode(IM_END, parse_special=True)
         self.last_prompt: list[int] = []
         self.last = {}
+        self.last_keep = 0
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, keep=0):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
-        emitted = 0
-        for t in self.script[:max_new]:
-            if cancel.is_set():
-                break
-            if self.delay:
-                time.sleep(self.delay)
-            emitted += 1
-            yield t
-        self.last = {"generated": emitted, "prompt_tokens": len(ids), "prompt_ms": 0.0, "decode_ms": 0.0,
-                     "finish": "stop" if emitted and self.script[emitted - 1] in self.stop_ids else "length",
-                     "sess": len(ids) + emitted, "reused": keep, "prefilled": max(0, len(ids) - 1 - keep)}
+        self.last_keep = keep
+        emitted, cancelled = 0, False
+        try:
+            for t in self.script[:max_new]:
+                if cancel.is_set():
+                    cancelled = True
+                    break
+                if self.delay:
+                    time.sleep(self.delay)
+                emitted += 1
+                yield t
+        finally:
+            # Service.run breaks at the stop token and closes the generator; the `last` DONE fields
+            # must still land (the real engine parses its DONE line on the same early-exit path).
+            self.last = {"generated": emitted, "prompt_tokens": len(ids), "prompt_ms": 0.0, "decode_ms": 0.0,
+                         "finish": "stop" if emitted and self.script[emitted - 1] in self.stop_ids else "length",
+                         "sess": 0 if cancelled else len(ids) + emitted, "reused": keep,
+                         "prefilled": max(0, len(ids) - 1 - keep)}
 
     @property
     def stop_ids(self):
@@ -120,11 +128,7 @@ class StrataEngine:
                     if not cancel.is_set():
                         yield int(line[2:])
                 elif line.startswith("DONE"):
-                    f = line.split()
-                    self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
-                                 "decode_ms": float(f[4]), "finish": f[5]}
-                    if len(f) > 6:
-                        self.last["sess"] = int(f[6])
+                    self._parse_done(line)
                     done = True
                     return
                 elif line.startswith("ERR"):
@@ -132,10 +136,27 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
             raise RuntimeError("the engine process ended")
         finally:
-            if not done:                                  # the consumer stopped early: drain to DONE
+            # The consumer breaks at the stop token BEFORE the DONE line arrives; the drain here
+            # must PARSE it, not skip it - Service.run reads self.last right after closing this
+            # generator to maintain the prefix cache.  (The original P8b skipped it, so `sess`
+            # was always the previous request's value and the cache could never engage.)
+            if not done:
                 for line in self.proc.stdout:
-                    if line.startswith("DONE") or line.startswith("ERR"):
+                    if line.startswith("DONE"):
+                        self._parse_done(line)
                         break
+                    if line.startswith("ERR"):
+                        break
+
+    def _parse_done(self, line: str):
+        f = line.split()
+        self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
+                     "decode_ms": float(f[4]), "finish": f[5]}
+        if len(f) > 6:
+            self.last["sess"] = int(f[6])
+        if len(f) > 8:                        # plan v0.4 P8c: cache reuse counters (additive)
+            self.last["reused"] = int(f[7])
+            self.last["prefilled"] = int(f[8])
 
     def close(self):
         try:
@@ -304,6 +325,7 @@ class Service:
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.im_end_id = tokenizer.encode(IM_END, parse_special=True)[0]
 
         # plan v0.3 P8b (prefix cache): the server OWNS the session's token stream.  After the first render,
         # every turn is assembled as `session_ids + encode(canonical tail after the previous assistant block)`
@@ -314,30 +336,13 @@ class Service:
         self.asm_ids: list[int] = []                   # the token ids the engine's live session covers
         self.asm_valid = False
         self.last_render = ""                          # the previous turn's canonical render (prefix anchor)
-        self.pend_ids: list[int] | None = None         # what prepare() decided to send
-        self.pend_keep = 0
-        self.pend_render = ""
-
-    @staticmethod
-    def _assistant_bound(messages) -> tuple[str, str, int]:
-        """(reasoning, content, tool_json_len) of the LAST assistant message, for the seam bound."""
-        reasoning, content, tool_len = "", "", 0
-        for m in reversed(messages):
-            if m.get("role") == "assistant":
-                r = m.get("reasoning_content") or m.get("thinking") or ""
-                reasoning, content = (r if isinstance(r, str) else ""), (m.get("content") or "")
-                tcs = m.get("tool_calls") or []
-                try:
-                    tool_len = sum(len(json.dumps(tc)) + 64 for tc in tcs)
-                except Exception:
-                    tool_len = 1024
-                break
-        return reasoning, content, tool_len
 
     def prepare(self, messages, tools, kwargs, max_new):
+        """Returns (ids, thinking, keep, render): the token stream to send, whether the parser
+        expects <think> blocks, the proposed cache reuse count, and the canonical render this
+        request was built from.  All four travel WITH the request - prepare runs outside the
+        FIFO, so per-request state on `self` would race between concurrent requests."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
-        self.pend_render = prompt
-        self.pend_keep = 0
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
@@ -365,65 +370,82 @@ class Service:
         if len(ids) + max_new > self.engine.max_context:
             raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                              f"({self.engine.max_context}); requests are never truncated")
-        # ---- the prefix-cache assembly: skip the canonical re-render of the previous assistant block
+        # ---- the prefix-cache assembly (plan v0.4 P8c): the engine keeps its session when the
+        # assembled stream extends its own committed record, and content-verifies every token, so
+        # the server's job is only to propose the stream.  The raw generation differs from the
+        # canonical re-render inside the last assistant block (the template re-normalizes
+        # <think> and tool-call JSON), so the assembled stream reuses the live session's tokens
+        # and appends the canonical text from the block's closing <|im_end|> EXCLUSIVE - the
+        # engine commits the stop token now, so the suffix starts after it.  The first <|im_end|>
+        # in the tail is necessarily this turn's closer: an earlier one would have ended the raw
+        # generation.  No length heuristics - the engine's record is the referee.
         if self.asm_valid and not images and len(prompt) > len(self.last_render) and \
                 prompt.startswith(self.last_render):
             tail = prompt[len(self.last_render):]
-            reasoning, content, tool_len = self._assistant_bound(messages)
-            # the template re-renders the last assistant turn as PAD + '<think>\n\n' + reasoning +
-            # '</think>\n\n' + content [+ tool-call XML]; the live session already carries the RAW
-            # generation, so the appended suffix starts at the block's closing <|im_end|>.  The size check
-            # pins the found closer to THIS turn's assistant block.
-            bound = 256 + len(reasoning) + len(content) + tool_len
-            j = tail.find("<|im_end|>", 0, bound)
-            expect = 6 + len(reasoning) + len(content) + tool_len
-            if j >= 0 and tail[j:].startswith("<|im_end|>\n<|im_start|>") and \
-                    abs(len(tail[:j]) - expect) <= 32:
-                suffix = self.tok.encode(tail[j:], parse_special=True)
-                self.pend_ids, self.pend_keep = self.asm_ids + suffix, len(self.asm_ids)
-                if len(self.pend_ids) + max_new <= self.engine.max_context:
-                    return self.pend_ids, kwargs.get("enable_thinking", True) is not False
-        self.pend_ids, self.pend_keep = ids, 0
-        return ids, kwargs.get("enable_thinking", True) is not False
+            j = tail.find(IM_END)
+            if j >= 0 and tail[j:].startswith(IM_END + "\n<|im_start|>"):
+                suffix = self.tok.encode(tail[j + len(IM_END):], parse_special=True)
+                keep, send_ids = len(self.asm_ids), self.asm_ids + suffix
+                if len(send_ids) + max_new <= self.engine.max_context:
+                    return send_ids, kwargs.get("enable_thinking", True) is not False, keep, prompt
+        return ids, kwargs.get("enable_thinking", True) is not False, 0, prompt
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, keep=0, render_text="") -> \
+            Iterator[tuple[str, object]]:
+        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+        `ids`/`keep`/`render_text` are THIS request's prepare() decision (concurrent-safe)."""
         parser, detok, n, finish = OutputParser(thinking=thinking, tools=tools), Detokenizer(self.tok), 0, "length"
         emb = getattr(self.embeddings, "path", None)
-        send_ids = self.pend_ids if self.pend_ids is not None else ids
-        keep = self.pend_keep if not emb else 0      # vision requests always prefill from scratch
-        render_text = self.pend_render
-        self.pend_ids = None
+        send_ids = ids
+        keep = keep if not emb else 0                # vision requests always prefill from scratch
+        if not render_text:
+            keep = 0                                 # a caller that skipped prepare() has no anchor
         produced: list[int] = []
         try:
             with self.fifo:
                 gen = self.engine.generate(send_ids, max_new, sampling, cancel, embeddings=emb, keep=keep) if emb else \
                     self.engine.generate(send_ids, max_new, sampling, cancel, keep=keep)
-                for t in gen:
-                    n += 1
-                    produced.append(t)
-                    if t in self.stop_ids:
-                        finish = "stop"
-                        break
-                    for ev in parser.feed(detok.push(t)):
-                        yield "event", ev
+                try:
+                    for t in gen:
+                        n += 1
+                        produced.append(t)
+                        if t in self.stop_ids:
+                            finish = "stop"
+                            break
+                        for ev in parser.feed(detok.push(t)):
+                            yield "event", ev
+                finally:
+                    # deterministic close: on the stop break the engine's DONE line is still in the
+                    # pipe - closing parses it into engine.last BEFORE the cache maintenance below
+                    # reads it (a GC-time close would be too late and nondeterministic).
+                    gen.close()
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in parser.finish():
             yield "event", ev
         # maintain the assembled session; the engine's own live length is the authority - a mismatch
-        # (cancelled request, drained stop, engine restart) drops the cache and the next turn re-prefills
-        sess = getattr(self.engine, "last", {}).get("sess", 0)
-        if sess > 0 and len(send_ids) + len(produced) == sess:
+        # (cancelled request, drained stop, engine restart) drops the cache and the next turn re-prefills.
+        # plan v0.4 P8c: the engine commits the stop token, so the cached stream is the emitted
+        # stream only when the turn ended on <|im_end|> - the ONE stop id whose canonical
+        # continuation ("\n<|im_start|>...") the seam can encode.  A turn that ended on
+        # <|endoftext|> (or any other stop id) has no canonical continuation after it and is
+        # dropped: the next turn re-prefills the canonical render from scratch.  The engine
+        # content-verifies regardless - a stale server view can only cost a full prefill,
+        # never correctness.
+        last = getattr(self.engine, "last", {})
+        sess = last.get("sess", 0)
+        ended_on_im_end = finish == "stop" and produced and produced[-1] == self.im_end_id
+        if sess > 0 and ended_on_im_end and len(send_ids) + len(produced) == sess:
             self.asm_ids, self.asm_valid, self.last_render = send_ids + produced, True, render_text
         else:
             self.asm_ids, self.asm_valid, self.last_render = [], False, ""
-        yield "done", {"finish": finish, "completion_tokens": n, "prefilled_from_cache": keep}
+        yield "done", {"finish": finish, "completion_tokens": n, "prefilled_from_cache": keep,
+                       "cache_reused": last.get("reused"), "cache_prefilled": last.get("prefilled")}
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def openai_chunks(svc: Service, req: dict, ids, thinking, keep, render, tools, max_new, cancel):
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
     def chunk(delta, finish=None):
@@ -432,7 +454,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
 
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, keep=keep, render_text=render):
         if kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
@@ -449,7 +471,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             last = chunk({}, finish)
             last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
                              "total_tokens": len(ids) + x["completion_tokens"]}
-            last["strata"] = {"prefilled_from_cache": x.get("prefilled_from_cache", 0)}
+            last["strata"] = {"prefilled_from_cache": x.get("prefilled_from_cache", 0),
+                              "cache_reused": x.get("cache_reused"), "cache_prefilled": x.get("cache_prefilled")}
             yield last
 
 
@@ -468,11 +491,11 @@ def openai_collect(chunks) -> dict:
         msg["tool_calls"] = calls
     return {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
             "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
-            "usage": last["usage"]}
+            "usage": last["usage"], "strata": last.get("strata")}
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def anthropic_events(svc: Service, req: dict, ids, thinking, keep, render, tools, max_new, cancel):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
@@ -482,7 +505,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     def close():
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, keep=keep, render_text=render):
         if kind == "event":
             ev: Event = x
             want = {"reasoning": "thinking", "content": "text", "tool_call": "tool_use"}[ev.kind]
@@ -618,9 +641,9 @@ def make_handler(svc: Service):
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 1024)
-            ids, thinking = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, keep, render = svc.prepare(messages, tools, kw, max_new)
             cancel = threading.Event()
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            chunks = openai_chunks(svc, req, ids, thinking, keep, render, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -635,9 +658,9 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 1024)
-            ids, thinking = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, keep, render = svc.prepare(messages, tools, kw, max_new)
             cancel = threading.Event()
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            events = anthropic_events(svc, req, ids, thinking, keep, render, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()
