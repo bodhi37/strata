@@ -54,15 +54,22 @@ async function copyText(text, btn) {
 }
 
 // ------------------------------------------------------------------ theme and tabs
-function setTheme(t) {
+// the system's theme until the user picks one (only a click is saved)
+function setTheme(t, save) {
   document.documentElement.dataset.theme = t;
-  try { localStorage.setItem("strata.theme", t); } catch (e) { /* ignore */ }
+  if (save) try { localStorage.setItem("strata.theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
 }
-$("theme-btn").onclick = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
-$("dark-toggle").onclick = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
-setTheme(document.documentElement.dataset.theme || "light");
+const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
+$("theme-btn").onclick = flipTheme;
+$("dark-toggle").onclick = flipTheme;
+setTheme(document.documentElement.dataset.theme || "light", false);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  let saved = null;
+  try { saved = localStorage.getItem("strata.theme"); } catch (err) { /* ignore */ }
+  if (!saved) setTheme(e.matches ? "dark" : "light", false);
+});
 
 let tab = "chat";
 function showTab(name) {

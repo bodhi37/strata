@@ -781,8 +781,7 @@ def make_handler(svc: Service):
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
-                # the web app's fonts, only if they are installed locally (serve/web/fonts); the page falls back
-                # to the system font without them
+                # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
                 if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():

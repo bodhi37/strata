@@ -47,5 +47,3 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
-# the web app's fonts (GT Walsheim Pro, commercial licence): local only, never published
-serve/web/fonts/
