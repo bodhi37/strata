@@ -9,6 +9,9 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/core/layer.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -141,7 +144,47 @@ struct Prefill::Impl {
     std::atomic<int> rd_status_[STAGE] = {};    // per staging slot: bytes read, or -1 (the pool cannot read it)
     bool stage_dma_[STAGE] = {};                // consume H2D's straight from a pinned source pointer
     const uint8_t* stage_dma_src_[STAGE] = {};
+    // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
+    strata::kernels::KvHostPools stage;
+    int32_t* ident_table = nullptr;
 };
+
+namespace {
+// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
+// streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
+// rounds differently: without this an A/B compares two expert placements as well as two KV placements)
+bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
+                strata::kernels::KvHostPools& st, bool& ok) {
+    const core::QsaState& q0 = ss.qsa_states[0];
+    if (q0.kv_mode != 1) return;
+    if (stage_own() && o_borrowed.count_only) return;
+    Alloc own;
+    own.owned = o_borrowed.owned;
+    Alloc& o = stage_own() ? own : o_borrowed;
+    const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
+    if (q0.kv_q4) {
+        st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_int8) {
+        st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
+        st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
+        st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+        st.v_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
+    } else {
+        st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
+        st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
+    }
+}
+strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
+    strata::kernels::QsaAttnPools p;
+    p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
+    p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    p.page_table = table;
+    return p;
+}
+}  // namespace
 
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
@@ -257,6 +300,17 @@ bool Prefill::alloc_all(std::string& err) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
+    take_stage(o, ss, s, m.stage, ok);
+    if (ok && m.stage.present()) {
+        const int64_t pages = ss.qsa_states[0].n_pages;
+        std::vector<int32_t> ident((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
+        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
+            cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+            ok = false;
+        else
+            m.owned.push_back(m.ident_table);
+    }
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(NE); m.off.resize(NE + 1);
     m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) {
@@ -367,6 +421,8 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     for (int i = 0; i < STAGE; ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
+    strata::kernels::KvHostPools stage;
+    take_stage(o, ss, s, stage, ok);
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -411,6 +467,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+        if (should_stop && should_stop()) { err = "cancelled"; return false; }
+        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
         // ---- embeddings: broadcast per tile below (emb is TILE-sized scratch)
@@ -690,6 +748,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         gdn_state += 0;
                     }
                     const core::QsaState* stp = qsa_l ? &ss.qsa_states[qsa_index] : nullptr;
+                    // KV streaming: this layer's cells [0, p0) come in from the host copy to the one-layer
+                    // staging pool before the chunk's tiles append (and read) through it.
+                    bool staged = false;
+                    if (qsa_l) {
+                        staged = stp->kv_mode == 1;
+                        if (staged)
+                            strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), stp->host,
+                                                                core::qsa_kv_format(*stp),
+                                                                (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                    }
                     for (int64_t t0 = 0; t0 < T; t0 += m.tile) {
                         const int64_t ts = std::min(T - t0, m.tile);
                         gr_norm(m.R + t0 * D, (const float*) wn->data, EPS, m.xn, m.xn16, ts, m.cs);
@@ -720,11 +788,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (!bf16_proj(m.gemm, wiq, m.mixed_bf + t0 * N, m.q_idx, ts, v.name("indexer.q_proj.weight"), err)) return false;
                             rms_rows(m.Kc, (const float*) wkn->data, ts * 2, 256, 256, EPS, m.cs);
                             rope(m.Kc, ts, 2, 256, 512, p0 + t0, (float) strata::kernels::qsa_freq_base(), m.cs);
-                            kv_append(m.Kc, m.Vc, ts, p0 + t0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs);
+                            if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): rotated K and V, the queries below too, the output back
+                                strata::kernels::fwht256_inplace_cuda(m.Kc, ts * 2, m.cs);
+                                strata::kernels::fwht256_inplace_cuda(m.Vc, ts * 2, m.cs);
+                                strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0 + t0, ts, m.Kc, m.Vc,
+                                                              s, m.cs, &st.host, staged ? &m.stage : nullptr);
+                            } else {
+                                kv_append(m.Kc, m.Vc, ts, p0 + t0, st.page_table, s.page_size,
+                                          st.kv_int8 ? nullptr : st.k_pool, st.kv_int8 ? nullptr : st.v_pool,
+                                          st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                          &st.host, staged ? &m.stage : nullptr);
+                            }
                             split_q(m.Qf, m.q, ts, m.cs);
                             rms_rows(m.q, (const float*) wqn->data, ts * 24, 256, 256, EPS, m.cs);
                             rope(m.q, ts, 24, 256, 6144, p0 + t0, (float) strata::kernels::qsa_freq_base(), m.cs);
+                            if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.q, ts * 24, m.cs);
                             rms_rows(m.q_idx, (const float*) wiqn->data, ts * 4, 128, 128, EPS, m.cs);
                             rope(m.q_idx, ts, 4, 128, 512, p0 + t0, (float) strata::kernels::qsa_freq_base(), m.cs);
                             const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -744,16 +822,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                                 m.sel_ids + b0 * m.cap, m.cs);
                             }
-                            strata::kernels::QsaAttnPools pools;
-                            pools.page_table = st.page_table;
-                            if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
-                            else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
+                            const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                                                : core::qsa_attn_pools(st);
                             for (int64_t b0 = 0; b0 < ts; b0 += m.attn_batch) {
                                 const int64_t nb = std::min(m.attn_batch, ts - b0);
                                 strata::kernels::qsa_decode_attn_batch(m.q + b0 * ZV, pools, m.sel_ids + b0 * m.cap,
                                                                        m.steps_dev + (t0 + b0) * strata::kernels::kStepCount, m.cap, s,
                                                                        m.attn_scratch, m.attn + b0 * ZV, nb, m.cs);
                             }
+                            if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, ts * 24, m.cs);
                             gate_attn(m.attn, m.Qf, m.attn_h, ts, m.cs);
                             if (!native_proj(m.gemm, wo, m.attn_h, m.bo + t0 * N, ts, v.name("attn_output.weight"), err)) return false;
                         }
@@ -780,6 +857,20 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+    if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
+        cudaStreamSynchronize(m.cs);
+        std::vector<uint8_t> b((size_t) gdn_floats * 4);
+        std::string line;
+        char h[8];
+        for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
+            cudaMemcpy(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size(), cudaMemcpyDeviceToHost);
+            uint64_t x = 1469598103934665603ull;
+            for (uint8_t c : b) x = (x ^ c) * 1099511628211ull;
+            std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long) (x & 0xffff));
+            line += h;
+        }
+        std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
+    }
     return true;
 }
 

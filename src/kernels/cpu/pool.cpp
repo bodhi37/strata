@@ -74,6 +74,7 @@ std::vector<int> physical_cores(bool skip_first) {
     // nothing ever ran on the siblings except by accident.  With this order the first 11 workers are alone on
     // their cores, worker 12+ takes a sibling, and the readers/server/GPU threads have 12 siblings to land on.
     cpu_set_t set;
+    CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof set, &set) == 0) {
         const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
         std::vector<int> phys, sib;
@@ -93,9 +94,9 @@ std::vector<int> physical_cores(bool skip_first) {
         }
         for (int c : phys) cores.push_back(c);
         for (int c : sib) cores.push_back(c);
-    }
-    if (cores.empty())
+    } else {
         for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
+    }
 #endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;

@@ -23,8 +23,9 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <atomic>
-#include <cstdint>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 #include <vector>

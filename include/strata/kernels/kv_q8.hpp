@@ -12,6 +12,7 @@
 // the FP16 pools: codes `[page][kv_head][page_size][head_dim]`, scales `[page][kv_head][page_size][head_dim/64]`.
 #pragma once
 
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <cstdint>
@@ -25,9 +26,11 @@ inline uint64_t kv_q8_bytes_per_cell(const QsaShapes& s) {
     return (uint64_t) s.n_head_kv * s.head_dim * 2 + (uint64_t) s.n_head_kv * (s.head_dim / KV_Q8_GROUP) * 2 * 2;
 }
 
-/// Append the cell at step[kStepPos] (graph-capturable: position and page come from device memory).
+/// Append the cell at step[kStepPos] (graph-capturable: position and page come from device memory). With a host
+/// copy (KV streaming, `kv_stream.hpp`) the cell is written there too, and to VRAM only if its block is resident.
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
-                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream);
+                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                       const KvHostPools* host = nullptr);
 
 /// Gather step[kStepWidth] cells named by `ids` into FP16 scratch `[id][kv_head][head_dim]`; the grid is sized by
 /// `max_ids` (capacity), the kernel reads the real count from `step`.

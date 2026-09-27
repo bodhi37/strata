@@ -357,10 +357,12 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
     o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
 }
 
-// one block per (token, kv head, 64-value group); 64 threads
+// one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
+// resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
 __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
-                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale) {
+                                 uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
+                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage) {
     const int64_t t = blockIdx.x;
     const int kvh = blockIdx.y, g = blockIdx.z >> 1;
     const bool is_v = (blockIdx.z & 1) != 0;
@@ -369,8 +371,12 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const int64_t pos = pos0 + t;
     const int64_t page = table[pos / page_size];
     const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
+    const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
     if (k_pool != nullptr) {
-        (is_v ? v_pool : k_pool)[row * 256 + d] = hf(x);
+        const uint16_t h = hf(x);
+        if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;
+        if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = h;
+        if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
         return;
     }
     float a = fabsf(x);
@@ -383,12 +389,26 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const float sf = __half2float(__ushort_as_half(sb));
     int q = 0;
     if (sf > 0.0f) { q = __float2int_rn(x / sf); q = q < -127 ? -127 : (q > 127 ? 127 : q); }
-    (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) q;
-    if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
+    if (page >= 0) {
+        (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
+    }
+    if (host.k_q != nullptr) {
+        (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+    }
+    if (stage.k_q != nullptr) {
+        (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
+    }
 }
 __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = hf(x[i]);
+}
+__global__ void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = __half2float(__float2half_rn(x[i]));
 }
 __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
@@ -399,16 +419,22 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream) {
+               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(K, V, pos0, page_table, page_size, k_pool,
-                                                                                  v_pool, k_q, v_q, k_scale, v_scale);
+    kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
+        K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
+        host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
     check("to_f16");
+}
+void round_f16(const float* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    round_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    check("round_f16");
 }
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
