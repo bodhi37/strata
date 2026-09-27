@@ -566,6 +566,76 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================
 
+// R13: O_DIRECT helpers.  A blob's file offset is 256-byte aligned but rarely 4 KiB, its length is not a
+// 4 KiB multiple, and the ring destinations are plain heap vectors - none of which O_DIRECT accepts.  Every
+// direct read therefore covers the blob with the enclosing 4 KiB-aligned span into a thread-local aligned
+// bounce buffer, and the exact blob bytes are memcpy'd out of it.  One extra 2.18 MB copy (~0.1 ms) against
+// the page-cache alloc/copy/DONTNEED cycle it removes.
+namespace {
+
+/// Full pread; a short read on a valid regular fd is EOF-level trouble, so it fails the read.
+bool pread_full(int fd, void* dst, size_t n, off_t off) {
+    uint8_t* p = (uint8_t*) dst;
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t r = ::pread(fd, p + done, n - done, off + (off_t) done);
+        if (r <= 0) return false;
+        done += (size_t) r;
+    }
+    return true;
+}
+
+/// One aligned bounce buffer per thread, grown to the largest blob (plus the 4 KiB head/tail over-read).
+uint8_t* tls_bounce(size_t bytes) {
+    struct Buf { void* p = nullptr; ~Buf() { std::free(p); } };
+    thread_local Buf buf;
+    thread_local size_t cap = 0;
+    if (cap < bytes) {
+        void* q = nullptr;
+        if (posix_memalign(&q, 4096, bytes) != 0) return nullptr;
+        std::free(buf.p);
+        buf.p = q;
+        cap = bytes;
+    }
+    return (uint8_t*) buf.p;
+}
+
+}  // namespace
+
+// R13: read the blob's bytes through `direct_fd_` into `dst`.  Returns the blob length, or -1 on any
+// failure (the caller falls back to the buffered pread, so a exotic filesystem cannot break the engine).
+int64_t ArenaExpertSource::direct_read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (!direct_ok_ || direct_fd_ < 0 || dst == nullptr) return -1;
+    if (layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return -1;
+    const uint64_t off = lay.blob_offset(layer, expert);
+    if (off + len > file_map_bytes_) return -1;
+    constexpr uint64_t A = 4096;
+    const uint64_t off_al = off & ~(A - 1);
+    const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
+    uint8_t* bounce = tls_bounce((size_t) span);
+    if (bounce == nullptr) return -1;
+    if (!pread_full(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return -1;
+    std::memcpy(dst, bounce + (off - off_al), (size_t) len);
+    return (int64_t) len;
+}
+
+// R13: read `len` bytes at file offset `off` (arbitrary alignment) through `direct_fd_` into `dst`.
+bool ArenaExpertSource::direct_read_span(uint64_t off, uint64_t len, uint8_t* dst) {
+    if (!direct_ok_ || direct_fd_ < 0 || dst == nullptr || len == 0) return false;
+    if (off + len > file_map_bytes_) return false;
+    constexpr uint64_t A = 4096;
+    const uint64_t off_al = off & ~(A - 1);
+    const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
+    uint8_t* bounce = tls_bounce((size_t) span);
+    if (bounce == nullptr) return false;
+    if (!pread_full(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return false;
+    std::memcpy(dst, bounce + (off - off_al), (size_t) len);
+    return true;
+}
+
 // Plan v0.3 P6: the arena from the model's shard 1.  Each layer's gate, up and down tensors hold the 512 experts
 // one after another; they are read in chunks and each expert's slice lands at its place in the blob
 // [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.
@@ -700,6 +770,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         }
         file_fd_ = ::open(fb.c_str(), O_RDWR | O_CREAT, 0644);
         if (file_fd_ < 0) { err = "ArenaExpertSource: cannot open " + fb; return false; }
+        // R13: the O_DIRECT twin fd.  If the filesystem refuses O_DIRECT (or STRATA_NO_ODIRECT=1), every
+        // read site falls back to the buffered pread path unchanged.
+        direct_ok_ = (std::getenv("STRATA_NO_ODIRECT") == nullptr);
+        if (direct_ok_) {
+            direct_fd_ = ::open(fb.c_str(), O_RDONLY | O_DIRECT);
+            if (direct_fd_ < 0) { direct_ok_ = false; }
+        } else {
+            direct_fd_ = -1;
+        }
         if (!preexisting && ::ftruncate(file_fd_, (off_t) cap) != 0) {
             ::close(file_fd_); file_fd_ = -1;
             err = "ArenaExpertSource: cannot size " + fb;
@@ -719,7 +798,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         slice_bytes_ = 0;
         dev_slice_.clear();
         note_ = "file-backed mmap " + fb +
-                (preexisting ? " (pre-existing; lazy page-in)" : " (materializing from the GGUF shards)");
+                (preexisting ? " (pre-existing; lazy page-in)" : " (materializing from the GGUF shards)") +
+                (direct_ok_ ? "; O_DIRECT expert reads ON" : "; O_DIRECT expert reads off");
         LoadStats st;
         if (preexisting) {
             st.bytes = want;
@@ -823,6 +903,13 @@ void ArenaExpertSource::close() {
         ::close(file_fd_);
 #endif
         file_fd_ = -1;
+    }
+    if (direct_fd_ >= 0) {
+#if !defined(_WIN32)
+        ::close(direct_fd_);
+#endif
+        direct_fd_ = -1;
+        direct_ok_ = false;
     }
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
@@ -936,14 +1023,20 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         if (len == 0 || off + len > file_map_bytes_ || len > dc_slot_bytes_) break;
         uint8_t* dst = hot_arena_ + (uint64_t) hot_count_ * dc_slot_bytes_;
         bool ok = false;
+        bool used_direct = false;
         if (file_fd_ >= 0) {
-            uint64_t done = 0;
-            while (done < len) {
-                const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (len - done), (off_t) (off + done));
-                if (r <= 0) break;
-                done += (uint64_t) r;
+            // R13: O_DIRECT first; the buffered fill (with its DONTNEED page-cache drop) is the fallback.
+            used_direct = direct_read_span(off, len, dst);
+            ok = used_direct;
+            if (!ok) {
+                uint64_t done = 0;
+                ok = true;
+                while (done < len) {
+                    const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (len - done), (off_t) (off + done));
+                    if (r <= 0) { ok = false; break; }
+                    done += (uint64_t) r;
+                }
             }
-            ok = (done == len);
         } else {
             std::memcpy(dst, base_ + off, (size_t) len);
             ok = true;
@@ -967,8 +1060,9 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
         // **AND GIVE THE FILE PAGES BACK.**  A `pread` of a blob leaves that blob in the page cache, so filling
         // a 20 GiB tier would otherwise leave 20 GiB of page cache behind - for pages this tier now serves from
         // anonymous memory and will never read from the file again.  On a 30 GiB box that page cache is the
-        // difference between a hot tier that can be grown and one that cannot.
-        if (file_fd_ >= 0) ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
+        // difference between a hot tier that can be grown and one that cannot.  (R13: the O_DIRECT fill leaves
+        // no cache copy, so the fadvise only runs on the buffered fallback.)
+        if (file_fd_ >= 0 && !used_direct) ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
     }
     for (int64_t s = hot_count_; s < dc_slots_; ++s) dc_free_.push_back((int32_t) s);
     if (hot_count_ == 0) {
@@ -1234,6 +1328,8 @@ int64_t ArenaExpertSource::read_blob_raw(int64_t layer, int64_t expert, void* ds
     if (file_fd_ < 0 || file_map_ == nullptr) return -1;
     const uint64_t off = lay.blob_offset(layer, expert);
     if (off + len > file_map_bytes_) return -1;
+    // R13: O_DIRECT first (no page-cache alloc/copy/DONTNEED); buffered pread is the fallback arm.
+    if (direct_read_span(off, len, (uint8_t*) dst)) return (int64_t) len;
     uint8_t* p = (uint8_t*) dst;
     uint64_t done = 0;
     while (done < len) {
@@ -1292,19 +1388,25 @@ void ArenaExpertSource::pf_worker() {
             const uint32_t i = pf_head_.fetch_add(1, std::memory_order_relaxed);
             if (i >= pf_njobs_.load(std::memory_order_acquire)) break;
             const PfJob& j = pf_jobs_[(size_t) i];
-            uint64_t done = 0;
-            while (done < j.len) {
-                const ssize_t r = ::pread(file_fd_, j.dst + done, (size_t) (j.len - done), (off_t) (j.off + done));
-                if (r <= 0) break;
-                done += (uint64_t) r;
+            // R13: the direct path first; the buffered pread + DONTNEED stays as the fallback arm.
+            bool ok = direct_read_span(j.off, j.len, j.dst);
+            if (!ok) {
+                uint64_t done = 0;
+                ok = true;
+                while (done < j.len) {
+                    const ssize_t r = ::pread(file_fd_, j.dst + done, (size_t) (j.len - done), (off_t) (j.off + done));
+                    if (r <= 0) { ok = false; break; }
+                    done += (uint64_t) r;
+                }
+                if (ok)
+                    // R8.2: **DROP THE PAGE-CACHE COPY IMMEDIATELY.**  A whole-blob `pread` leaves ~530 cached pages
+                    // behind, and on a 30 GiB box that already runs a 22 GiB mlocked tier there is no cache left to
+                    // hold them: the kernel allocates, clears, copies and then RECLAIMS every page of every miss.
+                    // perf during a diverse 300-token generation measured ~39% of the engine's CPU inside kernel
+                    // page-management on exactly this cycle.  The bytes the ring needed are in the ring; the cache
+                    // copy serves nobody (decode re-uses go through the LRU tier, prefill staging re-reads nothing).
+                    ::posix_fadvise(file_fd_, (off_t) j.off, (off_t) j.len, POSIX_FADV_DONTNEED);
             }
-            // R8.2: **DROP THE PAGE-CACHE COPY IMMEDIATELY.**  A whole-blob `pread` leaves ~530 cached pages
-            // behind, and on a 30 GiB box that already runs a 22 GiB mlocked tier there is no cache left to
-            // hold them: the kernel allocates, clears, copies and then RECLAIMS every page of every miss.
-            // perf during a diverse 300-token generation measured ~39% of the engine's CPU inside kernel
-            // page-management on exactly this cycle.  The bytes the ring needed are in the ring; the cache
-            // copy serves nobody (decode re-uses go through the LRU tier, prefill staging re-reads nothing).
-            ::posix_fadvise(file_fd_, (off_t) j.off, (off_t) j.len, POSIX_FADV_DONTNEED);
             pf_done_.fetch_add(1, std::memory_order_release);
         }
     }

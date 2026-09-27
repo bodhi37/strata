@@ -478,6 +478,14 @@ private:
     void* file_map_ = nullptr;       ///< the mmap of experts-native.bin (file_backing_ path)
     uint64_t file_map_bytes_ = 0;
     int file_fd_ = -1;
+    // R13: **O_DIRECT EXPERT READS.**  Every ring/staging/tier-fill read used to go through the page cache:
+    // the kernel allocated ~530 cache pages per 2.18 MB blob, copied disk->cache->user, and the reader then
+    // issued POSIX_FADV_DONTNEED to hand it all back (R8.2 measured ~39% of engine CPU inside kernel page
+    // management on that cycle).  A second O_RDONLY|O_DIRECT fd serves the same bytes straight into the
+    // destination buffer: no page-cache allocation, no DONTNEED, no double copy.  `file_fd_` stays for the
+    // mmap fallthrough and the (page-cache) WILLNEED prefetchers.  STRATA_NO_ODIRECT=1 is the A/B arm.
+    int direct_fd_ = -1;
+    bool direct_ok_ = false;
     uint8_t* hot_arena_ = nullptr;   ///< the anonymous pinned arena for the profile's hottest blobs
     uint64_t hot_cap_ = 0, hot_used_ = 0;
     int64_t hot_count_ = 0;
@@ -571,6 +579,8 @@ private:
     void pf_window_start();
     void pf_record_miss(int64_t idx);
     void pf_worker();              ///< R5-fetch: one of the four pread threads
+    int64_t direct_read_blob(int64_t layer, int64_t expert, uint8_t* dst);  ///< R13: one O_DIRECT blob read
+    bool direct_read_span(uint64_t off, uint64_t len, uint8_t* dst);        ///< R13: one O_DIRECT byte span
 };
 
 }  // namespace strata::core

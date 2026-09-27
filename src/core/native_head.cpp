@@ -119,8 +119,10 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
         if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            const cudaError_t herr = cudaGetLastError();
             host_ = nullptr;
-            err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";
+            err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB (cuda: " +
+                  cudaGetErrorString(herr) + ")";
             return false;
         }
         std::memcpy(host_, gguf.tensor_data(*t), bytes_);
