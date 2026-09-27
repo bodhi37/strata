@@ -157,9 +157,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const strata::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[0].max_cells;
-    const uint64_t sb = qsa_state_bytes(g, max_cells, false);
+    // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
+    // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume
+    const int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    const uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0]) == 0) { err = "mtp: state init failed"; return false; }
+    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
@@ -326,10 +329,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
             if (st_.kv_int8)
                 kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs);
+                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
             else
                 kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                               vcur_ + t * NKV * HD, s, cs);
+                               vcur_ + t * NKV * HD, s, cs, &st_.host);
         }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
@@ -342,10 +345,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
             norm_rope(qc, f32("self_attn.q_norm.weight"), (int) NH, (int) HD, pos + t * NH);
         }
-        QsaAttnPools pools;
-        pools.page_table = st_.page_table;
-        if (st_.kv_int8) { pools.k_q = st_.k_q; pools.v_q = st_.v_q; pools.k_scale = st_.k_scale; pools.v_scale = st_.v_scale; }
-        else { pools.k_pool = st_.k_pool; pools.v_pool = st_.v_pool; }
+        const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
         for (int t = 0; t < T; ++t)
@@ -491,6 +491,15 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
     return finish_capture(cs_, ok, step_exec_[j], "step", err);
 }
 
+void MtpDrafter::kv_restore(int64_t upto) {
+    if (st_.kv_mode != 2 || upto <= 0) return;
+    // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
+    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
+    strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, st_.kv_int8, b0, b1, st_.n_slots, s, cs_);
+    cudaStreamSynchronize(cs_);
+}
+
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -551,7 +560,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (probs) probs[0] = pj;
     int n = 1;
     // the chain continues while the last draft is likely enough to be verified
-    for (int j = 1; j < max_t_ - 1 && pj >= min_p; ++j) {
+    for (int j = 1; j < std::min(max_t_ - 1, max_drafts_) && pj >= min_p; ++j) {
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
         std::atomic_thread_fence(std::memory_order_seq_cst);

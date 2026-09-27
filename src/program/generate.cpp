@@ -41,6 +41,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
 
@@ -116,6 +117,7 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -248,6 +250,12 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    /// The suffix drafter: when the text being written repeats an earlier stretch of the context (code edits, quoted
+    /// input, tool-call JSON) by at least this many tokens, the window is filled with what followed it there instead
+    /// of the MTP's drafts, up to --spec - 1 of them, as long as the MTP's own first guess agrees.  0 = MTP only.
+    int suffix_draft = 0;
+    /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
+    int mtp_max_t = 0;
 };
 
 void usage() {
@@ -267,6 +275,9 @@ void usage() {
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                 "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
+                 "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
+                 "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -311,6 +322,8 @@ void usage() {
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "  --suffix-draft N     draft from an earlier repeat of the last N+ tokens of context (0 = MTP only)\n"
+                 "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native)\n"
@@ -603,6 +616,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
+        else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -658,6 +672,8 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
+        else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
             std::string e;
@@ -711,6 +727,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
+    if (o.kv_resident < 0) {
+        std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
+        return 2;
+    }
+    strata::core::qsa_set_kv_resident(o.kv_resident);
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         if (o.no_ple || o.ple_gguf.empty()) {
@@ -941,6 +962,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
     }
+    if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1)
+        std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
+                             "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
+                     (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
     // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
@@ -2136,6 +2161,9 @@ int main(int argc, char** argv) {
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
+        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+        if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -2309,6 +2337,9 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
+            // host copies and slots are always current (every writer writes both), so they need nothing
+            if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
             mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
@@ -2441,8 +2472,13 @@ int main(int argc, char** argv) {
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) S, 0.0f);
+            std::vector<int32_t> sbuf((size_t) S, 0);
+            if (o.suffix_draft > 0) {
+                sfx.reset();
+                for (int64_t t : ids) sfx.append((int32_t) t);
+            }
             bool first_window = true;
-            int64_t produced_n = 0;
+            int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
@@ -2452,15 +2488,22 @@ int main(int argc, char** argv) {
             const Clock::time_point d0 = Clock::now();
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
-                int T = S;
+                int T = S_mtp;
                 if (o.spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
+                // a repeat of earlier context proposes more than the MTP is confident about: take it, but only where the
+                // MTP's own first guess agrees (a repeat the model is not following costs a whole window)
+                bool from_sfx = false;
+                if (o.suffix_draft > 0 && !first_window) {
+                    const int k = sfx.propose(S - 1, sbuf.data());
+                    if (k + 1 > T && sbuf[0] == drafts[0]) { T = k + 1; from_sfx = true; }
+                }
                 if (p + T > o.max_context) break;
                 window[0] = x;
-                for (int i = 1; i < T; ++i) window[(size_t) i] = drafts[(size_t) i - 1];
+                for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -2472,6 +2515,7 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
@@ -2490,6 +2534,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     ++produced_n;
+                    if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
@@ -2531,7 +2576,7 @@ int main(int argc, char** argv) {
                 }();
                 auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
                     std::vector<uint8_t> b(bytes);
-                    if (bytes) cudaMemcpy(b.data(), p, bytes, cudaMemcpyDeviceToHost);
+                    if (bytes) cudaMemcpy(b.data(), p, bytes, cudaMemcpyDefault);   // VRAM or a streamed host copy
                     return fnv1a(b.data(), b.size(), h);
                 };
                 // the cells [c0, c1) of one int8 K or V pool ([page][kv_head][page_size][head_dim]), bytes per value `w`
@@ -2547,6 +2592,16 @@ int main(int argc, char** argv) {
                 };
                 const ConvStateSizes z = conv_state_sizes(g);
                 uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
+                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
+                    const size_t per = z.gdn / (size_t) g.n_gdn_layers();
+                    std::string s;
+                    char b[8];
+                    for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
+                        std::snprintf(b, sizeof(b), "%04llx ", (unsigned long long) (hash_dev((const uint8_t*) ss.gdn_state + i * per, per, 1469598103934665603ull) & 0xffff));
+                        s += b;
+                    }
+                    std::fprintf(stderr, "strata serve: STATE_HASH_GDN %s\n", s.c_str());
+                }
                 uint64_t h_ple = hash_dev(ss.ple_hist, z.ple, 1469598103934665603ull);
                 uint64_t h_tail = 1469598103934665603ull, h_pool = h_tail, h_kv = h_tail, h_stale = h_tail;
                 const int64_t kvb = qs.head_dim, scb = (qs.head_dim / 64) * 2;
@@ -2556,8 +2611,12 @@ int main(int argc, char** argv) {
                     const strata::core::QsaState& st = ss.qsa_states[i];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
-                    for (const auto& [pool, w] : {std::pair<const void*, int64_t>{st.k_q, kvb}, {st.v_q, kvb},
-                                                  {st.k_scale, scb}, {st.v_scale, scb}}) {
+                    // KV streaming: the host copy is the identity layout and holds every cell
+                    const bool hs = st.kv_mode != 0;
+                    for (const auto& [pool, w] : {std::pair<const void*, int64_t>{hs ? st.host.k_q : st.k_q, kvb},
+                                                  {hs ? st.host.v_q : st.v_q, kvb},
+                                                  {hs ? st.host.k_scale : st.k_scale, scb},
+                                                  {hs ? st.host.v_scale : st.v_scale, scb}}) {
                         h_kv = hash_cells(pool, w, 0, L, h_kv);
                         h_stale = hash_cells(pool, w, L, end_cell, h_stale);
                     }
@@ -2565,8 +2624,11 @@ int main(int argc, char** argv) {
                 const strata::core::QsaState& ms = mtp.kv_state();
                 uint64_t h_mtp = 1469598103934665603ull;
                 const int64_t mL = std::min<int64_t>(L, ms.max_cells);
-                for (const auto& [pool, w] : {std::pair<const void*, int64_t>{ms.k_q, kvb}, {ms.v_q, kvb},
-                                              {ms.k_scale, scb}, {ms.v_scale, scb}})
+                const bool mh = ms.kv_mode != 0;
+                for (const auto& [pool, w] : {std::pair<const void*, int64_t>{mh ? ms.host.k_q : ms.k_q, kvb},
+                                              {mh ? ms.host.v_q : ms.v_q, kvb},
+                                              {mh ? ms.host.k_scale : ms.k_scale, scb},
+                                              {mh ? ms.host.v_scale : ms.v_scale, scb}})
                     if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
                                      "kv=%016llx mtp=%016llx stale=%016llx ple_prev=%d,%d\n", (long long) L,
@@ -2585,6 +2647,22 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
+                // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
+                uint64_t miss = 0, look = 0;
+                bool over = false;
+                for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                    const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(ss.qsa_states[i].map);
+                    miss += c.misses; look += c.lookups; over = over || c.overflow;
+                }
+                std::fprintf(stderr, "strata serve: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
+                                     "from RAM%s\n", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
+                             (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
+                             over ? " - OVERFLOW (too few resident cells)" : "");
+            }
+            if (sfx_windows > 0)
+                std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
+                             (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
         }
         return 0;
     }
@@ -3029,16 +3107,30 @@ int main(int argc, char** argv) {
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
+        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        std::vector<int32_t> sbuf((size_t) o.spec, 0);
+        int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+        if (o.suffix_draft > 0) {
+            for (int64_t t : o.tokens) sfx.append((int32_t) t);
+            for (int64_t t : produced) sfx.append((int32_t) t);
+        }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
-            int T = o.spec;
+            int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                while (T < o.spec && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
+            bool from_sfx = false;
+            if (o.suffix_draft > 0 && !first_window) {
+                const int k = sfx.propose(o.spec - 1, sbuf.data());
+                if (k + 1 > T && (!use_mtp || sbuf[0] == drafts[0])) { T = k + 1; from_sfx = true; }
+            }
             ++window_hist[(size_t) T];
             if (p + T > o.max_context) {
                 std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) p);
@@ -3047,7 +3139,8 @@ int main(int argc, char** argv) {
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
-                int32_t d = use_mtp ? drafts[(size_t) i - 1] : at < oracle.size() ? (int32_t) oracle[at] : 0;
+                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp ? drafts[(size_t) i - 1]
+                                                    : at < oracle.size() ? (int32_t) oracle[at] : 0;
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
             }
@@ -3086,9 +3179,11 @@ int main(int argc, char** argv) {
             drafts_total += T - 1;
             drafts_ok += a;
             ++accepted_hist[(size_t) a];
+            if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             bool eos = false;
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
+                if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
             }
             if (eos) {
@@ -3120,6 +3215,9 @@ int main(int argc, char** argv) {
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
             std::printf("  (min draft probability %.2f)\n", o.spec_min_p);
         }
+        if (o.suffix_draft > 0)
+            std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,
+                        (long long) sfx_ok, (long long) sfx_drafts);
         std::printf("%-24s", "accepted per round");
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");

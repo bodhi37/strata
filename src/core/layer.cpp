@@ -27,6 +27,8 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -475,39 +477,204 @@ struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>   
 // dispatch too and the two must not be able to drift.
 }
 // namespace
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope) {    const QsaShapes s = qsa_shapes(g);    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;    uint64_t n = 0;    n += g_kv_int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64                    : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
-// k_pool + v_pool, fp16
-n += (uint64_t) pages * 4;
-// page_table
-n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;
-// tail
-n += (uint64_t) s.idx_dim * 4;
-// dead
-n += (uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim * 4;
-// pooled
-n += 16;
-// block_pos
-if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;
-// cos + sin tables
-n += strata::kernels::qsa_step_bytes() + 16; // counts and aligned attention status
-// the per-token counts
-n += (uint64_t) s.n_head * 4;
-// pos_dev
-return align_up16(n) + 256;}
-uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,                        const QsaState* share_rope) {    const QsaShapes s = qsa_shapes(g);    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;    Cursor c{(uint8_t*) base};    st.kv_int8 = g_kv_int8;    if (g_kv_int8) {        const uint64_t cells = (uint64_t) pages * s.n_head_kv * s.page_size;        st.k_q = c.take<int8_t>(cells * s.head_dim);        st.v_q = c.take<int8_t>(cells * s.head_dim);        st.k_scale = c.take<uint16_t>(cells * (s.head_dim / strata::kernels::KV_Q8_GROUP));        st.v_scale = c.take<uint16_t>(cells * (s.head_dim / strata::kernels::KV_Q8_GROUP));    } else {        st.k_pool = c.take<uint16_t>((uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim);        st.v_pool = c.take<uint16_t>((uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim);    }    st.page_table = c.take<int32_t>((uint64_t) pages);    st.n_pages = pages;    st.max_cells = max_cells;    st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);    st.idx_dead = c.take<float>((uint64_t) s.idx_dim);    st.idx_pooled = c.take<float>((uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim);    st.idx_block_pos = c.take<int32_t>(1);    if (share_rope != nullptr) {        st.cos_tab = share_rope->cos_tab;        st.sin_tab = share_rope->sin_tab;    } else {        st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));        st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));    }    st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount); st.attention_status = c.take<int32_t>(1);    st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
-// the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-if (cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t), cudaHostAllocMapped | cudaHostAllocPortable) !=            cudaSuccess ||        cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {        return 0;
-// the caller sees a zero byte count; a half-built state is worse than none
+namespace {
+// KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
+int64_t g_kv_resident = 0;
+uint64_t g_kv_host_bytes = 0;
+
+/// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
+struct KvPlan {
+    int mode = 0;
+    int64_t pages = 0, slots = 0, pooled_rows = 0;
+};
+KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
+    KvPlan p;
+    p.pages = (max_cells + s.page_size - 1) / s.page_size;
+    p.slots = p.pages;
+    p.pooled_rows = max_cells / s.idx_block + 2;
+    if (g_kv_resident <= 0) return p;
+    // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers
+    static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
+    static const bool main_off = std::getenv("STRATA_KV_MAIN_OFF") != nullptr;
+    if (ring_cells > 0 ? ring_off : main_off) return p;
+    if (ring_cells > 0) {
+        const int64_t r = (ring_cells + s.page_size - 1) / s.page_size;
+        if (r < p.pages) { p.mode = 2; p.slots = r; p.pooled_rows = 2; }   // the drafter has no indexer
+    } else {
+        const int64_t r = (std::max(g_kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
+        if (r < p.pages) { p.mode = 1; p.slots = r; }
+    }
+    return p;
 }
-st.host_step[strata::kernels::kStepCount] = 0;
-// THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
-// frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
-// agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
-if (share_rope == nullptr) {    std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));    strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::qsa_freq_base(), (int) max_cells,                                      hc.data(), hs.data());    cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);    cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);    }
-// the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
-// not page at all wants.  A real allocator re-points it; nothing outside `kv_append`/`kv_gather` may care.
-std::vector<int32_t> tab((size_t) pages);    for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;    cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);    return c.used;}
-void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {    const QsaShapes s = qsa_shapes(g);    cudaStream_t cs = (cudaStream_t) stream;    if (st.kv_int8) {        const size_t cells = (size_t) st.n_pages * s.n_head_kv * s.page_size;        cudaMemsetAsync(st.k_q, 0, cells * s.head_dim, cs);        cudaMemsetAsync(st.v_q, 0, cells * s.head_dim, cs);        cudaMemsetAsync(st.k_scale, 0, cells * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);        cudaMemsetAsync(st.v_scale, 0, cells * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);    } else {    cudaMemsetAsync(st.k_pool, 0, (size_t) st.n_pages * s.n_head_kv * s.page_size * s.head_dim * 2, cs);    cudaMemsetAsync(st.v_pool, 0, (size_t) st.n_pages * s.n_head_kv * s.page_size * s.head_dim * 2, cs);    }    cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);    cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);    cudaMemsetAsync(st.idx_pooled, 0, (size_t) ((st.max_cells / s.idx_block) + 2) * s.idx_dim * 4, cs);}
+uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages) {
+    return g_kv_int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
+                     : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
+}
+}  // namespace
+
+void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
+int64_t qsa_kv_resident() { return g_kv_resident; }
+int64_t qsa_kv_resident_min() { return 20480; }
+uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+    const QsaShapes s = qsa_shapes(g);
+    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    uint64_t n = 0;
+    n += kv_pool_bytes(s, p.slots) + 4 * 16;                                   // K/V pools (the VRAM slots)
+    n += (uint64_t) p.pages * 4;                                               // page_table
+    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
+    n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
+    n += (uint64_t) s.idx_dim * 4;                                             // dead
+    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    n += 16;                                                                   // block_pos
+    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
+    n += (uint64_t) s.n_head * 4;                                              // pos_dev
+    return align_up16(n) + 256;
+}
+
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells) {
+    const QsaShapes s = qsa_shapes(g);
+    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const int64_t pages = p.pages;
+    Cursor c{(uint8_t*) base};
+    st.kv_int8 = g_kv_int8;
+    st.kv_mode = p.mode;
+    st.n_slots = p.slots;
+    const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
+    if (g_kv_int8) {
+        st.k_q = c.take<int8_t>(rows * s.head_dim);
+        st.v_q = c.take<int8_t>(rows * s.head_dim);
+        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        st.v_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+    } else {
+        st.k_pool = c.take<uint16_t>(rows * s.head_dim);
+        st.v_pool = c.take<uint16_t>(rows * s.head_dim);
+    }
+    st.page_table = c.take<int32_t>((uint64_t) pages);
+    st.n_pages = pages;
+    st.max_cells = max_cells;
+    st.map = strata::kernels::KvStreamMap{};
+    st.map.page_table = st.page_table;
+    st.map.n_blocks = pages;
+    st.map.n_slots = p.slots;
+    if (p.mode == 1) {
+        st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
+        st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
+        st.map.slot_ref = c.take<int32_t>((uint64_t) p.slots);
+        st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
+        st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
+        st.map.ctl = c.take<int32_t>((uint64_t) strata::kernels::kKvCtlInts);
+    }
+    st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
+    st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
+    st.idx_pooled_rows = p.pooled_rows;
+    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    st.idx_block_pos = c.take<int32_t>(1);
+    if (share_rope != nullptr) {
+        st.cos_tab = share_rope->cos_tab;
+        st.sin_tab = share_rope->sin_tab;
+    } else {
+        st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
+        st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
+    }
+    st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
+    st.attention_status = c.take<int32_t>(1);
+    st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
+    // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
+    if (cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
+            cudaSuccess) {
+        return 0;   // the caller sees a zero byte count; a half-built state is worse than none
+    }
+    st.host_step[strata::kernels::kStepCount] = 0;
+    // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
+    st.host = strata::kernels::KvHostPools{};
+    if (p.mode != 0) {
+        const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
+        const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, g_kv_int8) + 4 * 256;
+        uint8_t* h = nullptr;
+        uint8_t* d = nullptr;
+        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess)
+            return 0;
+        g_kv_host_bytes += bytes;
+        Cursor hc{d};
+        if (g_kv_int8) {
+            st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
+            st.host.v_q = hc.take<int8_t>(hrows * s.head_dim);
+            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.host.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        } else {
+            st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
+            st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
+        }
+    }
+    // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
+    // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
+    // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
+    if (share_rope == nullptr) {
+        std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
+        strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::qsa_freq_base(), (int) max_cells,
+                                          hc.data(), hs.data());
+        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+    }
+    // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
+    // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.
+    if (p.mode == 0) {
+        std::vector<int32_t> tab((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
+        cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+    } else if (p.mode == 1) {
+        strata::kernels::kv_stream_reset(st.map, nullptr);
+    } else {
+        strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
+    }
+    cudaDeviceSynchronize();
+    return c.used;
+}
+
+void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
+    const QsaShapes s = qsa_shapes(g);
+    cudaStream_t cs = (cudaStream_t) stream;
+    const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
+    if (st.kv_int8) {
+        cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
+        cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
+        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+        cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+    } else {
+        cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
+        cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
+    }
+    // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
+    // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
+    // carries the unwritten cells past the end, which nothing reads.
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+}
+
+strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
+    strata::kernels::QsaAttnPools pools;
+    pools.page_table = st.page_table;
+    if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
+    else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
+    return pools;
+}
+
+void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
+                    int64_t cap, void* stream) {
+    if (st.kv_mode != 1) return;
+    strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, st.kv_int8, ids, steps, n_q, cap,
+                                       qsa_shapes(g), stream);
+}
+
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
 n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;
@@ -676,7 +843,7 @@ if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
 // launch is sized from a capacity in `st`/`b`, so this sequence can be captured and replayed.  The
 // host-scalar wrappers would be correct here today and silently wrong in a graph.
-if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream);    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
+if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
     try {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
             (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, (float) qsa_freq_base(), stream);
@@ -708,6 +875,8 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     } else {
     qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
     }
+    // KV streaming: every block the selection names is made resident before anything reads it
+    qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
         strata::kernels::QsaAttnPools pools;
         pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; pools.k_q = st.k_q; pools.v_q = st.v_q;

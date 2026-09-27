@@ -31,7 +31,7 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
                                     uint16_t* __restrict__ k_scale, uint16_t* __restrict__ v_scale,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
-                                    int head_dim, int page_size) {
+                                    int head_dim, int page_size, KvHostPools host) {
     const long long pos = (long long) __ldg(step + kStepPos);
     const int h = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
     const bool is_v = blockIdx.z == 1;
@@ -51,10 +51,18 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
         q = __float2int_rn(x / sf);
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
     }
+    // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident
     const long long page = (long long) table[pos / page_size];
-    const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-    (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
-    if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
+    if (page >= 0) {
+        const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+        (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+        if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
+    }
+    if (host.k_q != nullptr) {
+        const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+        (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+        if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
+    }
 }
 
 // One thread = 4 consecutive values of one cell and head (as the FP16 gather does with uint2).
@@ -93,12 +101,13 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
 }  // namespace
 
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
-                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream) {
+                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                       const KvHostPools* host) {
     validate(s, "kv_append_q8");
     const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), 2);
     kv_append_q8_kernel<<<grid, KV_Q8_GROUP, 0, (cudaStream_t) stream>>>(
         k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
-        (int) s.page_size);
+        (int) s.page_size, host ? *host : KvHostPools{});
     check("kv_append_q8 launch");
 }
 
