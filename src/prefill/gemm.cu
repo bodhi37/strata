@@ -5,16 +5,33 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
-namespace strata::prefill {
+namespace strata {
+namespace prefill {
 namespace {
 
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
         std::exit(1);
+    }
+}
+
+// R21: cublasCreate can fail transiently when the context is under VRAM pressure (long sessions with
+// per-request prefill allocs) or right after a driver hiccup.  A failure here used to take the whole
+// engine down; reclaim, wait, and retry before giving up.
+bool create_handle(cublasHandle_t* h) {
+    for (int attempt = 0;; ++attempt) {
+        if (cublasCreate(h) == CUBLAS_STATUS_SUCCESS) return true;
+        (void) cudaGetLastError();
+        (void) cudaFree(0);
+        if (attempt >= 3) return false;
+        std::fprintf(stderr, "prefill gemm: cublasCreate failed; reclaiming and retrying (%d/3)\n", attempt + 1);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 }
 
@@ -31,7 +48,7 @@ Gemm::~Gemm() {
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                          std::string& err) {
     cublasHandle_t h = nullptr;
-    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { err = "prefill gemm: cublasCreate failed"; return false; }
+    if (!create_handle(&h)) { err = "prefill gemm: cublasCreate failed"; return false; }
     handle_ = h;
     stream_ = stream;
     external_ = true;
@@ -46,7 +63,7 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     cublasHandle_t h = nullptr;
-    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { err = "prefill gemm: cublasCreate failed"; return false; }
+    if (!create_handle(&h)) { err = "prefill gemm: cublasCreate failed"; return false; }
     handle_ = h;
     stream_ = stream;
     cublasSetStream(h, (cudaStream_t) stream);
@@ -104,4 +121,5 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 
-}  // namespace strata::prefill
+}  // namespace prefill
+}  // namespace strata

@@ -322,9 +322,17 @@ class Vision:
 
 
 def child_env(cfg: dict) -> dict:
-    """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    """The engine's environment: the config's own `env` dict (the STRATA_* A/B knobs) applied on top of the
+    server's, then the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
+    compiled it) first on the library search path.
+
+    Without the `env` merge every knob a config carries (STRATA_STATIC_TIER, STRATA_PREFILL_ADMIT,
+    STRATA_NO_ODIRECT, STRATA_PREFILL_TILE, STRATA_RSPLIT, STRATA_PARK_SPIN_US ...) was silently dropped -
+    the engine saw only whatever the tmux server happened to be launched with, so two configs that
+    differ in that block ran identically and the A/B was never actually performed."""
     env = dict(os.environ)
+    for k, v in (cfg.get("env") or {}).items():
+        env[str(k)] = str(v)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -562,6 +570,8 @@ class Service:
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                        "drafts_accepted": last.get("drafts_accepted"),
+                        "drafts_offered": last.get("drafts_offered"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None})
                     now = time.time()

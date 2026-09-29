@@ -4,6 +4,9 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+#include <chrono>
+#include <cstdio>
+#include <thread>
 #include <climits>
 #include <cstring>
 #include <exception>
@@ -118,12 +121,22 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
-        if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        // R21: the pin can fail with cudaErrorDevicesUnavailable right after a hard engine kill - the
+        // driver needs seconds to release the previous context.  Retry with backoff before giving up
+        // (a failed start costs the whole ~90 s load, and the guard script's 10 s wait is not always
+        // enough after an OOM-killed or crashed run).
+        for (int attempt = 0;; ++attempt) {
+            if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) break;
             const cudaError_t herr = cudaGetLastError();
             host_ = nullptr;
-            err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB (cuda: " +
-                  cudaGetErrorString(herr) + ")";
-            return false;
+            if (attempt >= 5) {
+                err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB (cuda: " +
+                      cudaGetErrorString(herr) + ")";
+                return false;
+            }
+            std::fprintf(stderr, "strata generate: embedding pin failed (%s); retrying in 5 s (%d/5)\n",
+                         cudaGetErrorString(herr), attempt + 1);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
         }
         std::memcpy(host_, gguf.tensor_data(*t), bytes_);
         void* d = nullptr;

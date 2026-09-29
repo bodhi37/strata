@@ -238,6 +238,149 @@ From the per-request telemetry (R7 lines) on a 200-token request:
 
 ---
 
+## 0.8 R16-R19 SESSION (2026-09-28) — the prefill fix (4-8x), the env bug that hid every A/B, and the real decode budget
+
+Session configs: `strata-r16-v1800-q4.json`, `strata-r17-tiers.json` (best), `strata-r18b-nodirect.json`,
+`strata-r19-best.json` = r17 with `env` re-derived after the server fix. All measured with one client,
+port 8123, `scratch/r15_probe.py`, `scratch/r11_decode_bench.py`, `scratch/prefillbench.py`, `/tmp/pf_disk2.py`
+(diskstats-wrapped prefill).
+
+### 0.8.1 THE BIG WIN: prefill was 4-5x under-performing because the chunk is auto-halved
+
+`generate.cpp:2114` halves `--prefill` until the prefill buffers fit in the **expert cache's lendable
+slots** (`k + 128 <= xcache.slots()`). With the 800-slot cache that shipped, **`--prefill 16384` was
+silently served as 2048-token chunks** — and every chunk re-reads the ~12.5k-blob non-resident set
+(the arena sweep), so a 6.4k prompt paid **4 chunks x 27 GB** instead of one.
+
+| prompt | chunk served | prefill tok/s | read bytes / prompt-token | config |
+| ---: | ---: | ---: | ---: | --- |
+| 6,420 | 2048 | **57** | 21.4 MB (9.8 blobs) | r13-base (chunk 8192 offered) |
+| 7,567 | 8192 | **255** | 5.8 MB (2.7 blobs) | r16 (cache 1200) |
+| 15,029 | 16384 | **450** | 1.53 MB (0.70 blobs) | r17 (cache 1500) |
+| 29,953 | 16384 | **419** | ~1.5 MB | r17 |
+| 77,513 | 16384 | **336-379** | 0.35 blobs → 27.4k blobs total | r17 |
+
+**Fix: the VRAM expert cache must have enough slots to lend the prompt path its buffers.** 1500 slots
+(3.04 GiB) + `--kv q4_0` (-750 MB) makes `chunk 16384` real. `--prefill 16384` + `--expert-cache 1500` is
+the new floor; a 2000-slot cache would let 32768 fit. **This is the single highest-value knob found in
+this session and it was invisible: the only sign is one stderr line ("prompt chunk 16384 -> 8192 tokens
+so its buffers fit in the expert cache").**
+
+End-to-end effect, same `scratch/r11_coherence.py` suite, same box, coherent output throughout:
+
+| case | r13-base (chunk 2048) | r19 (chunk 16384) | speedup |
+| --- | ---: | ---: | ---: |
+| LONG-PREFILL (6,425-token prompt) | 123.4 s | **56.9 s** | 2.2x |
+| LONG-TASK (6,419-token prompt + generation) | 188.2 s | **69.7 s** | 2.7x |
+| SHORT (64-token prompt) | 19.8 s | 43.3 s | (cold-start variance; the first request pays the tier's cold sweep) |
+
+### 0.8.2 THE ENV BUG — every `STRATA_*` knob in every config was silently dropped
+
+`serve/server.py:child_env()` built the engine environment from `os.environ` only; the config's `"env"`
+block was never merged. So `STRATA_STATIC_TIER`, `STRATA_PREFILL_ADMIT`, `STRATA_NO_ODIRECT`,
+`STRATA_PREFILL_TILE`, `STRATA_RSPLIT`, `STRATA_PARK_SPIN_US` … never reached the engine — r13-base read
+"static" only because the tmux server happened to carry it. **Fixed** (the merge is now in `child_env`).
+Two consequences: (a) every env-based A/B in §0.6/§0.7 is suspect, (b) `STRATA_STATIC_TIER=0` means
+STATIC (the code tests presence, not value) — to get the dynamic LRU tier, **omit** the variable.
+
+### 0.8.3 The drive ground truth (measured with `scratch/qdbench` on the real arena)
+
+| read | QD1 | QD2 | QD8 | QD16 | QD32 | seq |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2.18 MB O_DIRECT, iconq3xxs/experts-native.bin | 816 | 969 | 969 | 968 | 963 | 1289 (4 threads, 8 MB) |
+| raw block device /dev/nvme0n1 | 886 | — | 722-1063 | — | 935 | — |
+| 128 KB | — | — | 586 (QD8) | — | 356 (QD32) | — |
+| 4 KB | — | — | — | — | **74 (18.5k IOPS)** | — |
+
+**The drive is a flat ~1.0-1.3 GB/s device at every queue depth** (Kingston SNV2S1000G, DRAM-less
+4-channel TC2200). PCIe link is Gen4 x4 (16 GT/s) — verified, ASPM off. `max_sectors_kb` 128→2048: +10%.
+Scheduler kyber vs none: no difference (422 vs 420 MB/s on a prefill). dmesg clean, 36.9 °C. The mission's
+"4+ GB/s" premise does not hold on this SSD; **~1.0 GB/s is the ceiling for the 2.18 MB random reads the
+engine issues**, and it is reached (prefill rd-wait runs at 1.12-1.35 GB/s effective).
+
+### 0.8.4 The decode budget, measured per window (`r15_probe` + `phases/win`)
+
+r17, 200-token agentic generation, 120.2 ms/window, **1.52-1.57 tokens/window** (spec 4):
+
+```
+ver[wait 15.5  pool 91.3  host 9.8  commit 0.7]  dispatch[plan 2.3 actq 0.2 run 13.5 ringwait ~74]  mtp 1.2
+pool/win: drain 19.2 (gu 11.7 + down 7.4)   <- the CPU pool's real kernel time, NOT the bottleneck
+```
+
+| per token | ms | what it is |
+| --- | ---: | --- |
+| ringwait | **47** | the missed-blob reads: ~20 blobs x 2.18 MB at ~0.93 GB/s |
+| ver wait | 9.9 | GPU (attention/dense graphs) |
+| ver host | 6.2 | per-layer host staging in the verify loop |
+| pool pass-0 | 8.6 | resident experts on the CPU, overlapped with the reads |
+| other | 2.8 | mtp, commit, plan, actq |
+| **total** | **74.5** | = 13.4 tok/s (measured 12.0-13.4) |
+
+So: **decode is miss-BYTE-bound, not latency-bound and not compute-bound.** `ringwait = miss_bytes /
+~0.93 GB/s`, and the drive is already at its ceiling while it waits. The pool kernels are 19 ms/window of
+a 120 ms window; the GPU is idle most of the window.
+
+**The ceiling when the working set IS resident: 28.36 tok/s** (cooking topic, run immediately after a probe
+on the same topic — 200 tokens in 7.1 s). That is the pipeline's non-drive floor: ~35 ms/token.
+
+### 0.8.5 The coverage curve, re-measured, and what a bigger tier would buy
+
+From the full 6.03M-entry routing dump (and confirmed on the R7-era dump): **12k blobs (24.3 GiB) →
+95.56%, 14k (28.4 GiB) → 97.81%, 16k (32.4 GiB) → 99.12%, 18k (36.5 GiB) → 99.75%.**
+
+* Per-window misses at 95.3% RAM coverage: ~20 blobs/token = 43 MB/token. At 98%: ~8 = 17 MB. At 99.1%:
+  ~4 = 8.7 MB. **Every +2,000 resident blobs ≈ halves the miss bytes.**
+* **Side-buffer "miss cache" (top-K non-resident experts per layer, prefetched): only 6-27% of misses are
+  captured by 0.4-1.6 GiB** — strictly worse than spending the same bytes on the main tier. Rejected.
+* The resident ceiling on this box is **~13,000 blobs** = 11,826 host (24 GiB) + 1,500 VRAM. Reachable
+  growth found: +0 (see below).
+
+### 0.8.6 Why the tier cannot grow (measured, not assumed)
+
+* **Host RAM is at the wall.** Engine anon = 25.17 GB (24.00 GiB tier, mlocked) + zram 1.98 GB physical
+  (6.8 GB of process pages, 3.4x compressed) + ~1 GB apps + 1.4 GB cache = 30.9 of 31.1 GB. `used 30,
+  available 0.28`. A 26 GiB tier would OOM (the previous session's incident). The mission's "reclaim the
+  dense pool (1416 MiB) and the token embedding (644 MiB)" does not apply to this build: both are
+  **cudaMalloc'd VRAM** (the weight arena + the native dense set), and the token embedding failed to pin
+  and lives in a file mapping, not anonymous RAM.
+* **VRAM is at the wall.** 12,282 MiB total: native projections 2975 + weight arena 1416 + MTP draft 891 +
+  draft head 105 + native head 675 + q4_0 KV @131k 906 + verify 67 + expert cache 1500 slots 3040 +
+  graphs/workspaces ≈ 11.5 GiB used, **413 MiB free**. `--expert-cache 1800` fails (the head upload OOMs);
+  1500 is the largest that boots with q4_0 KV at 131k context.
+* **Smaller blobs are the only remaining byte lever, and they cost model quality** (see 0.8.7).
+
+### 0.8.7 Tried and rejected in this session (each with its measurement)
+
+| lever | result |
+| --- | --- |
+| `--kv q4_0` + `--expert-cache 1200 -> 1500` | **kept**: frees 750 MB and +300 blobs (~+1% coverage) |
+| `--spec 8` (vs 4) | 1.85 vs 1.52 tokens/window but a worse floor (min 3.97 vs 6.03); **spec 4 kept** |
+| `--prefill 16384` + cache 1500 | **kept** (the 0.8.1 fix) |
+| buffered reads (`STRATA_NO_ODIRECT=1`) | prefill 232-385 tok/s vs 277-284 O_DIRECT — **no win**; r19 keeps O_DIRECT |
+| `STRATA_PREFILL_ADMIT=1` | **hurts**: 1.82-2.09 MB/prompt-token vs 1.53 without (the admits evict each other, R10's finding stands) |
+| I/O scheduler kyber vs none | 422 vs 420 MB/s — no difference |
+| `max_sectors_kb` 128 -> 2048 | +10% on the drive micro-bench (816 -> 886 MB/s QD1); kept |
+| bigger prefill chunk without lending (2000+ slots) | needs >1800 slots, which OOMs at 131k context |
+| VRAM `--expert-cache-per-layer` | R7 measured per-layer allocation *worse* than the global ranking at every budget (8k-16k) |
+| requant to shrink the arena | **blocked**: the down projection's row width is 640, so only 32/64-block types fit (Q4_0/IQ4_NL/Q2_0) — Q2_0 is a 2-bit down (large quality cost, against the mission's ladder), and btrfs CoW needs ~46 GB of free space for in-place compaction, of which there is 31 GB |
+
+### 0.8.8 Where the remaining 2x is
+
+1. **The prefill staging pipeline reads at ~350-680 MB/s while the drive does 969.** `rd-wait` dominates
+   (`moe 174 s: rd-wait 131.6 s` on the 77.5k prompt). The reader pool is 16 threads with a 48-slot
+   staging ring and `rd_q_.pop_back()` (LIFO — the consumer's next blob is served last); the dequant ring
+   is DQ=2. Candidates: FIFO the reader queue, raise DQ/readers, or `io_uring`. **A 2x prefill (419 ->
+   850) is sitting here**, and it is the mission's weakest gate.
+2. **Decode's non-drive 28 ms/token** (ver wait 9.9 + ver host 6.2 + pool 8.6 + 2.8): overlap the verify
+   staging and/or move resident-expert compute to the idle GPU (`--pcie-frac` applies the staging path to
+   misses today, not to residents). At 28.36 tok/s the pipeline is *proven* to run at 35 ms/token.
+3. Anything that adds resident blobs.
+
+**Correctness gate:** every config above ran `r11_decode_bench.py` (6 topics) with all outputs OK/coherent;
+no truncation or garbage was observed in any run.
+
+---
+
 ### 0.6.1 Environment bugs found and fixed (each one blocked real work)
 
 | bug | symptom | fix |
@@ -573,3 +716,88 @@ python3 ~/models/strata/bench_endpoint.py --port 8101 --contexts 1024,4096,32768
 # expert-format parity for the patched kernels (Q5_0 down, IQ4_XS gate/up)
 LD_LIBRARY_PATH=$HOME/deps/cuda-13.3/opt/cuda/lib64 ~/models/strata/build/native_expert_parity <shard4.gguf> 0 5
 ```
+
+---
+
+## 0.9 R22 SESSION (2026-09-29) — prefill is stall-bound; the tier mutex is NOT the lever; and the measurement method was the real bug
+
+Takeover state: branch `r14-upstream` with the R20/R21 work **uncommitted in the working tree** (FIFO
+prefill reader queue, O_DIRECT 512-byte alignment probe + no-copy read, tunable
+`STRATA_PREFILL_READERS`, `--gpu-share`, cublas/embed retry loops), and a live `strata-r21b.json` run.
+Everything below is on that tree; the code is left in the committed-behaviour state (see 0.9.3).
+
+### 0.9.1 The live run was a regression — `--gpu-share` moves RESIDENT experts over PCIe
+
+`strata-r21b.json` = r19 + `--gpu-share 0.5` + `STRATA_RSPLIT=2` + `--pool-workers 12`. Its decode was
+**5.3-9.4 tok/s** against r19's measured median 7.75, with `ringwait` exploding to **1074-8001 ms/window**
+(vs ~74 ms in r17's breakdown). The mechanism: `--gpu-share` routes a fraction of *all* distinct experts -
+RAM-tier hits included, not just VRAM-cache misses - to the GPU over PCIe. A resident expert costs nothing
+to read from DRAM, but sending it to the GPU means a 2.18 MB DMA per blob; at ~20 experts/layer x 48 layers
+that is ~2 GB/token across PCIe, which cannot beat the CPU pool reading the same bytes from RAM. **Moving
+resident-expert compute to the idle GPU is the wrong trade on this box: the data movement dominates.**
+(The separate `--pcie-frac` path - misses only - is unaffected and was already measured neutral in R7.)
+
+### 0.9.2 Single-sample A/B is invalid on this box — the run-to-run variance is 3x
+
+Every prefill number in this project (including R7's and R19's tables) was a single sample. Measured with
+`scratch/pf_multi.py` (new: K UNIQUE prompts, since the conversation cache makes repeats meaningless), same
+binary, same config, one engine, n=6 on a ~10.8k-token prompt:
+
+| run | min | median | max |
+| --- | ---: | ---: | ---: |
+| baseline (r19-best), n=6 | 104 | **176** | 264 |
+| `STRATA_PREFILL_READERS=48`, n=6 | 87 | **181** | 264 |
+
+The spread within ONE config is larger than any difference between configs. **Any prefill A/B in this repo
+has to be n>=5 samples; a single 385 tok/s sample and a single 173 tok/s sample mean nothing.** (For
+calibration, the same 13,758-token prompt measured 385, 312 and 173 tok/s across three launches of
+identical-or-near-identical configs.) The variance tracks `kswapd0` reclaim and co-tenant disk I/O
+(`slskd`, the desktop) rather than anything the engine does.
+
+### 0.9.3 The tier mutex is NOT the prefill bottleneck (two attempts, both rejected)
+
+The engine's own telemetry says prefill is read-bound: on a 15.7k-token prefill `rd-wait` was **90.2 s of
+109.2 s** of MoE time, and the request pulled **18.52 GB at 0.52 GB/s**. The obvious suspect was
+`ArenaExpertSource::dc_mu_`: *every* staging read holds it across a whole-blob (2.18 MB) `memcpy` - out of
+the tier on a hit, into it on an admission - so 16 reader threads queue on one lock and the disk reads
+behind them are not issued. Two shapes were built and measured:
+
+* **`shared_mutex`** (`read_blob_raw` shared, `dc_stage_admit` unique): **2.2x WORSE**, 173 vs 385 tok/s on
+  the same prompt. The reader publishes its slot's `done` flag only *after* `stage_admit`, which then needs
+  the exclusive side while 16 readers hold shared across their copies - writer starvation on the exact flag
+  the consumer waits on. Rejected.
+* **Plain mutex, memcpy moved outside the critical section** (touch kept under the lock, because the
+  `window_epoch_` stamp it sets is what stops `dc_alloc_locked` evicting the slot mid-copy): n=6 median
+  **192 vs 176** baseline - indistinguishable. Rejected.
+
+Conclusion: the lock is real but not load-bearing here. The code is left as the R20/R21 tree (memcpy under
+the lock), with the measurements recorded on `dc_mu_` so the next agent does not re-derive this.
+
+### 0.9.4 What prefill actually is: stall/depth-bound, and not by reader count either
+
+`scratch/r16_bottleneck.py` during a prefill:
+
+```
+NVMe read rate during run : 376 MB/s   (525 MB/s with 48 readers)
+GPU util  min/med/p90/max : 0 / 8 / 79 / 100 %
+VERDICT: GPU idle AND drive idle -> prefill is STALL/DEPTH-bound
+```
+
+The drive is NOT the wall: `dd iflag=direct` moves **985 MB/s sustained over 20 GB** (twice, stable), and
+4 KiB random does 272 MB/s. So the engine leaves ~2x of drive rate unused during prefill, yet raising the
+reader count 3x changed nothing - the stall is upstream of the readers. Prefill's consume loop is
+single-threaded and interleaves, per expert, `cudaStreamWaitEvent` -> H2D -> `cudaEventRecord` -> dequant ->
+2 cuBLAS GEMMs, with a full `cudaStreamSynchronize` per tile in the router pass; with only `STAGE=48`
+staging slots the read queue drains whenever that thread stalls on a slot (`used-wait` 8.5 s) or on compute.
+Raising `STAGE` is the untested lever but it is coupled to the prefill borrow region (a bigger buffer set
+makes the driver halve `--prefill`), so it was not attempted blind.
+
+### 0.9.5 Where that leaves the levers (honest)
+
+* **Decode is at its structural wall.** ~0.4 misses/layer over 48 strictly serial layers = QD1 per layer at
+  ~2.8 ms, ~20 blobs/token = 43 MB/token; the drive delivers ~0.93 GB/s for that shape, so ~46 ms/token is
+  the floor (~21 tok/s) and r19 measures 7.75 median / 9.62 max. It improves only with more resident bytes.
+* **Prefill's 2x is in the host consume loop / pipeline depth**, not the drive, not the lock, not the
+  reader count. The next concrete experiment is a deeper staging ring decoupled from the borrow region (a
+  separate read-buffer pool), or removing the per-tile `cudaStreamSynchronize` in the router pass.
+* Do not trust a single prefill number from any earlier section: use `scratch/pf_multi.py`, n>=5.

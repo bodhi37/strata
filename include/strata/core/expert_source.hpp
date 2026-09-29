@@ -27,14 +27,48 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace strata::core {
+
+/// R20: a stateless allocator that hands out storage aligned to `kAlign` bytes.  O_DIRECT requires the BUFFER
+/// address to be aligned too, not just the file offset and length, so the read-ring slots have to come from
+/// somewhere that guarantees it - `std::vector<uint8_t>`'s allocator does not, which is why every decode miss
+/// used to be read into a bounce buffer and memcpy'd into place.  512 is the strictest alignment this needs to
+/// satisfy (the device's logical block size); the probe in `expert_source.cpp` only relaxes the offset/length
+/// test to it once a real direct read has succeeded, and a destination this aligned qualifies either way.
+template <class T>
+struct AlignedBuf {
+    static constexpr std::size_t kAlign = 512;
+    using value_type = T;
+
+    AlignedBuf() = default;
+    template <class U> AlignedBuf(const AlignedBuf<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        void* p = nullptr;
+        const std::size_t bytes = n * sizeof(T);
+        // posix_memalign wants the alignment to be a power-of-two multiple of sizeof(void*): 512 is.
+        if (bytes == 0) return nullptr;
+        if (posix_memalign(&p, kAlign, bytes) != 0) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept { std::free(p); }
+
+    template <class U> struct rebind { using other = AlignedBuf<U>; };
+};
+
+template <class A, class B>
+bool operator==(const AlignedBuf<A>&, const AlignedBuf<B>&) noexcept { return true; }
+template <class A, class B>
+bool operator!=(const AlignedBuf<A>&, const AlignedBuf<B>&) noexcept { return false; }
 
 /// Where one routed expert's bytes come from.
 ///
@@ -140,6 +174,13 @@ struct ExpertDispatch {
     int64_t layers = 0;
     int64_t experts = 0;
     int64_t missing = 0;
+
+    /// R21: --gpu-share.  0..256: the fraction (in 256ths) of a layer's DISTINCT experts - RAM-tier
+    /// hits included, not just the VRAM-cache misses - routed to the GPU through the pinned arena's
+    /// device alias, so the window's expert reads split across the CPU pool's cores and the PCIe path
+    /// at the same time.  0 = the legacy policy (misses only, the last pcie_num/256 of them).
+    int gpu_share = 0;
+    int64_t pcie_residents = 0;   ///< R21: RAM-tier blobs this run sent over PCIe (vs the miss ones).
 
     // ================================ R4: THE VRAM TIER, MEASURED BEFORE IT IS USED ================================
     //
@@ -486,6 +527,10 @@ private:
     // mmap fallthrough and the (page-cache) WILLNEED prefetchers.  STRATA_NO_ODIRECT=1 is the A/B arm.
     int direct_fd_ = -1;
     bool direct_ok_ = false;
+    // R20: the alignment O_DIRECT actually enforces on THIS file, probed at open (512 on this NVMe/btrfs
+    // pair, not the 4096 the code used to assume).  Blob offsets are 1024-aligned, so with a 512 requirement
+    // every read lands directly in its destination and the 2.18 MB bounce memcpy disappears.
+    uint64_t direct_align_ = 4096;
     uint8_t* hot_arena_ = nullptr;   ///< the anonymous pinned arena for the profile's hottest blobs
     uint64_t hot_cap_ = 0, hot_used_ = 0;
     int64_t hot_count_ = 0;
@@ -509,6 +554,15 @@ private:
     int64_t dc_stage_admits_ = 0;              ///< R8b: prefill admissions
     /// R8b: guards the LRU structures when prefill's READER threads touch them (decode's mutators are all
     /// host-thread and never overlap prefill, but prefill touches run concurrently on the reader pool).
+    ///
+    /// R22 measured this lock as a possible prefill bottleneck and found it is NOT one - leave it alone.
+    /// Every staging read does hold the mutex across a whole-blob (2.18 MB) memcpy, and `rd-wait` is 83% of
+    /// MoE time, so narrowing the critical section looked like the obvious 2x.  It is not: a `shared_mutex`
+    /// (`read_blob_raw` shared, `dc_stage_admit` unique) measured 2.2x WORSE, because the reader publishes its
+    /// slot's `done` flag only AFTER `stage_admit`, which then waits for the exclusive side behind 16 readers
+    /// holding shared across their copies - writer starvation on the very flag the consumer blocks on.  And
+    /// moving just the memcpy out (touch kept under the lock, for the epoch stamp that prevents eviction) was
+    /// indistinguishable from baseline at n=6 (median 192 vs 197 tok/s, both min~110/max~300 - see REPORT).
     std::mutex dc_mu_;
     void dc_init(int64_t slot_bytes);
     int32_t dc_alloc(int64_t idx);             ///< a free or evicted slot for blob `idx`, or -1
@@ -553,8 +607,12 @@ private:
     static constexpr uint64_t kChunk = 512 * 1024;
     static constexpr int kMaxChunks = 16;                  // (max_blob + kChunk - 1) / kChunk, bounded
     struct PfJob { uint8_t* dst; uint64_t off, len; };     ///< one sub-read of one blob
-    std::vector<std::vector<uint8_t>> ring_;   ///< per slot: one whole blob (largest layer's bytes)
-    std::vector<int64_t> ring_of_;             ///< blob index -> ring slot for the CURRENT layer, else -1
+    /// R20: the decode read ring.  Slot buffers are allocated on the O_DIRECT alignment so `direct_read_span`
+    /// can pread a missed blob STRAIGHT into its final home; with plain heap vectors every one of these reads
+    /// took the bounce buffer plus a whole-blob memcpy.
+    using RingBytes = std::vector<uint8_t, AlignedBuf<uint8_t>>;
+    std::vector<RingBytes> ring_;            ///< per slot: one whole blob (largest layer's bytes)
+    std::vector<int64_t> ring_of_;           ///< blob index -> ring slot for the CURRENT layer, else -1
     std::vector<PfJob> pf_jobs_;
     std::vector<std::thread> pf_workers_;
     std::atomic<uint32_t> pf_epoch_{0}, pf_done_{0}, pf_head_{0}, pf_njobs_{0}, pf_parked_{0};
