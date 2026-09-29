@@ -922,3 +922,55 @@ F/BW/VL/VNNI/VBMI all present"* while failing on missing data, and `cuda_device_
 cannot run at all here. The live endpoint is entirely AVX-512 CPU + pinned-RAM, which is exactly why 51.8 GB/s of
 DRAM is the wall and why no quant rename moves decode.
 
+### 0.10.5 Decode is fine — the 5 tok/s reading was a units error, not a regression
+
+A fresh benchmark read 5.3 / 5.6 / 6.6 tok/s against the documented 9.4-9.7, so `--hot-ram-gib` was dropped
+24.0 -> 21.0 to buy RAM headroom (the engine had `VmSwap` 916 MiB, 1.1 GiB available). **That made it worse**, and
+the reason turned out to be that the comparison itself was invalid:
+
+| config | decode (6 x 200, client wall) | VmLck | VmSwap |
+| --- | --- | ---: | ---: |
+| `strata-r23-wrapup` (24.0) | 5.28 / **5.57** / 6.56 | 24.0 GiB | 916 MiB |
+| r24 experiment (21.0) | 4.78 / **4.96** / 6.45 | 21.0 GiB | 131 MiB |
+
+Two things were wrong. First, shrinking the tier costs more than the headroom buys - the pinned tier is
+load-bearing, and 100% hot-tier lookup coverage does not mean a *cold* tier is as good as a warm one. Second, and
+this is the actual answer: **the client wall-clock includes the prefill of the prompt.** These bench prompts are
+59-74 tokens and cold short-prompt prefill costs 5.5-11.5 s each at 6-13 tok/s, so a request the engine spends
+21.7 s decoding gets a client wall of 30 s. Comparing that 6.7 to a 9.4 figure taken from the engine's own log line
+is comparing two different quantities.
+
+Engine-side, from the same bench run: **10.0 / 9.7 / 9.4 / 9.2 / 9.2 / 9.1 / 8.7 / 8.4 / 7.7 / 7.7 / 7.7**, median
+**8.9**, max **10.0** - against r19's documented median 9.7 / max 17.1 (n=46). That is within normal run-to-run
+spread: the endpoint was never broken. `strata-r23-wrapup.json` (24.0) is the live config again, `VmLck` back to
+25165728 kB, and the r24 experiment config is deleted.
+
+**Benchmarking rule for the next person:** engine-reported `generated in N ms (X tok/s)` and client-side
+`completion_tokens / wall` are *not* the same number on this box, and the gap is largest exactly where benchmarks
+are shortest. Compare log-to-log, and note that per-request warm-up/checkpoint makes a 70-token prompt cost ~6-11 s
+of prefill regardless of its length.
+
+### 0.10.6 Reproduction, closed: `scratch/r14_multiturn_bench.py` is the 10+ harness
+
+Re-ran the script that produced §0.7.3's "9.3-17.1 tok/s" claim (3 topics x 3 turns, full history resent, 200 tok,
+greedy) against the live endpoint on `strata-r23-wrapup.json`. Engine-side decode for the 9 generations:
+
+| req | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tok/s | **17.9** | 12.1 | 9.9 | 7.5 | 9.0 | 10.5 | 7.3 | 8.5 | 8.9 |
+
+min 7.30 / **median 9.00** / max **17.90**, draft acceptance 0.874 - against r19's documented median 9.70 / max
+17.10 (n=46). Whole r23 session n=34: median 8.80, max 17.90. The documented range reproduces, and 17.9 slightly
+exceeds r19's observed max. The endpoint is back where it was; nothing needed fixing beyond the revert of the r24
+`--hot-ram-gib` experiment and using the right harness. The tier must be *warmed* (many requests) before a median
+means anything: the first sweep after a cold start sits ~1 tok/s below the steady-state one.
+
+Final state: branch `r14-upstream` @ `dd609f9` (tag `fork-r19-snapshot`), `engine/strata` == `build/strata` modulo
+nvcc's PID-dependent fatbin temp filename, config `strata-r23-wrapup.json` = `strata-r19-best.json` except the
+`log`/`--dump-counts` paths, `VmLck` 25165728 kB = the configured 24.0 GiB, VRAM 11.1/12.3 GiB, `max_context` 131072,
+`/v1/models` = `qwen3.8-flash-next-heretic-2-iq3_xxs`, Pi provider baseUrl `http://127.0.0.1:8123/v1`. The Coder
+"IQ1_M" port lives on `r20-coder` (tag `fork-r20-coder-port`) and its 28 GB of shards are parked under `~/models/`
+unreferenced; declined for the reasons in §0.10.1.
+
+
+
