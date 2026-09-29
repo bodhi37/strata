@@ -240,6 +240,9 @@ struct Options {
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
+    /// R21: the share (0..1) of each layer's DISTINCT experts - RAM-tier hits included - routed to the
+    /// GPU over PCIe.  Overrides the misses-only policy above; > 0 turns it on.
+    double gpu_share = 0.0;
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
@@ -738,6 +741,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
+        else if (a == "--gpu-share") o.gpu_share = std::atof(next("--gpu-share"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
@@ -2211,6 +2215,7 @@ int main(int argc, char** argv) {
         };
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.gpu_share = std::max(0, std::min(256, (int) (o.gpu_share * 256.0 + 0.5)));
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         if (!o.dump_profile.empty() || !o.dump_counts.empty())
             drive.d.usage_total.assign((size_t) (g.n_layers * g.n_expert), 0ull);
@@ -3466,6 +3471,7 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        drive.d.gpu_share = std::max(0, std::min(256, (int) (o.gpu_share * 256.0 + 0.5)));
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         if (!o.dump_profile.empty() || !o.dump_counts.empty())

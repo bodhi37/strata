@@ -297,32 +297,53 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_ready();
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
-        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
+        // R21: --gpu-share.  A deterministic fraction of ALL distinct experts - RAM-tier hits included,
+        // not just VRAM-cache misses - is computed on the GPU, so the window's expert bytes stream from
+        // DRAM through the pool's cores AND through the PCIe path at the same time instead of
+        // serializing behind the pool.  The split is per (layer, expert), so a blob lands on the same
+        // side every window; correctness is unaffected either way (the combine adds the shares, and the
+        // float-order difference is the same class the VRAM-hit path already carries).
+        const bool share_gpu = d.gpu_share > 0;
         GpuPlanSink& P = *d.plan;
+        const int64_t fcap = P.pcie_mode == 1 ? 64 : P.staging_cap;   // zero-copy needs no staging
+        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
-        for (int q = 0; q < nd; ++q) {
+        for (int64_t q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                if (slot >= 0) {
-                    kd = 0;
-                    ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                 : (size_t) slot * (size_t) d.cache_blob));
-                } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
-                        const uint8_t* src = d.src->blob(d.layers, e);
-                        if (src != nullptr && d.src->pinned(d.layers, e)) {
-                            kd = 1;
-                            dma_src[fetches] = src;
-                            pcie_i0[fetches] = i0;
-                            ++fetches;
-                        }
+                bool gpu = false;
+                if (share_gpu) {
+                    uint32_t h = (uint32_t) e * 0x9E3779B1u;
+                    h ^= (uint32_t) d.layers * 0x85EBCA6Bu;
+                    h *= 0xC2B2AE35u;
+                    h ^= h >> 15;
+                    gpu = (h >> 24) < (uint32_t) d.gpu_share;
+                } else if (slot < 0) {
+                    gpu = miss_rank >= nmiss - m;
+                }
+                if (gpu && fetches < fcap && fetches < 64) {
+                    const uint8_t* src = d.src->blob(d.layers, e);
+                    if (src != nullptr && d.src->pinned(d.layers, e)) {
+                        kd = 1;
+                        dma_src[fetches] = src;
+                        pcie_i0[fetches] = i0;
+                        ++fetches;
+                        if (slot >= 0) ++d.pcie_residents;
                     }
-                    ++miss_rank;
+                }
+                if (kd != 1) {
+                    if (slot >= 0) {
+                        kd = 0;
+                        ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
+                                                                                     : (size_t) slot * (size_t) d.cache_blob));
+                    } else {
+                        ++miss_rank;
+                    }
                 }
             }
             for (int64_t i = i0; i < n; ++i)
@@ -609,6 +630,27 @@ uint8_t* tls_bounce(size_t bytes) {
     return (uint8_t*) buf.p;
 }
 
+/// R20: what alignment does O_DIRECT *actually* require for this file?  The code assumed 4096.  Here the NVMe
+/// reports logical_block_size 512 and btrfs accepts 512-aligned direct reads, so that assumption was 8x
+/// stricter than necessary - and because a blob's stride is 2,176,000 = 2^10 x 2125 bytes, only 1 blob in 4
+/// sits on a 4 KiB boundary.  The other 75% paid a full-size bounce + memcpy on EVERY miss.
+///
+/// Probed rather than taken from sysfs: a real O_DIRECT pread at an offset that is a multiple of 512 but NOT
+/// of 1024 succeeds only if the whole stack (fs + block layer + device) truly permits 512.  That tests the
+/// exact operation we are about to rely on, which a sysfs value or a statx claim does not.  Anything
+/// unexpected keeps the old, always-safe 4096 behaviour, so this cannot break another filesystem.
+uint64_t probe_direct_alignment(int fd, uint64_t file_bytes) {
+    constexpr uint64_t kProbeLen = 512;
+    uint64_t off = 512;                        // 512-aligned, deliberately NOT 1024-aligned
+    if (file_bytes < off + kProbeLen) return 4096;
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, kProbeLen) != 0) return 4096;  // a 4096-aligned buffer is never the limiter
+    const ssize_t r = ::pread(fd, buf, (size_t) kProbeLen, (off_t) off);
+    std::free(buf);
+    if (r != (ssize_t) kProbeLen) return 4096;  // EINVAL or anything else: stay on the strict, safe path
+    return 512;
+}
+
 }  // namespace
 
 // R13: read the blob's bytes through `direct_fd_` into `dst`.  Returns the blob length, or -1 on any
@@ -632,10 +674,23 @@ int64_t ArenaExpertSource::direct_read_blob(int64_t layer, int64_t expert, uint8
 }
 
 // R13: read `len` bytes at file offset `off` (arbitrary alignment) through `direct_fd_` into `dst`.
+//
+// R20: the alignment used to be hard-coded 4096, which forced EVERY miss through a full-size bounce buffer
+// plus a 2.18 MB memcpy: a blob's stride is 2,176,000 = 2^10 x 2125 bytes, so only 1 blob in 4 starts on a
+// 4 KiB boundary.  The device's real requirement is its 512-byte logical block size (probed at open into
+// `direct_align_`), which every blob offset (1024-aligned) and every blob length (512-aligned) already
+// satisfies - so the read now lands directly in its destination and the copy is gone.  At ~260 misses/token
+// that was ~1.1 GB/s of read+write DRAM traffic stolen from the CPU expert kernels, which are themselves
+// bandwidth-bound, plus the CPU on 10-16 reader threads.
 bool ArenaExpertSource::direct_read_span(uint64_t off, uint64_t len, uint8_t* dst) {
     if (!direct_ok_ || direct_fd_ < 0 || dst == nullptr || len == 0) return false;
     if (off + len > file_map_bytes_) return false;
-    constexpr uint64_t A = 4096;
+    const uint64_t A = direct_align_;
+    const bool dst_al = ((reinterpret_cast<uintptr_t>(dst) & (uintptr_t)(A - 1)) == 0);
+    if (((off | len) & (A - 1)) == 0 && dst_al)
+        return pread_full(direct_fd_, dst, (size_t) len, (off_t) off);   // the no-copy path
+    // Something is genuinely unaligned for this device: cover the blob with the enclosing aligned span in the
+    // bounce buffer, exactly as R13 did.  Correct on every filesystem, just slower.
     const uint64_t off_al = off & ~(A - 1);
     const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
     uint8_t* bounce = tls_bounce((size_t) span);
@@ -785,6 +840,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         if (direct_ok_) {
             direct_fd_ = ::open(fb.c_str(), O_RDONLY | O_DIRECT);
             if (direct_fd_ < 0) { direct_ok_ = false; }
+            else {
+                // R20: learn the alignment this file truly needs instead of assuming 4096.
+                struct stat sb;
+                const uint64_t fb_bytes = (::fstat(direct_fd_, &sb) == 0 && sb.st_size > 0)
+                                              ? (uint64_t) sb.st_size : file_map_bytes_;
+                direct_align_ = probe_direct_alignment(direct_fd_, fb_bytes);
+            }
         } else {
             direct_fd_ = -1;
         }

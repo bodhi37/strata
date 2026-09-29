@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <thread>
 #include <vector>
 
@@ -138,7 +139,9 @@ struct Prefill::Impl {
     std::vector<std::thread> rd_pool_;
     std::mutex rd_mu_;
     std::condition_variable rd_cv_, rd_done_cv_;
-    std::vector<RdJob> rd_q_;
+    std::deque<RdJob> rd_q_;   // R20: FIFO.  See init_readers - the consumer waits for staging slots in
+                               // issue order, so a LIFO queue makes the needed blob the last one served.
+    int readers_ = 16;         // R20: live reader count (STRATA_PREFILL_READERS)
     bool rd_stop_ = false;
     std::atomic<bool> rd_done_[STAGE] = {};     // per staging slot: its read has landed
     std::atomic<int> rd_status_[STAGE] = {};    // per staging slot: bytes read, or -1 (the pool cannot read it)
@@ -364,7 +367,17 @@ bool Prefill::init_readers() {
     Impl& m = *impl_;
     {
         Impl* mm = impl_.get();
-        for (int i = 0; i < 16; ++i)
+        // R20: the reader count is now tunable (STRATA_PREFILL_READERS, default 16 as shipped).  The drive
+        // measured flat ~0.90-0.97 GB/s from QD4 to QD32 on 2.18 MB O_DIRECT reads, so MORE readers cannot
+        // buy bandwidth - the point of the knob is to prove that on the real pipeline and to find the count
+        // that saturates the drive while leaving cores for the dequant ring.
+        int nrd = 16;
+        if (const char* e = std::getenv("STRATA_PREFILL_READERS")) {
+            const int v = std::atoi(e);
+            if (v >= 1 && v <= 64) nrd = v;
+        }
+        m.readers_ = nrd;
+        for (int i = 0; i < nrd; ++i)
             m.rd_pool_.emplace_back([mm]() {
                 for (;;) {
                     Impl::RdJob j;
@@ -372,8 +385,18 @@ bool Prefill::init_readers() {
                         std::unique_lock<std::mutex> lk(mm->rd_mu_);
                         mm->rd_cv_.wait(lk, [&] { return mm->rd_stop_ || !mm->rd_q_.empty(); });
                         if (mm->rd_stop_ && mm->rd_q_.empty()) return;
-                        j = mm->rd_q_.back();
-                        mm->rd_q_.pop_back();
+                        // R20: **FIFO, not LIFO.**  The blobs are issued in ascending file-offset order into
+                        // staging slots 0,1,2,... (stage_one), and the consumer blocks on those slots in that
+                        // same ascending order (stage_consume waits on stage_of[j]).  With pop_back() every
+                        // reader took the NEWEST job, so the job the consumer was actually waiting for was the
+                        // one left for last - a guaranteed head-of-line stall, and the drive's queue was filled
+                        // with blobs needed latest.  The prior note here claimed the pool kept the drive busy
+                        // "in file-offset order"; LIFO popping is exactly the opposite of that.  Serving the
+                        // oldest job first is what converts queue depth into the *useful* kind: the reads in
+                        // flight are the reads the consumer is about to need, still strictly ascending in
+                        // offset, so the drive streams forward through the arena instead of thrashing.
+                        j = mm->rd_q_.front();
+                        mm->rd_q_.pop_front();
                     }
                     const int64_t r = mm->src->read_blob_raw(j.layer, j.expert, j.dst);
                     // R10: admit the landed bytes to the LRU tier from THIS thread, before publishing the
