@@ -1,6 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -201,31 +202,32 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 }
 
 // ---------------------------------------------------------------- MoE
+template <int REG>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
     const int64_t t = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (t >= T) return;
     const int lane = threadIdx.x & 31;
-    const float* lg = logits + t * 512;
-    float v[16];
+    const float* lg = logits + t * (REG * 32);
+    float v[REG];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) v[i] = lg[lane + i * 32];
+    for (int i = 0; i < REG; ++i) v[i] = lg[lane + i * 32];
     float mx = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) mx = fmaxf(mx, v[i]);
+    for (int i = 0; i < REG; ++i) mx = fmaxf(mx, v[i]);
     mx = warp_max(mx);
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
+    for (int i = 0; i < REG; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
     const float rcp = 1.0f / warp_sum(sum);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
+    for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
     float selected = 0.0f, selected_sum = 0.0f;
     for (int rank = 0; rank < 10; ++rank) {
         float best = v[0];
         int ex = lane;
 #pragma unroll
-        for (int i = 1; i < 16; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+        for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
             const float ob = __shfl_xor_sync(0xffffffffu, best, m);
@@ -477,8 +479,13 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     check("gdn_recurrence");
 }
-void route(const float* logits, int32_t* ids, float* weights, int64_t T, void* stream) {
-    route_kernel<<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    if (n_expert == 512)
+        route_kernel<16><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else if (n_expert == 256)
+        route_kernel<8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else
+        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {

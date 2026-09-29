@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/artifact/gguf_reader.hpp"   // R20: read the model's own MoE shape (pruned variants ship <512 experts)
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
@@ -1025,8 +1026,21 @@ int main(int argc, char** argv) {
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
-    const strata::core::ModelGeometry g;
-    const int64_t K = 10;
+    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+    int64_t K = 10;
+    if (!o.native_preset.empty()) {
+        // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
+        // is the authority on its own MoE shape - everything else in the geometry is unchanged
+        try {
+            strata::GgufFile model_gguf(o.native_preset);
+            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
+            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
+                         o.native_preset.c_str(), e.what());
+            return 1;
+        }
+    }
     if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
         std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
                      (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
@@ -1234,7 +1248,10 @@ int main(int argc, char** argv) {
             o.mtp.clear();
         }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
+        // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
+        static const strata::core::ModelGeometry draft_geometry{};
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
@@ -2096,9 +2113,10 @@ int main(int argc, char** argv) {
     // otherwise from an empty sequence (`session_zero`); the rest of the prompt goes through the batched prompt path
     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 || thits.d_res == nullptr || host_res.empty()) {
-            std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR, --prefill CHUNK, --expert-profile P and "
-                                 "--expert-cache\n");
+        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+            (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
+            std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
+                                 "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
         // R10: one pinned max-blob buffer for the lent-slot refills (see the refill loops).

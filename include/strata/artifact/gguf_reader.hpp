@@ -454,8 +454,9 @@ private:
 // ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
 struct Qwen4ExpGuard {
-    uint32_t block_count = 48, hidden = 2560, experts = 512, experts_used = 10, head_count = 24,
-             head_count_kv = 2;
+    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,
+             head_count_kv = 2;   // 0 = presence-only: pruned variants (GSQ-RCO Coder) legitimately ship
+                                  // fewer experts than the canonical 512; the graph reads the true value
 };
 
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
@@ -477,7 +478,7 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
         if (!v) return std::string("missing ") + r.key;
-        if (v->u != r.want)
+        if (r.want && v->u != r.want)
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok

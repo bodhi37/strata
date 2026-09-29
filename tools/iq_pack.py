@@ -234,20 +234,24 @@ def main() -> int:
 
     # ---- the experts
     n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
+    n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
+    if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
+        print("the routers disagree on the expert count; a per-layer pruned model cannot be packed")
+        return 1
     layout, offset = [], 0
     for l in range(n_layers):
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
-        per = [t.expected_bytes() // N_EXPERT for t in ts]
+        per = [t.expected_bytes() // n_expert for t in ts]
         if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
             print("layer %d: gate and up differ in type" % l)
             return 1
         blob = per[0] + per[1] + per[2]
         layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
-        offset += blob * N_EXPERT
+        offset += blob * n_expert
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
         fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
                  "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
-                 % (N_EXPERT, offset, src.name))
+                 % (n_expert, offset, src.name))
         for l, gt, dt, off, blob, ts in layout:
             ws = [model.where[t.name] for t in ts]
             ov = override.get(str(l))
@@ -273,9 +277,9 @@ def main() -> int:
         return 0
     with open(path, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
-            parts = [model.bytes(t.name).reshape(N_EXPERT, -1) for t in ts]
-            chunk = np.concatenate(parts, axis=1)          # (512, blob): gate | up | down per expert
-            assert chunk.shape == (N_EXPERT, blob)
+            parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
+            chunk = np.concatenate(parts, axis=1)          # (n_expert, blob): gate | up | down per expert
+            assert chunk.shape == (n_expert, blob)
             fo.write(chunk.tobytes())
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
