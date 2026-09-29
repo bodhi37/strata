@@ -801,3 +801,124 @@ makes the driver halve `--prefill`), so it was not attempted blind.
   reader count. The next concrete experiment is a deeper staging ring decoupled from the borrow region (a
   separate read-buffer pool), or removing the per-tile `cudaStreamSynchronize` in the router pass.
 * Do not trust a single prefill number from any earlier section: use `scratch/pf_multi.py`, n>=5.
+
+## 0.10 R23 WRAP-UP (2026-09-29) — the GSQ-RCO Coder was evaluated and declined; IQ3_XXS stands as the endpoint
+
+The Coder quant (`Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF`, released as "IQ1_M") was downloaded, inspected at the
+byte level, and its upstream support was ported into this fork. It was then **declined**: it does not buy the speed
+it was bought for, and the user is not using it for its one strength. Everything below is measured off the file on
+disk, not off the model card. **The live endpoint is unchanged IQ3_XXS** (branch `r14-upstream` @ `dd609f9`,
+`engine/strata`, config `strata-r23-wrapup.json` = `strata-r19-best.json` with only the log/counts paths renamed).
+
+### 0.10.1 "IQ1_M" is a misnomer, and that is the whole story
+
+The file contains **no IQ1_M tensor at all**. Shard 1's type histogram is
+`Q6_K x129, BF16 x484, F32 x292, IQ4_XS x45, Q4_K x47, IQ4_NL x86, IQ3_XXS x34, Q5_K x35, Q2_0 x9, IQ2_S x40, IQ3_S x20, F16, Q8_0`
+(`tools/probe_gguf.py`, 1223 tensors). The name is the release's label for **1.89 bits per _original_ parameter** -
+i.e. the pruning (256 of 512 experts per layer) is folded into the bitrate. The kept experts are stored with ordinary
+encodings: gate/up in IQ3_XXS/IQ2_S/IQ3_S/IQ4_XS, down in IQ4_NL/Q2_0.
+
+Consequence, and this is the number that kills the premise: an expert blob's size is set by the expert's **shape**
+(`ffn_*_exps` is 2560x640 per expert, 144 such tensors), not by the headline quant.
+
+| | expert arena | bytes/expert blob | MiB per token (480 blobs) |
+| --- | ---: | ---: | ---: |
+| heretic IQ3_XXS (live) | 49.81 GiB | 2.075 MiB | **996** |
+| Coder "IQ1_M" shard 1 | 23.42 GiB | 1.952 MiB | **937** |
+
+A token walks `top_k 10 x 48 layers = 480` blobs in **both** models. The Coder reads **6% fewer bytes per token**.
+The halving is in the number of *experts*, which a token never touches - it only shrinks the arena that has to fit
+somewhere. Measured DRAM read bandwidth on this box (`build/bwbench`, 12 threads over scattered 2 MiB pages) is
+**51.8 GB/s**, so the fully-RAM-resident decode ceiling is 51.8/(996/1024) = **53 tok/s** for IQ3_XXS and
+**56.6 tok/s** for the Coder. "300-700 tok/s decode, fully resident" was never reachable on this architecture at
+this top-k: the bytes per token are the wall, and they barely moved.
+
+Upstream's own numbers agree, and they are the honest verdict (RTX 5070 12 GB, Ryzen 5 7600, 64 GB -
+`bench/results/2026-09-28-coder/` vs `2026-09-28-speed-0114/`):
+
+| 4K prompt | Coder | IQ3_XXS | | 32K | Coder | IQ3_XXS |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| prefill tok/s | **1,152** | 770 | | prefill tok/s | **1,298** | 1,108 |
+| decode tok/s | 50.6 | **62.1** | | decode tok/s | **53.3** | 51.4 |
+
+**Prefill ~1.5x, decode ~0 (slower at short context).** The real gains are footprint (49.8 -> 23.4 GiB of experts,
+so it fits 32 GB of RAM and a 12 GB card caches ~20% of experts instead of ~10%) and the halved prefill stream -
+which on *this* box matter least, because we have 30 GiB and the bottleneck is host read depth, not residency.
+
+
+### 0.10.2 What the port needed, and where it lives
+
+Upstream already solved the interesting half. **PR #54** (`f07c68c` + `b3e5d6f`, "pruned expert variants") reads
+`qwen4exp.expert_count` / `expert_used_count` from the model file instead of assuming 512x10, and threads
+`g.n_expert` through prefill/router/layout in place of the `NE = 512` literals at
+`include/strata/kernels/cpu/expert.hpp:36` and `include/strata/core/layout.hpp:52`. The index question it answers:
+`tensor-allocation/*.rco-allocation.txt` section 2 lists the kept experts under their **original sparse indices**
+(layer 0 keeps `0,1,2,4,8,10,12,...` of 512), but the stored tensor's dim is **dense 256**
+(`blk.N.ffn_gate_exps.weight = [2560, 640, 256]`), so the router output must be remapped - shipped as
+`data/expert-profile-coder.bin`.
+
+`git apply -3` of `f07c68c` onto this fork took 6 of 8 files clean; the 2 conflicts were our own R10/R11 tile work
+(`m.tile`, the R11 `m.mixed` OOB fix) and were resolved by hand to keep ours - upstream's version predates both.
+Committed on branch **`r20-coder`** @ `ef9636e`, tag **`fork-r20-coder-port`**. It is *not* in the live tree, and it
+is **not finished**: `tools/probe_gguf.py` still refuses the file (`EXPERT TYPES NOT SUPPORTED: gate/up IQ4_XS x2`,
+`DENSE TYPES NOT SUPPORTED: IQ2_S, IQ3_S, IQ3_XXS`), so building a pack needs kernel work beyond PR #54. The 28 GB
+of downloaded shards are parked at `~/models/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF-iQ1_M/`; nothing references them
+(`/home` has 273 GB free). Revisit only if prefill throughput or a 32 GB host ever becomes the goal.
+
+### 0.10.3 Live endpoint verification (all green)
+
+`engine/strata` execs a binary 4 bytes different from `build/strata` - verified to be only nvcc's PID-dependent temp
+filename (`tmpxft_00015425` vs `tmpxft_00059440`) inside fatbin metadata: same build-ID, same code.
+
+| check | result |
+| --- | --- |
+| `/v1/models`, `/health` | `qwen3.8-flash-next-heretic-2-iq3_xxs`, `max_context 131072`, ok |
+| arithmetic + instruction-follow | `17*23 -> 391`, exact two-line format honoured, greedy |
+| coherence (`scratch/quickbench.py`) | "Hello. 2+2 is 4." + coherent 400-tok reasoning trace |
+| decode | **8.4 tok/s** over 400 tok (r19 documented median 7.75 / max 9.62) - no regression |
+| abliteration | gritty safecracker thriller opener: complied first try, explicit on-screen violence, **zero** hedge/refusal phrases, `finish_reason: stop` |
+| Pi harness | `~/.pi/agent/models.json` provider baseUrl `http://127.0.0.1:8123/v1` = the live port and model id |
+| residency | `VmLck 25165728 kB` = exactly the configured 24.0 GiB; RSS 25.4 GiB; VRAM 11.1/12.3 GiB |
+**One operational footgun found while verifying: `max_tokens` must cover the reasoning, not just the answer.** A
+request with `max_tokens: 40` returned `"content": null` with the whole 40 tokens in `reasoning_content` and
+`finish_reason: "length"` - correct behaviour for a reasoning model, but it looks like a broken endpoint to any client
+that only reads `message.content`. The Pi harness is safe (`maxTokens: 131072`, and `serve/server.py:879` treats a
+missing/0/`-1` as "the rest of the context"), and with a 600-token budget the same prompt returns
+`"READY\n2^10"` with `finish_reason: "stop"` after 109 tokens. Any third-party client must send a generous budget.
+
+
+### 0.10.4 The test suite on this box: 84%, and all 5 failures are environmental
+
+`ctest` is actively misleading here and every number was chased to its cause rather than assumed. The history, so
+the next person does not re-derive it:
+
+* **Never run `ctest -j 8` while the endpoint is up.** Parallel: 29% pass with 9 `out of memory` failures. Serial:
+  61%, and all 9 OOM failures vanish (`dequant_s2_parity`, `shared_expert_parity`, `gr_parity`, `kv_q8_parity`
+  re-run individually: 4/4 pass). The engine holds 24 GiB mlocked + 25.4 GiB RSS on a 30 GiB host - the failures
+  were the test runner competing with the live endpoint, not the code.
+* The `Not Run` entries were not failures either: the production cache has **`STRATA_BUILD_TESTS:BOOL=OFF`**, so
+  8 test executables (`expert_parity`, `pool_test`, `expert_multi_test`, `native_mmvq_multi`, `graph_registry_test`,
+  `pinned_capture`, `suffix_drafter_test`, `controller_test`) are simply not built. A separate tree
+  (`build-tests`, configured with `-DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_COMPILER=/home/bodhi/deps/cuda-13.3/opt/cuda/bin/nvcc
+  -DCMAKE_CUDA_ARCHITECTURES=89`; `nvcc` is not on `PATH`, which is why a naive fresh configure dies in
+  `cmake_cuda_find_toolkit`) builds them, and **5 of the 8 pass immediately**.
+* `pinned_capture` "failed" purely because ad-hoc runs have no `LD_LIBRARY_PATH` for
+  `libcudart.so.13` - the engine's own launch script sets it. With the path exported it passes, as does
+  `native_mmvq_multi`.
+
+**Final authoritative run** (`build-tests`, serial, `LD_LIBRARY_PATH` set, engine left up): **26/31 = 84% pass.**
+The 5 failures, each with its verbatim cause:
+
+| test | cause | kind |
+| --- | --- | --- |
+| `ple_parity` | *required PLE table is missing or incompatible: `../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf`* | reference file not on this machine |
+| `expert_parity` | *cannot read expert 0 (layer 0) from `pack/full/experts.bin`* | `pack/` is empty; we run native IQ packs |
+| `pool_test` | *cannot read expert 0 of layer 0 from `pack/full/experts.bin`* | same |
+| `platform_memory_test` | *`mlock failed (raise ulimit -l)`* | `ulimit -l` = 8192 KiB, unraisable from this shell; the engine's own launch path locks 24 GiB fine |
+| `cuda_device_selftest` | *device NVIDIA GeForce RTX 4070 SUPER reports compute capability 8.9; Strata targets sm_120 (RTX 5000 series / Blackwell) only* | permanent: GPU is pre-Blackwell |
+
+**Zero code regressions.** Note what this means for the endpoint's identity: `expert_parity` prints *"AVX512
+F/BW/VL/VNNI/VBMI all present"* while failing on missing data, and `cuda_device_selftest` says the CUDA kernels
+cannot run at all here. The live endpoint is entirely AVX-512 CPU + pinned-RAM, which is exactly why 51.8 GB/s of
+DRAM is the wall and why no quant rename moves decode.
+
