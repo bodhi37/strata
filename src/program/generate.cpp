@@ -34,6 +34,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
@@ -1133,9 +1134,12 @@ int main(int argc, char** argv) {
             ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
         }
         if (o.native_ple_key && wk->quantized()) {
-            // heretic-2 stores the PLE key as Q8_0; the mmvq native-key path is type-generic
-            // (native_mmvq_weight_bytes/native_mmvq handle it), so accept 8 alongside the Q2_0 packs.
-            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 8) || !wk->native_q8_1) {
+            // The mmvq native-key path is type-generic (native_mmvq_weight_bytes /
+            // native_mmvq handle every type native_mmvq_supported() accepts), so any
+            // natively served key works here: heretic-2's Q8_0 key, the Q2_0 packs'
+            // key, and Orca's factory IQ4_XS key alike.
+            if (!wk->native_data || !strata::kernels::native_mmvq_supported(wk->native_type) ||
+                !wk->native_q8_1) {
                 std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
                 return 1;
             }
