@@ -155,6 +155,13 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     blob_ = mx;
     off_ = std::move(off);
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    // R4.2g bases (same as open()): without these every layer admits from slot 0 and the
+    // layers overwrite each other (verify_slot fails at byte 0 on sized/native packs).
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
 }
 
