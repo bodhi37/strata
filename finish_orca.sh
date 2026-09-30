@@ -63,7 +63,7 @@ for S in "$SH1" "$SH2" "$SH3"; do
 import sys; sys.path.insert(0,'$ROOT/tools')
 from gguf_reader import GGUFFile
 g=GGUFFile('$S')
-names=set(g.tensors.keys()) if hasattr(g,'tensors') else set()
+names={t.name for t in g.tensors}
 for k in ['token_embd.weight','output.weight','blk.1.ple_key','blk.0.ffn_gate_inp.weight','output_norm.weight']:
   print(' ',k, 'YES' if k in names else 'no')
 print('  ntensors', len(names))
@@ -78,7 +78,7 @@ for S in "$SH1" "$SH2" "$SH3"; do
   HAS_OUT=$("$PY" -c "
 import sys; sys.path.insert(0,'$ROOT/tools')
 from gguf_reader import GGUFFile
-g=GGUFFile('$S'); print('yes' if 'output.weight' in g.tensors else 'no')" 2>/dev/null | tail -1)
+g=GGUFFile('$S'); print('yes' if 'output.weight' in {t.name for t in g.tensors} else 'no')" 2>/dev/null | tail -1)
   [ "$HAS_OUT" = "yes" ] && TENSOR_SHARD=$S
 done
 echo "[2] arch=$ARCH_SHARD tensor=$TENSOR_SHARD"
@@ -114,7 +114,7 @@ found=False
 for s in ['$SH1','$SH2','$SH3']:
   try:
     g=GGUFFile(s)
-    if any('ple' in k.lower() for k in g.tensors.keys()):
+    if any('ple' in t.name.lower() for t in g.tensors):
       found=True; break
   except Exception: pass
 print('yes' if found else 'no')" 2>/dev/null | tail -1)
@@ -143,7 +143,7 @@ for S in "$SH1" "$SH2" "$SH3"; do
   HAS_EMB=$("$PY" -c "
 import sys; sys.path.insert(0,'$ROOT/tools')
 from gguf_reader import GGUFFile
-g=GGUFFile('$S'); print('yes' if 'token_embd.weight' in g.tensors else 'no')" 2>/dev/null | tail -1)
+g=GGUFFile('$S'); print('yes' if 'token_embd.weight' in {t.name for t in g.tensors} else 'no')" 2>/dev/null | tail -1)
   [ "$HAS_EMB" = "yes" ] && NATIVE=$S
 done
 echo "[6] native=$NATIVE"
