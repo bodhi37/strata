@@ -1392,7 +1392,14 @@ int main(int argc, char** argv) {
         // top pairs the hot tier already holds - duplicated residents serve no extra routing traffic and the
         // card's slots are the scarcest tier on a 12 GiB card.
         const int64_t skip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_blobs() : 0;
-        const int64_t want = std::min<int64_t>((int64_t) profile.size() - skip, xcache.slots());
+        // Per-layer quotas skip pairs whose layer is full, so the scan runs past `slots` pairs to the end
+        // of the profile until every layer quota is full (shared mode keeps the old top-`want` slice).
+        const int64_t end = (int64_t) profile.size();
+        const int64_t want = o.expert_cache_per_layer ? end - skip
+                                                      : std::min<int64_t>(end - skip, xcache.slots());
+        int32_t verify_slot = strata::core::kNotResident;
+        const uint8_t* verify_blob = nullptr;
+        int64_t verify_bytes = 0;
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
             if (slot == strata::core::kNotResident) {
@@ -1411,26 +1418,29 @@ int main(int argc, char** argv) {
                              (long long) i, err.c_str());
                 return 1;
             }
+            if (verify_slot == strata::core::kNotResident) {
+                verify_slot = slot;
+                verify_blob = b;
+                verify_bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(
+                    profile[(size_t) (skip + i)].first);
+            }
             ++prefilled;
+            if (o.expert_cache_per_layer && prefilled >= xcache.slots()) break;   // every quota is full.
         }
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        // R7: verify a pair the VRAM tier ACTUALLY holds.  With the host hot tier active the tier starts at
-        // `skip`, so `profile[0]` is a host-tier resident and `slot_of` answers -1 - and R5's own guard
-        // (`slots() > 0 && !verify_slot(...)`) then refused every such run with "slot outside the arena".
-        const int64_t vskip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_blobs() : 0;
+        // The verified pair is the first one actually admitted (under per-layer quotas profile[vskip]
+        // itself may have been skipped, and verifying it would refuse a healthy run).
         if (xcache.slots() > 0 && prefilled > 0 &&
-            !xcache.verify_slot(xcache.slot_of(profile[(size_t) vskip].first, profile[(size_t) vskip].second),
-                                srcp->blob(profile[(size_t) vskip].first, profile[(size_t) vskip].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) vskip].first))) {
+            !xcache.verify_slot(verify_slot, verify_blob, err, verify_bytes)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         mem_mark("the profile fill");
         if (xcache.slots() > 0)
-            std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                         (long long) prefilled, (long long) want);
+            std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot %d verified\n",
+                         (long long) prefilled, (long long) xcache.slots(), (int) verify_slot);
         else
             std::fprintf(stderr, "strata generate: VRAM tier off; profile drives the host hot tier only\n");
     }
