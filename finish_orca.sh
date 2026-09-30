@@ -123,7 +123,8 @@ PLE=$PLE_SHARED
 if [ "$HAS_PLE" = "yes" ]; then
   if [ ! -s "$PLE_ORCA" ]; then
     echo "[5] requantising Orca PLE -> $PLE_ORCA $(date -Is)"
-    PLE_SRC=$SH3
+# Orca split: PLE table (blk.1.ple_*) lives in shard 1 (heretic kept it in shard 3).
+    PLE_SRC=$SH1
     "$PY" "$ROOT/tools/make_ple_iq4nl.py" --src "$PLE_SRC" --out "$PLE_ORCA" --verify 1024 || { echo "[5] orca PLE requant failed, falling back to shared"; PLE=$PLE_SHARED; }
     [ -s "$PLE_ORCA" ] && PLE=$PLE_ORCA
   else
