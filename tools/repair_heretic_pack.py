@@ -51,6 +51,64 @@ def dequant_q8_0_to_bf16(raw: bytes) -> bytes:
     return (b >> np.uint32(16)).astype(np.uint16).tobytes()
 
 
+# ggml's IQ4_NL codebook (ggml-quants.c: kvalues_iq4nl); the CUDA kernel
+# vec_dot_iq4_xs_q8_1 and dq_iq4_xs decode against the same 16 numbers.
+KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,
+                          1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
+
+
+def _f32_to_bf16_rne(x: np.ndarray) -> bytes:
+    b = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).copy()
+    b += np.uint32(0x7FFF) + ((b >> np.uint32(16)) & np.uint32(1))
+    return (b >> np.uint32(16)).astype(np.uint16).tobytes()
+
+
+def dequant_iq4_nl_to_bf16(raw: bytes) -> bytes:
+    """IQ4_NL blocks (32 vals, 18 B: fp16 d + 16 B nibbles) -> BF16 bytes."""
+    n = len(raw) // 18
+    u = np.frombuffer(raw, dtype=np.uint8, count=n * 18).reshape(n, 18)
+    d = u[:, :2].copy().view("<f2").reshape(-1).astype(np.float32)
+    qs = u[:, 2:]
+    lo = KVALUES_IQ4NL[qs & 0x0F]
+    hi = KVALUES_IQ4NL[qs >> 4]
+    x = np.empty((n, 32), dtype=np.float32)
+    x[:, :16] = d[:, None] * lo
+    x[:, 16:] = d[:, None] * hi
+    return _f32_to_bf16_rne(x.reshape(-1))
+
+
+def dequant_iq4_xs_to_bf16(raw: bytes) -> bytes:
+    """IQ4_XS super-blocks (256 vals, 136 B) -> BF16 bytes.
+
+    Layout (ggml-common.h block_iq4_xs, QK_K=256): fp16 d, u16 scales_h,
+    4 x u8 scales_l, 128 B nibbles.  Reference: ggml dequantize_row_iq4_xs
+    and this repo's dq_iq4_xs (src/kernels/cuda/iq_kernels.cu).
+    """
+    n = len(raw) // 136
+    u = np.frombuffer(raw, dtype=np.uint8, count=n * 136).reshape(n, 136)
+    d = u[:, :2].copy().view("<f2").reshape(-1).astype(np.float32)          # (B,)
+    scales_h = u[:, 2:4].copy().view("<u2").reshape(-1)                    # (B,)
+    scales_l = u[:, 4:8].astype(np.uint16)                                 # (B,4)
+    qs = u[:, 8:].reshape(n, 8, 16)                                        # (B,8,16)
+    ib = np.arange(8, dtype=np.uint16)
+    ls = ((scales_l[:, ib // 2] >> (4 * (ib % 2))) & 0xF) | \
+         (((scales_h[:, None] >> (2 * ib)) & 3) << 4)                       # (B,8)
+    dl = d[:, None] * (ls.astype(np.float32) - 32.0)                       # (B,8)
+    lo = KVALUES_IQ4NL[qs & 0x0F]
+    hi = KVALUES_IQ4NL[qs >> 4]
+    x = np.empty((n, 8, 32), dtype=np.float32)
+    x[:, :, :16] = dl[:, :, None] * lo
+    x[:, :, 16:] = dl[:, :, None] * hi
+    return _f32_to_bf16_rne(x.reshape(-1))
+
+
+REPAIR_DEQUANT = {
+    "Q8_0": dequant_q8_0_to_bf16,
+    "IQ4_NL": dequant_iq4_nl_to_bf16,
+    "IQ4_XS": dequant_iq4_xs_to_bf16,
+}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True)
@@ -103,13 +161,15 @@ def main() -> int:
                 new_rows.append(r)
                 continue
             f, t, mm = where[r[0]]
-            if t.type_name != "Q8_0":
-                print("ERROR: %s is %s, expected Q8_0" % (t.name, t.type_name))
+            dq = REPAIR_DEQUANT.get(t.type_name)
+            if dq is None:
+                print("ERROR: %s is %s, no dequant path (have %s)" %
+                      (t.name, t.type_name, sorted(REPAIR_DEQUANT)))
                 return 1
             ne0, ne1 = int(t.shape[0]), int(t.shape[1] if len(t.shape) > 1 else 0)
             n = t.expected_bytes()
             raw = bytes(mm[f.data_start + t.offset: f.data_start + t.offset + n])
-            bf16 = dequant_q8_0_to_bf16(raw)
+            bf16 = dq(raw)
             elems = ne0 * (ne1 if ne1 else 1)
             if len(bf16) != elems * 2:
                 print("ERROR: %s dequant size %d != %d" % (t.name, len(bf16), elems * 2))
@@ -124,8 +184,8 @@ def main() -> int:
                   "0", "0", "1", "0", "0", "0", "0", "0", "0", "0"]
             at += len(bf16) + ((-len(bf16)) % align)
             new_rows.append(nr)
-            print("  %s: Q8_0 [%d, %d] -> BF16 %d B @ dense.bin %s" %
-                  (r[0], ne0, ne1, len(bf16), nr[3]))
+            print("  %s: %s [%d, %d] -> BF16 %d B @ dense.bin %s" %
+                  (r[0], t.type_name, ne0, ne1, len(bf16), nr[3]))
 
     if a.dry_run:
         print("dry run: index not rewritten")
