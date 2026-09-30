@@ -1395,7 +1395,10 @@ int main(int argc, char** argv) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size() - skip, xcache.slots());
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
-            if (slot == strata::core::kNotResident) break;
+            if (slot == strata::core::kNotResident) {
+                if (!o.expert_cache_per_layer) break;   // shared mode: the tier itself is full.
+                continue;   // per-layer mode: this pair's layer quota is full; later pairs may fit.
+            }
             const uint8_t* b = srcp->blob(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
             // R7: the byte count must come from the SAME pair the blob did.  This read `profile[i].first` while
             // the blob came from `profile[skip + i]`, so with the host hot tier active the fill copied layer
