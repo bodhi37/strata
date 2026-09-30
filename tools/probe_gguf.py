@@ -52,7 +52,24 @@ def fetch_head(src: str, nbytes: int) -> pathlib.Path:
 
 
 def parse(path: pathlib.Path):
-    d = path.read_bytes()
+    # Read the header only, growing the buffer until the parse completes.
+    # The full file can be tens of GB and must never be read into RAM (OOM).
+    size = path.stat().st_size
+    nbytes = min(16 * 1024 * 1024, size)
+    with open(path, "rb") as fh:
+        d = fh.read(nbytes)
+        while True:
+            try:
+                return _parse_buf(d)
+            except (struct.error, IndexError):
+                if nbytes >= size:
+                    raise
+                nbytes = min(nbytes * 2, size)
+                fh.seek(0)
+                d = fh.read(nbytes)
+
+
+def _parse_buf(d: bytes):
     if d[:4] != b"GGUF":
         head = d[:120].decode("utf-8", "replace")
         raise SystemExit(f"not a GGUF (starts with {head!r})")

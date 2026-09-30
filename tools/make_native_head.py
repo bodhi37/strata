@@ -54,10 +54,12 @@ def main() -> int:
         print("%s has no tensor %s" % (a.tensor_shard, a.name)); return 1
     if len(t.shape) != 2:
         print("%s is not 2-D" % a.name); return 1
-    raw = pathlib.Path(a.tensor_shard).read_bytes()[tsh.data_start + t.offset:
-                                                    tsh.data_start + t.offset + t.expected_bytes()]
-    if len(raw) != t.expected_bytes():
-        print("short read of %s" % a.name); return 1
+    # Stream the tensor bytes with seek + chunked copy: the source shard can be
+    # tens of GB and must never be read fully into RAM (OOM).
+    src_off = tsh.data_start + t.offset
+    nbytes = t.expected_bytes()
+    if nbytes is None or nbytes <= 0:
+        print("cannot determine byte size of %s" % a.name); return 1
 
     out = pathlib.Path(a.out)
     with out.open("wb") as f:
@@ -76,8 +78,16 @@ def main() -> int:
         hdr = f.tell()
         f.write(b"\0" * ((-hdr) % 4096))
         data_start = f.tell()
-        f.write(raw)
-    expect = data_start + t.expected_bytes()
+        with open(a.tensor_shard, "rb") as src:
+            src.seek(src_off)
+            remaining = nbytes
+            while remaining > 0:
+                chunk = src.read(min(64 * 1024 * 1024, remaining))
+                if not chunk:
+                    print("short read of %s" % a.name); return 1
+                f.write(chunk)
+                remaining -= len(chunk)
+    expect = data_start + nbytes
     print("%s: %s %s %s -> %d bytes (expected %d)" % (out, a.name, t.type_name, list(t.shape),
                                                       out.stat().st_size, expect))
     return 0 if out.stat().st_size == expect else 1
