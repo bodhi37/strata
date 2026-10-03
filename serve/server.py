@@ -9,7 +9,8 @@ Images (optional, when the config has a "vision" entry): OpenAI image_url parts 
 data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
-Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
+Requests whose prompt plus max tokens exceed the engine's context are shortened to the room left (never a 400);
+only a prompt that leaves no room at all is rejected with 400 - the prompt itself is never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
@@ -470,14 +471,17 @@ class Service:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
+        if room < 1:
+            # The prompt alone fills the context, so nothing could be generated - the prompt itself is never
+            # truncated.  Clients (agents) recognize this message as a context overflow and compact.
+            raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                             f"({self.engine.max_context}); requests are never truncated")
         if max_new is None or max_new <= 0:
-            if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
             max_new = room
         elif max_new > room:
-            raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                             f"({self.engine.max_context}); requests are never truncated")
+            # A shorter completion beats a 400: an over-budget max_tokens must never kill the session (#545).
+            print(f"[strata] max_tokens {max_new} -> {room} (room left after {len(ids)} prompt tokens)", flush=True)
+            max_new = room
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def _note(self, n, evs):

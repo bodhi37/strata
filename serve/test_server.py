@@ -86,12 +86,12 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(self.engine.last_max_new, want)
                 self.assertEqual(ct, want)
 
-    def test_explicit_budget_over_the_context_is_rejected(self):
+    def test_explicit_budget_over_the_context_is_clamped(self):
         for api in ("openai", "anthropic"):
             with self.subTest(api=api):
-                s, b, _, _ = self.call(api, max_tokens=CTX)
-                self.assertEqual(s, 400)
-                self.assertIn("exceeds the context", b["error"]["message"])
+                s, b, pt, _ = self.call(api, max_tokens=CTX)
+                self.assertEqual(s, 200, b)                       # never a 400: shortened to the room left
+                self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
 
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
@@ -108,6 +108,11 @@ class MaxTokens(unittest.TestCase):
             with self.subTest(api=api, room=0):     # nothing left: rejected, not truncated
                 text = "y" * (CTX - CTX_SLACK - overhead - over)
                 s, b, _, _ = self.call(api, text=text)
+                self.assertEqual(s, 400, b)
+                self.assertIn("no room to answer", b["error"]["message"])
+            with self.subTest(api=api, room=0, explicit=1):   # ...same 400 with an explicit budget
+                text = "y" * (CTX - CTX_SLACK - overhead - over)
+                s, b, _, _ = self.call(api, text=text, max_tokens=1)
                 self.assertEqual(s, 400, b)
                 self.assertIn("no room to answer", b["error"]["message"])
 
