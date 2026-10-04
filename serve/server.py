@@ -51,6 +51,8 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 READY_WAIT_S = 600.0        # how long a request waits for a restarting engine before giving up (retryable)
+DRAIN_S = 90.0              # how long an early-stopped request waits for the engine's STOP/DONE (covers a prefill
+                            # chunk cancel plus the engine's lent-slot refill cleanup before the FIFO moves on)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -227,6 +229,33 @@ class StrataEngine:
                 return
             yield None
             time.sleep(0.5)
+        # A request that ended early (client disconnect, cancel, a drain that gave up) leaves its engine output
+        # unconsumed in the queue: the engine answers exactly one GEN at a time, so that DONE (or worse, that
+        # request's tokens) belongs to a request nobody is serving any more.  Without this guard the next
+        # request reads the stale DONE as its own - it returns instantly with 0 tokens and finish "length",
+        # which pi shows as "Response was truncated before completion" with nothing in it (reproduced live
+        # 2026-10-04: sessions 05:00/05:09 UTC, metrics "length prompt=2463/34303 out=0" in ~1 s).
+        stale = []
+        try:
+            while True:
+                stale.append(self.lines.get_nowait())
+        except queue.Empty:
+            pass
+        if stale:
+            sample = str(stale[0])[:60].replace("\n", " ")
+            print(f"[strata] engine output out of step ({len(stale)} line(s) left by an earlier request, "
+                  f"first: {sample!r}); replacing the engine", flush=True)
+            self._ready.clear()            # before the restart thread runs: the wait below must not pass early
+            self.start_restart("stale engine output left by an earlier request")
+            waited = time.time()
+            while not self._ready.is_set():
+                if cancel.is_set():
+                    return
+                if time.time() - waited > READY_WAIT_S:
+                    raise RuntimeError("server error: the engine failed to come back after a restart "
+                                       f"({int(READY_WAIT_S)} s); retrying is safe")
+                yield None
+                time.sleep(0.5)
         self.progress = None
         head = f"GENI {int(max_new)} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
@@ -283,12 +312,14 @@ class StrataEngine:
                         pass
                 # BOUNDED: an engine that stalled (the watchdog path) may never answer the STOP, and an unbounded
                 # drain here would pin the service FIFO forever - exactly the failure the watchdog exists to end.
-                deadline = time.time() + 20.0
+                # DRAIN_S covers a prefill-chunk cancel plus the engine's lent-slot refill cleanup; anything left
+                # unconsumed after the deadline is caught by generate()'s stale-output guard on the next request.
+                deadline = time.time() + DRAIN_S
                 while time.time() < deadline:
                     try:
                         line = self.lines.get(timeout=1.0)
                     except queue.Empty:
-                        if not self.proc.is_alive():
+                        if self.proc.poll() is not None:
                             break
                         continue
                     if line is None or line.startswith("ERR"):
@@ -649,9 +680,10 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                 finally:
-                    gen.close()                         # STOP+drain to THIS request's DONE while still holding the
-                    #                                     fifo, so a stop-token break can't leave the shared engine
-                    #                                     queue mid-drain for the next request to read as its own DONE
+                    try:
+                        gen.close()                     # STOP+drain to THIS request's DONE while still holding the
+                    except Exception:                   # fifo - but a drain failure must not mask the request's
+                        pass                            # own outcome (and the stale-output guard recovers below)
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise

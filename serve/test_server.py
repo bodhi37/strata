@@ -355,6 +355,91 @@ class RestartWindow(unittest.TestCase):
             server.READY_WAIT_S = old
 
 
+class DesyncGuard(unittest.TestCase):
+    """A request that ends early (client disconnect, cancel, a drain that gave up) can leave the engine's DONE or
+    its tokens unconsumed in the line queue.  The engine answers exactly one GEN at a time, so without a guard the
+    NEXT request reads that stale output as its own: it returns instantly with 0 tokens and finish "length", which
+    pi shows as "Response was truncated before completion" with nothing in it (reproduced live 2026-10-04).  The
+    guard must detect the out-of-step queue, replace the engine, and serve the next request from a clean one."""
+
+    @staticmethod
+    def script() -> str:
+        """A fake `--serve` engine; its last argv is a mode file read at startup: 'abandon' prints two tokens and a
+        DONE for its first GEN (and never reads stdin again - the stranded-output shape), 'answer' answers every."""
+        return ("#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "MODE = open(sys.argv[-1]).read().strip()\n"
+                "print('INFO context=4096', flush=True)\n"
+                "print('READY 4096 stop', flush=True)\n"
+                "for line in sys.stdin:\n"
+                "    if line.startswith('QUIT'):\n"
+                "        break\n"
+                "    if not line.startswith('GEN'):\n"
+                "        continue\n"
+                "    if MODE == 'abandon':\n"
+                "        MODE = 'abandoned'\n"
+                "        print('T 65', flush=True)\n"
+                "        time.sleep(1.5)\n"
+                "        print('T 66', flush=True)\n"
+                "        print('DONE 2 3 1.0 40.0 cancel 0 0 0', flush=True)\n"
+                "        time.sleep(3600)\n"
+                "    else:\n"
+                "        for t in (67, 68):\n"
+                "            print('T %d' % t, flush=True)\n"
+                "            time.sleep(0.02)\n"
+                "        print('DONE 2 3 1.0 40.0 stop 0 0 0', flush=True)\n")
+
+    def engine(self, mode: str) -> tuple[StrataEngine, Path]:
+        d = tempfile.mkdtemp(prefix="strata-desync-")
+        mode_file = Path(d) / "mode"
+        mode_file.write_text(mode)
+        exe = Path(d) / "fake-engine"
+        exe.write_text(self.script())
+        exe.chmod(0o755)
+        eng = StrataEngine(str(exe), [str(mode_file)], watchdog_s=30.0)
+        self.addCleanup(eng.close)
+        return eng, mode_file
+
+    def test_stale_output_is_never_served_to_the_next_request(self):
+        import serve.server as server
+        eng, mode_file = self.engine("abandon")
+        old = server.DRAIN_S
+        server.DRAIN_S = 0.5
+        try:
+            cancel = threading.Event()
+            proc_before = eng.proc
+            gen1 = eng.generate([1, 2, 3], 10, {}, cancel)
+            self.assertEqual(next(gen1), 65)
+            gen1.close()                     # consumer left early: the drain expires before the engine's DONE
+            time.sleep(1.6)                  # the engine (ignoring STOP) finishes: its output is now stranded
+            mode_file.write_text("answer")   # the replacement engine must be a clean one
+            gen2 = eng.generate([1, 2, 3], 10, {}, cancel)
+            got = [t for t in gen2 if t is not None]
+            self.assertEqual(got, [67, 68], "the next request was served the stranded request's output")
+            self.assertTrue(eng._ready.is_set())
+        finally:
+            server.DRAIN_S = old
+
+    def test_preseeded_stale_done_triggers_replacement(self):
+        eng, _ = self.engine("answer")
+        cancel = threading.Event()
+        proc_before = eng.proc
+        eng.lines.put("DONE 9 9 0.0 0.0 cancel 0 0 0\n")   # a DONE stranded by a long-gone request
+        gen = eng.generate([1, 2, 3], 10, {}, cancel)
+        got = [t for t in gen if t is not None]
+        self.assertEqual(got, [67, 68], "the next request was served the stranded DONE (phantom length)")
+        self.assertIsNot(eng.proc, proc_before, "an out-of-step queue must replace the engine")
+
+    def test_clean_finish_never_restarts_the_engine(self):
+        eng, _ = self.engine("answer")
+        cancel = threading.Event()
+        proc_before = eng.proc
+        for _ in range(2):
+            got = [t for t in eng.generate([1, 2, 3], 10, {}, cancel) if t is not None]
+            self.assertEqual(got, [67, 68])
+        self.assertIs(eng.proc, proc_before, "a clean queue must not trigger an engine replacement")
+
+
 class ThinkingControl(unittest.TestCase):
     """reasoning_effort reaches the chat template: none closes the think block, the levels map onto the model's."""
 
