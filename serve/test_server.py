@@ -324,6 +324,37 @@ class Watchdog(unittest.TestCase):
         self.assertTrue(eng._ready.is_set(), "the engine was not restarted")
 
 
+class RestartWindow(unittest.TestCase):
+    """While the engine is being restarted (watchdog abort, engine death) the dead engine reads max_context 0:
+    without a wait, every request in the window would 400 "leaves no room to answer in the context (0)" - a lie
+    pi compacts on.  Requests must wait for the engine, then fail retryable if it never came back."""
+
+    def service(self, pending_s):
+        from types import SimpleNamespace
+        eng = SimpleNamespace(_ready=threading.Event(), max_context=CTX, info={})
+        if pending_s:
+            threading.Timer(pending_s, eng._ready.set).start()
+        self.tok = ByteTokenizer()
+        return Service(eng, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def test_requests_wait_for_a_restarting_engine(self):
+        svc = self.service(pending_s=1.0)
+        ids, _, max_new = svc.prepare([{"role": "user", "content": "hi"}], [], {})
+        self.assertEqual(max_new, CTX - CTX_SLACK - len(ids))   # normal budget once the engine is back
+
+    def test_engine_that_never_returns_is_a_retryable_runtime_error(self):
+        import serve.server as server
+        svc = self.service(pending_s=None)
+        old = server.READY_WAIT_S
+        server.READY_WAIT_S = 1.0
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                svc.prepare([{"role": "user", "content": "hi"}], [], {})
+            self.assertIn("retrying is safe", str(cm.exception))
+        finally:
+            server.READY_WAIT_S = old
+
+
 class ThinkingControl(unittest.TestCase):
     """reasoning_effort reaches the chat template: none closes the think block, the levels map onto the model's."""
 

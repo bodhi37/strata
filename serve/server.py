@@ -50,6 +50,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+READY_WAIT_S = 600.0        # how long a request waits for a restarting engine before giving up (retryable)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -547,6 +548,20 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
+        # An engine restart may be in flight (watchdog abort, engine death): the dead engine reads
+        # max_context 0, and without this wait every request in the restart window would 400 with a LIE -
+        # "leaves no room to answer in the context (0)" - which overflow-aware clients (pi) act on by
+        # compacting.  Wait for the engine instead; after the deadline say honestly that the engine is
+        # unreachable rather than inventing a context-size error.
+        ready = getattr(self.engine, "_ready", None)
+        if ready is not None and not ready.is_set():
+            print("[strata] waiting for the engine restart ...", flush=True)
+            deadline = time.time() + READY_WAIT_S
+            while not ready.is_set() and time.time() < deadline:
+                time.sleep(0.5)
+            if not ready.is_set():
+                raise RuntimeError("server error: the engine failed to come back after a restart "
+                                   f"({int(READY_WAIT_S)} s); retrying is safe")
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if room < 1:
             # The prompt alone fills the context, so nothing could be generated - the prompt itself is never
