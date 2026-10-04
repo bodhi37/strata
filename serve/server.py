@@ -12,6 +12,10 @@ converted to PNG first with Pillow.
 Requests whose prompt plus max tokens exceed the engine's context are shortened to the room left (never a 400);
 only a prompt that leaves no room at all is rejected with 400 - the prompt itself is never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
+An engine that stops producing output (no PP while reading, no T while decoding) is a stalled request, not a slow
+one: after STRATA_WATCHDOG_S seconds of silence (default 180, 0 disables) the request fails with a finish_reason
+instead of a bare EOF, and the engine is replaced in the background.  Every stream ends with a finish_reason (or an
+Anthropic error event), so clients always see an ordinary provider error rather than a protocol-level stream break.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
 `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
@@ -83,17 +87,36 @@ class StrataEngine:
     """
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None):
+                 env: dict | None = None, watchdog_s: float | None = None):
+        self.exe, self.args = exe, list(args)
+        self.cwd, self.env, self.log_path = cwd, env, log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
-        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        # Silence is a fault, not slowness: a prompt being read prints PP chunk lines and a decoding request prints
+        # a T per token, so minutes of quiet mean the request is stuck.  The server notices within
+        # |watchdog_s| and the engine is replaced, instead of heart-beating while a hung engine blocks everyone.
+        # 0 disables the watchdog; STRATA_WATCHDOG_S overrides the default (anything, not only the CLI).
+        try:
+            self.watchdog_s = float(watchdog_s if watchdog_s is not None
+                                    else os.environ.get("STRATA_WATCHDOG_S", "") or 180.0)
+        except ValueError:
+            self.watchdog_s = 180.0
+        self.restart_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._spawn()
+
+    def _spawn(self):
+        """Start `strata --serve` and read it up to READY.  Safe to call again: a stalled engine is killed and
+        replaced by restart(), so a hung request cannot take the endpoint down for good."""
+        self.proc = subprocess.Popen([self.exe, "--serve", *self.args], cwd=self.cwd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8",
+                                     bufsize=1, env=self.env)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
-            self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+            self.info["version"] = json.loads((Path(self.exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
         for line in self.proc.stdout:
@@ -107,15 +130,45 @@ class StrataEngine:
                 self.can_stop = "stop" in f[2:]
                 break
         if self.max_context <= 0:
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
+            raise RuntimeError("the engine exited before it was ready" +
+                               (f" (see {self.log_path})" if self.log_path else ""))
+        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks).
+        # The process and queue are bound HERE: a restart replaces both, and the old pump must not feed the new
+        # queue from the new process's pipe.
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
+        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
+        self._ready.set()
 
-    def _pump(self):
-        for line in self.proc.stdout:
-            self.lines.put(line)
-        self.lines.put(None)
+    @staticmethod
+    def _pump(proc, lines):
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    def start_restart(self, reason: str):
+        """Replace a stalled engine on its own thread: the request that noticed the stall fails first, and later
+        requests wait (with heart-beats) for the new engine to reach READY."""
+        threading.Thread(target=self.restart, args=(reason,), daemon=True).start()
+
+    def restart(self, reason: str):
+        with self.restart_lock:
+            self._ready.clear()
+            print(f"[strata] restarting the engine: {reason}", flush=True)
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=30)
+            except Exception:
+                pass
+            for stream in (self.proc.stdin, self.proc.stdout):   # close the old pipes (ResourceWarning otherwise)
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                self._spawn()
+                print(f"[strata] the engine is back (context {self.max_context})", flush=True)
+            except Exception as e:
+                print(f"[strata] the engine did NOT come back: {e}", flush=True)
 
     def _parse_done(self, line):
         f = line.split()
@@ -167,12 +220,19 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        # a restart may be in flight (watchdog, engine death): wait with heart-beats instead of failing blind
+        while not self._ready.is_set():
+            if cancel.is_set():
+                return
+            yield None
+            time.sleep(0.5)
         self.progress = None
         head = f"GENI {int(max_new)} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         self.proc.stdin.flush()
         done = False
+        last_output = time.time()
         try:
             while True:
                 try:
@@ -180,8 +240,17 @@ class StrataEngine:
                 except queue.Empty:
                     if cancel.is_set():
                         return
+                    quiet = time.time() - last_output
+                    if self.watchdog_s > 0 and quiet > self.watchdog_s:
+                        # The engine prints a T per decoded token and PP chunks while reading a prompt, so this
+                        # much silence is a stalled request, not a slow one (a hung prefill once sat here for
+                        # hours).  Fail the request cleanly and replace the engine in the background.
+                        self.start_restart(f"no output for {int(quiet)} s during a request")
+                        done = True                  # the engine is being replaced: there is no DONE to drain for
+                        raise TimeoutError(f"the engine stopped responding (no output for {int(quiet)} s)")
                     yield None
                     continue
+                last_output = time.time()
                 if line is None:
                     done = True
                     raise RuntimeError("the engine process ended")
@@ -211,8 +280,16 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                while True:
-                    line = self.lines.get()
+                # BOUNDED: an engine that stalled (the watchdog path) may never answer the STOP, and an unbounded
+                # drain here would pin the service FIFO forever - exactly the failure the watchdog exists to end.
+                deadline = time.time() + 20.0
+                while time.time() < deadline:
+                    try:
+                        line = self.lines.get(timeout=1.0)
+                    except queue.Empty:
+                        if not self.proc.is_alive():
+                            break
+                        continue
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
@@ -563,6 +640,9 @@ class Service:
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise
+        except Exception:                               # an engine fault (ERR line, watchdog, dead process)
+            finish = "error"                            # history must not report a stalled request as "length"
+            raise
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
@@ -886,7 +966,12 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                try:
+                    return self._json(200, openai_collect(chunks))
+                except Exception as e:
+                    print(f"[strata] request failed: {e!r}", flush=True)
+                    return self._json(500, {"error": {"type": "server_error",
+                                                      "message": "server error: " + str(e) + " (transient; retrying is safe)"}})
             self._sse()
             try:
                 for c in chunks:
@@ -896,8 +981,34 @@ def make_handler(svc: Service):
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
+            except (BrokenPipeError, ConnectionResetError):
                 cancel.set()                                 # client went away: stop the engine
+                chunks.close()
+            except Exception as e:                           # NOTE: TimeoutError is an OSError - handled here, not above
+                # An engine fault must still TERMINATE the stream: a bare EOF makes clients report a protocol error
+                # (Pi: "Stream ended without finish_reason") and hides the real cause.  A final chunk with a
+                # finish_reason is an ordinary provider error, and the client's own retry policy applies.
+                # The finish_reason NAME is the contract: pi-ai never reads a chunk's `error` field, it reports
+                # "Provider finish_reason: <name>" - and pi only retries names matching its retryable patterns
+                # (server.?error, timeout, ...) and only runs compact-and-retry when the name matches its
+                # overflow patterns (no room to answer, exceeds the context).  So an engine ERR about context
+                # size must finish as "no room to answer" (-> pi compacts and retries), everything else as
+                # "server_error" (-> pi retries the request itself).
+                cancel.set()
+                which = str(e)
+                reason = ("no room to answer" if ("no room to answer" in which or "exceeds the context" in which)
+                          else "server_error")
+                print(f"[strata] request failed: {e!r}", flush=True)
+                last = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
+                        "created": int(time.time()), "model": svc.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+                        "error": {"type": "server_error", "message": "server error: " + str(e) + " (transient; retrying is safe)"}}
+                try:
+                    self.wfile.write(b"data: " + json.dumps(last, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
                 chunks.close()
 
         def _anthropic(self, req):
@@ -908,7 +1019,12 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                try:
+                    return self._json(200, anthropic_collect(events))
+                except Exception as e:
+                    print(f"[strata] request failed: {e!r}", flush=True)
+                    return self._json(500, {"type": "error", "error": {"type": "server_error",
+                                                                       "message": "server error: " + str(e) + " (transient; retrying is safe)"}})
             self._sse()
             try:
                 for item in events:
@@ -919,8 +1035,20 @@ def make_handler(svc: Service):
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
-            except OSError:
+            except (BrokenPipeError, ConnectionResetError):
                 cancel.set()
+                events.close()
+            except Exception as e:                           # see _openai: terminate, never a bare EOF
+                cancel.set()
+                print(f"[strata] request failed: {e!r}", flush=True)
+                try:
+                    err = {"type": "error", "error": {"type": "server_error",
+                                                      "message": "server error: " + str(e) + " (transient; retrying is safe)"}}
+                    self.wfile.write(b"event: error\ndata: " + json.dumps(err, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
                 events.close()
 
     return Handler
@@ -1042,6 +1170,9 @@ def main() -> int:
                             env=env)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        if engine.watchdog_s > 0:
+            print(f"[strata] engine watchdog: {engine.watchdog_s:.0f} s of silence aborts the request and restarts "
+                  f"the engine (STRATA_WATCHDOG_S=0 disables)", flush=True)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's

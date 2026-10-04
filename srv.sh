@@ -8,6 +8,11 @@ cd "$(dirname "$0")"
 PORT="${2:-8111}"
 CFG="$1"
 SESSION="srv${PORT}"
+# Bind to the Tailscale address (not 0.0.0.0) so the model is reachable from the laptop
+# over the tailnet without being exposed on the LAN. Auth comes from a 0600 key file because
+# this box has no passwordless sudo, so the firewall cannot be used as a second layer.
+TS_IP="${STRATA_HOST:-100.87.70.9}"
+API_KEY="$(cat "$HOME/.config/qwen-serve/api-key" 2>/dev/null || true)"
 
 stop_server() {
   tmux kill-session -t "$SESSION" 2>/dev/null
@@ -23,12 +28,19 @@ if [[ "$1" == "restart" ]]; then stop_server; shift; CFG="$1"; fi
 [[ -f "$CFG" ]] || { echo "no config: $CFG"; exit 1; }
 stop_server
 mkdir -p logs
-tmux new-session -d -s "$SESSION" \
-  "./venv/bin/python serve/server.py --engine strata --config '$CFG' --port '$PORT' 2>&1 | tee -a logs/srv-$(basename '$CFG' .json).log.srv"
+# Resolve the log path here, in bash: a `$(basename '$CFG')` inside the tmux string leaves a literal
+# $CFG that the shell running the command expands to EMPTY (fish), and tee then logs nowhere.
+LOGF="logs/srv-$(basename "$CFG" .json).log.srv"
+# 300 s of engine silence = a stalled request, not a slow one (a 16k prefill chunk runs 60-90 s here,
+# 2x-4x margin); 180 (server default) is one QLC/zram hiccup away from killing a HEALTHY engine and
+# losing every cache. 0 disables.
+WATCHDOG_S="${STRATA_WATCHDOG_S:-300}"
+tmux new-session -d -s "$SESSION" -e STRATA_API_KEY="$API_KEY" -e STRATA_WATCHDOG_S="$WATCHDOG_S" \
+  "./venv/bin/python serve/server.py --engine strata --config '$CFG' --port '$PORT' --host '$TS_IP' 2>&1 | tee -a $LOGF"
 # wait for readiness
 for i in $(seq 1 90); do
   sleep 5
-  if curl -s --max-time 3 "http://127.0.0.1:${PORT}/v1/models" 2>/dev/null | grep -q qwen; then
+  if curl -s --max-time 3 -H "Authorization: Bearer $API_KEY" "http://${TS_IP}:${PORT}/v1/models" 2>/dev/null | grep -q qwen; then
     echo "UP after $((i*5))s on :$PORT with $CFG"
     exit 0
   fi

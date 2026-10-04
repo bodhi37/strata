@@ -1,4 +1,6 @@
-"""serve/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack).
+"""serve/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack), plus
+the resilience paths: every stream ends with a finish_reason (or an error event), a silent engine is aborted by
+the watchdog and replaced, and reasoning_effort reaches the chat template.
 
     python -m unittest serve.test_server -v
 """
@@ -7,6 +9,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -14,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, MockEngine, Service, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, MockEngine, Service, StrataEngine, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -193,6 +198,165 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
         finally:
             self.svc.api_key = ""
+
+
+class RaisingEngine(MockEngine):
+    """Streams a token or two, then fails the way the engine boundary can: an ERR (ValueError) or a fault."""
+
+    def __init__(self, tok, error, after=2):
+        super().__init__(tok, "</think>\n\nthe answer", max_context=CTX)
+        self.error, self.after, self.emitted = error, after, 0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.last_prompt = list(ids)
+        for _ in range(self.after):
+            yield self.script[min(self.emitted, len(self.script) - 1)]
+            self.emitted += 1
+        raise self.error
+
+
+class StreamTerminus(unittest.TestCase):
+    """An engine fault must END the HTTP stream, not truncate it: clients that see a bare EOF report a protocol
+    error (Pi: "Stream ended without finish_reason") and never learn what happened."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+
+    def service_with(self, error):
+        svc = Service(RaisingEngine(self.tok, error), self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    @staticmethod
+    def stream(base, path, body):
+        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode()
+
+    @staticmethod
+    def chunks(text):
+        return [json.loads(line[6:]) for line in text.splitlines()
+                if line.startswith("data: ") and line[6:] != "[DONE]"]
+
+    def test_openai_stream_fault_ends_with_a_finish_reason(self):
+        base = self.service_with(RuntimeError("boom"))
+        text = self.stream(base, "/v1/chat/completions",
+                           {"model": "m", "stream": True, "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+        last = self.chunks(text)[-1]
+        self.assertEqual(last["choices"][0]["finish_reason"], "server_error")
+        self.assertIn("boom", last["error"]["message"])
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_openai_stream_err_line_ends_as_an_overflow(self):
+        # an engine ERR about context size must finish_reason "no room to answer": pi-ai reports
+        # "Provider finish_reason: <name>" and never reads a chunk's `error` field, so the overflow
+        # class has to be encoded in the finish_reason itself for pi's compact-and-retry to fire
+        base = self.service_with(ValueError("prompt (5 tokens) leaves no room to answer in the context (4096)"))
+        text = self.stream(base, "/v1/chat/completions",
+                           {"model": "m", "stream": True, "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+        last = self.chunks(text)[-1]
+        self.assertEqual(last["choices"][0]["finish_reason"], "no room to answer")
+        self.assertIn("no room to answer", last["error"]["message"])
+
+    def test_stream_watchdog_fault_is_retryable_for_pi(self):
+        # the watchdog's TimeoutError must finish_reason "server_error": pi's retryable pattern
+        # `server.?error` matches the reported "Provider finish_reason: server_error" so the client
+        # retries instead of dead-ending
+        base = self.service_with(TimeoutError("the engine stopped responding (no output for 180 s)"))
+        text = self.stream(base, "/v1/chat/completions",
+                           {"model": "m", "stream": True, "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+        last = self.chunks(text)[-1]
+        self.assertEqual(last["choices"][0]["finish_reason"], "server_error")
+        self.assertIn("server error: ", last["error"]["message"])
+        self.assertIn("no output for 180 s", last["error"]["message"])
+
+    def test_anthropic_stream_fault_ends_with_an_error_event(self):
+        base = self.service_with(RuntimeError("boom"))
+        text = self.stream(base, "/v1/messages",
+                           {"model": "m", "stream": True, "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("event: error", text)
+        self.assertIn("event: message_stop", text)
+        self.assertIn("boom", text)
+
+    def test_non_stream_fault_is_a_500_with_the_message(self):
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            with self.subTest(path=path):
+                base = self.service_with(RuntimeError("boom"))
+                body = {"model": "m", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=30)
+                self.assertEqual(cm.exception.code, 500)
+                self.assertIn("boom", json.dumps(json.loads(cm.exception.read())))
+
+
+class Watchdog(unittest.TestCase):
+    """Silence from the engine is a stalled request, not slowness: it is aborted (instead of waiting for hours)
+    and the engine is replaced in the background."""
+
+    def test_silence_aborts_the_request_and_restarts_the_engine(self):
+        d = tempfile.mkdtemp(prefix="strata-watchdog-")
+        exe = Path(d) / "silent-engine"
+        exe.write_text("#!/usr/bin/env python3\n"
+                       "import sys, time\n"
+                       "print('INFO context=4096', flush=True)\n"
+                       "print('READY 4096 stop', flush=True)\n"
+                       "for line in sys.stdin:\n"
+                       "    if line.startswith('QUIT'):\n"
+                       "        break\n"
+                       "    if line.startswith('GEN'):\n"
+                       "        time.sleep(3600)\n")
+        exe.chmod(0o755)
+        eng = StrataEngine(str(exe), [], watchdog_s=1.0)
+        self.addCleanup(eng.close)
+        gen = eng.generate([1, 2, 3], 5, {}, threading.Event())
+        started = time.time()
+        with self.assertRaises(TimeoutError):
+            for _ in range(200):
+                next(gen)
+        self.assertLess(time.time() - started, 40)
+        deadline = time.time() + 15
+        while not eng._ready.is_set() and time.time() < deadline:
+            time.sleep(0.25)
+        self.assertTrue(eng._ready.is_set(), "the engine was not restarted")
+
+
+class ThinkingControl(unittest.TestCase):
+    """reasoning_effort reaches the chat template: none closes the think block, the levels map onto the model's."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ByteTokenizer()
+        cls.engine = RecordingEngine(cls.tok, "</think>\n\nhello", max_context=CTX)
+        cls.svc = Service(cls.engine, cls.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def prompt(self, **extra):
+        body = {"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}], **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+        return self.tok.decode(self.engine.last_prompt)
+
+    def test_none_disables_thinking(self):
+        text = self.prompt(reasoning_effort="none")
+        self.assertNotIn("Reasoning effort is set to xhigh", text)
+        self.assertIn("<think>\n\n</think>", text)
+
+    def test_default_is_the_template_default(self):
+        self.assertIn("Reasoning effort is set to xhigh", self.prompt())
+
+    def test_low_is_passed_through(self):
+        self.assertIn("Reasoning effort is set to low", self.prompt(reasoning_effort="low"))
 
 
 if __name__ == "__main__":
