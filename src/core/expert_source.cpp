@@ -2442,6 +2442,8 @@ uint64_t probe_direct_alignment(int fd, uint64_t file_bytes) {
     std::free(buf);
     if (r != (ssize_t) kProbeLen) return 4096;  // EINVAL or anything else: stay on the strict, safe path
     return 512;
+}
+
 bool hash_sampled_file(const std::filesystem::path& path, uint64_t& h, std::string& err) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -2998,7 +3000,6 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         return true;
 #endif
     }
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds);
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
                                      shared_arena_file, pack_hash);
     if (!a->valid()) {
