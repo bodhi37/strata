@@ -284,33 +284,6 @@ __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vb
     return d * sumi;
 }
 
-// ---- Q5_0 (down projections of IQ3_M layers 0-5): a self-contained WHOLE-32-value-block dot in the
-// style of the engine's q2_0 wrapper (one call per block, ipb=1), not llama.cpp's partial mmvq
-// transcription - the first transcription only covered 16 of the 32 values and parity failed 1.0.
-__device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
-                                                   const int& kbx, const int& iqs) {
-    // ggml q5_0 packing: element p = 0..15 -> LOW nibble of qs[p]; p = 16..31 -> HIGH nibble of qs[p-16]
-    const block_q5_0* b = (const block_q5_0*) vbq + kbx;
-    const uint32_t qh = (uint32_t) b->qh[0] | ((uint32_t) b->qh[1] << 8) |
-                        ((uint32_t) b->qh[2] << 16) | ((uint32_t) b->qh[3] << 24);
-    const int* u8 = (const int*) bq8_1->qs;
-    int sumi = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        int vi = 0;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int p = 4 * j + k;
-            const uint8_t byte = b->qs[p & 15];
-            const int v = (p < 16 ? (byte & 0xF) : (byte >> 4)) | (((int) ((qh >> p) & 1)) << 4);
-            vi |= v << (8 * k);
-        }
-        sumi = ggml_cuda_dp4a(vi, u8[j], sumi);
-    }
-    // each quant value is v - 16; THIS engine's q8_1 ds.y holds the raw float activation sum (d8 * sum(q)):
-    // sum((v-16)*u)*d8 = d8 * sumi - 16 * ds.y
-    return __half2float(b->d) * ((float) sumi * __low2float(bq8_1->ds) - 16.0f * __high2float(bq8_1->ds));
-}
 
 // IQ4_XS: 256 values as 8 sub-blocks of 32 (6-bit scale each); one call covers one sub-block (iqs = 4 * sub-block),
 // and `bq8_1` is the super-block's first q8_1 block, so the call's activation is bq8_1[iqs / 4].  The GSQ-RCO IQ3_S
@@ -1807,7 +1780,6 @@ bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
-        case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
         case 16: return (size_t) (n / 256) * sizeof(block_iq2_xxs);
         case 17: return (size_t) (n / 256) * sizeof(block_iq2_xs);
         case 18: return (size_t) (n / 256) * sizeof(block_iq3_xxs);
