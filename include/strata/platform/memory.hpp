@@ -26,5 +26,24 @@ void unlock_resident(void* p, uint64_t bytes);
 /// R22b: the host's MemAvailable in bytes (Linux /proc/meminfo; 0 when unreadable, e.g. Windows - callers
 /// must treat 0 as "unknown, never trust a regrow on it").
 uint64_t host_available_bytes();
+/// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
+/// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
+/// 8 bytes at `luid` (cudaDeviceProp::luid).  Page-locked host memory the GPU maps is charged there.  False (and
+/// `why` says so) when the query is not possible - always elsewhere than Windows.
+bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
+
+/// The machine's physical RAM in bytes (0 when unknown).
+uint64_t total_physical_memory();
+
+/// #357/#577: whether the OS file cache could keep the `read_bytes` the expert files are read for, beside
+/// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`
+/// bytes of RAM available.  The file tier passes only the expert bytes it really reads from the files (the experts
+/// outside its resident RAM copy) and the RAM that copy really holds - not every shard's bytes and the requested
+/// budget, which on a 96 GB PC (#577) made the file tier read unbuffered when the cache could keep its reads.
+inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read_bytes,
+                             uint64_t margin = 4ull << 30) {
+    const uint64_t room = avail > arena_bytes + margin ? avail - arena_bytes - margin : 0;
+    return room >= read_bytes;
+}
 
 }  // namespace strata::platform

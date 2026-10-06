@@ -86,6 +86,76 @@ __global__ void __launch_bounds__(1024) conv_residual_kernel(const float* histor
     // Exact hidden/result alias is safe: each thread owns one element.
     result[c] = __fadd_rn(hidden[c], __fadd_rn(gated[c], activation));
 }
+// ---- the batch: T tokens, the same arithmetic per element as the kernels above
+// weighted_rms_norm (native_gr_norm.cu) with the gamma row repeating every H rows (one token's H groups)
+__device__ float norm_warp_sum(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffu, value, offset, 32);
+    return value;
+}
+__global__ void rms_rep_kernel(const float* __restrict__ input, const float* __restrict__ gamma,
+                               float* __restrict__ output) {
+    constexpr int BlockSize = 1024;             // native_gr_rms_norm_weighted's choice for 2560 columns
+    const int tid = threadIdx.x;
+    const size_t row_offset = size_t(blockIdx.x) * N;
+    input += row_offset;
+    output += row_offset;
+    gamma += size_t(blockIdx.x % H) * N;
+    float partial = 0.0f;
+    for (int col = tid; col < N; col += BlockSize) {
+        const float value = input[col];
+        partial += value * value;
+    }
+    __shared__ float sums[32];
+    partial = norm_warp_sum(partial);
+    const int lane = tid % 32;
+    if (lane == 0) sums[tid / 32] = partial;
+    __syncthreads();
+    partial = 0.0f;
+    if (lane < BlockSize / 32) partial = sums[lane];
+    partial = norm_warp_sum(partial);
+    const float mean = partial / N;
+    const float scale = rsqrtf(mean + NG_RMS_EPS);
+    for (int col = tid; col < N; col += BlockSize) output[col] = scale * input[col] * gamma[col];
+}
+__global__ void broadcast_batch_kernel(const float* value, const float* gate, float* gated, int T) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(T) * D) return;
+    const size_t t = i / D, d = i % D;
+    gated[i] = __fmul_rn(value[t * N + d % N], gate[t * H + d / N]);
+}
+// the dilated conv (taps 9, 6, 3 tokens back and this one) and the residual; a tap before the chunk reads the history
+__global__ void conv_residual_batch_kernel(const float* history, const float* normalized, const uint16_t* weights,
+                                           float* hidden, const float* gated, int T) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(T) * D) return;
+    const int t = int(i / D), c = int(i % D);
+    float sum = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int p = t - 9 + 3 * k;             // the token this tap reads (k == 3: this one)
+        const float x = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (9 + p)];
+        const float wk = __half2float(__ushort_as_half(weights[c * 4 + k]));
+        const float term = __fmul_rn(x, wk);
+        sum = k == 0 ? term : __fadd_rn(sum, term);
+    }
+    const float activation = sum / (1.0f + expf(-sum));
+    hidden[i] = __fadd_rn(hidden[i], __fadd_rn(gated[i], activation));
+}
+// the history after the chunk: the last nine normalized rows (older ones from the history when T < 9)
+__global__ void history_batch_kernel(float* history, const float* normalized, int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= D) return;
+    float h[HISTORY];
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) {
+        const int p = T - HISTORY + r;
+        h[r] = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (T + r)];
+    }
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
+}
+
 struct Span { const void* p; size_t bytes; size_t alignment; };
 bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
@@ -129,6 +199,23 @@ void native_ple_postops(const float* projected_key, const float* hidden,
     launch_check();
     native_gr_rms_norm_weighted(b.gated,w.norm_conv,b.normalized,N,H,NG_RMS_EPS,stream);
     conv_residual_kernel<<<D/256,256,0,st>>>(history,b.normalized,w.conv1d_f16,hidden,b.gated,b.conv,b.result);
+    launch_check();
+}
+
+void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                              float* query_norm, float* gated, float* gate, int T, void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate)
+        throw std::invalid_argument("native PLE postops batch: null input or empty batch");
+    auto st = static_cast<cudaStream_t>(stream);
+    const unsigned rows = unsigned(T) * H;
+    const unsigned blocks = unsigned((size_t(T) * D + 255) / 256);
+    rms_rep_kernel<<<rows, 1024, 0, st>>>(key, w.norm_key, key);
+    rms_rep_kernel<<<rows, 1024, 0, st>>>(hidden, w.norm_query, query_norm);
+    gate_kernel<<<rows, 512, 0, st>>>(key, query_norm, gate, 1.0f / std::sqrt(float(N)));
+    broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
+    rms_rep_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm);
+    conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T);
+    history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T);
     launch_check();
 }
 } // namespace strata::kernels

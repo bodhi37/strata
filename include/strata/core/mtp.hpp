@@ -21,6 +21,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -53,6 +54,9 @@ public:
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
+    /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
+    /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
@@ -70,30 +74,71 @@ public:
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
+    /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
+    /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
+    /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
+    /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
+    void set_draft_sampling(const strata::kernels::SamplerParams& sp);
+    /// Coupled mode with penalties: the history the next draft() chain starts from - what the session holds after the
+    /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
+    void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
+    void set_ple_session(SessionState* s) { ple_ss_ = s; }
+    bool coupled() const { return coupled_active_; }
+
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
+
+    /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
+    /// state, the first cell a round can still read, its device, and a wait for its own stream.
+    const float* tensor_f32(const char* name) const { return f32(name); }
+    const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
+    const void* tensor_q8(const char* name) const { return q8(name); }
+    QsaState& kv_state_rw() { return st_; }
+    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    int device() const { return device_; }
+    bool idle(std::string& err) {
+        if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
+        return true;
+    }
 
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
-    bool capture_round(int T, std::string& err);
-    bool capture_step(int j, std::string& err);
+    bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
+    bool capture_round(int T, bool coupled, std::string& err);
+    bool capture_step(int j, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
+    // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
+    // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
+    bool setup_coupled(std::string& err);
+    cudaGraphExec_t round_exec_c_[9] = {};
+    cudaGraphExec_t step_exec_c_[9] = {};
+    bool coupled_ok_ = false, coupled_active_ = false;
+    bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
+    int coupled_j_ = 0;
+    strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
+    int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
+    void* cscratch_ = nullptr;
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
+    SessionState* ple_ss_ = nullptr;
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0;
+    int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
+    cudaGraphExec_t prefill_dev_exec_[9] = {};
+    int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
+    int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaGraphExec_t round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };

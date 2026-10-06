@@ -14,15 +14,25 @@
 // THE COMPLETION PROTOCOL, because this is where a pool usually goes wrong.  `run()` waits for `done == n`
 // AND for every worker to PARK.  Waiting only for `done` is not enough: a worker can still be inside the
 // drain loop after its last `done` increment, and the host resetting `head` underneath it would let that
-// worker claim a job from the NEXT batch before the next batch has been published.  The
-// `done`-then-`parked` pair makes the handover unambiguous, and the second wait costs a few hundred cycles
-// against a layer that takes milliseconds.
+// worker claim a job from the NEXT batch before the next batch has been published.
+//
+// **AND `parked` IS NOT ENOUGH EITHER (issue #29).**  A worker that went to sleep (after `kSpinBeforeSleep`) is
+// still counted as parked when it wakes, so for a moment after it has seen a new epoch the host believes it is
+// idle.  On a card with most experts in VRAM the workers sleep in the middle of a request, tiny batches finish
+// before a sleeper is awake, and that moment comes round constantly: a late worker could claim from the NEXT
+// batch while the host was still writing it, run a job twice, or add to `done` after the host had reset it -
+// and `done != n` then never ended, with the GPU waiting on the pool forever.  So every claim carries its
+// batch: `head` is one 64-bit word `epoch | njobs | index`, a claim is a CAS that only succeeds for the epoch
+// the worker woke for, and a late worker's claim simply fails.  A claim that succeeds belongs to the current
+// batch, whose description the host cannot change until that job's `done` has landed.
 #pragma once
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <atomic>
+#include <cstdio>
+#include <memory>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -53,13 +63,32 @@ struct ExpertJobMulti {
     const void* nact[MAXT] = {};
 };
 
+/// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
+/// always used and the default; the hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
+enum class PoolAffinity {
+    Auto,      ///< Hybrid: prioritize physical P-cores, then SMT, then E-cores (defaults to P-core count)
+    PCores,    ///< Restrict workers strictly to Performance cores and their SMT siblings
+    All,       ///< The default: one worker per physical core in the OS's order, without hybrid distinction
+};
+
+struct CpuTopology {
+    bool is_hybrid = false;
+    int p_cores = 0;                ///< Physical performance cores
+    int p_threads = 0;              ///< Total logical threads on performance cores
+    int e_cores = 0;                ///< Efficient cores
+    std::vector<int> worker_cores;  ///< Ordered CPU IDs; on Windows, group * 64 + processor within the group
+    int host_core = -1;             ///< Logical core reserved for host thread
+};
+
+CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
+
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
 /// worker.  On the 6-core/12-thread machine this project measures on, `hardware_concurrency()/2` workers on
 /// logical processors 0..5 would put every worker on a sibling pair and halve the useful bandwidth - which is
 /// exactly the kind of error that shows up as "the CPU path is slower than the model says" with no clue why.
 ///
 /// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
-std::vector<int> physical_cores(bool skip_first);
+std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
@@ -71,9 +100,23 @@ std::vector<int> physical_cores(bool skip_first);
 /// - exactly 5/6 of L9's 44.14 on 6 - and at **26.9 GB/s inside the host loop**, where the unpinned spinning
 /// host is free to land on a worker's core or its SMT sibling.  That 1.35x is not the kernel.
 ///
-/// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
-long long pin_current_thread(int core);
-void restore_thread_affinity(long long previous);
+/// The previous host placement. `valid` is false when querying or setting placement failed.
+/// Windows uses a reversible CPU Set selection, leaving hard affinity (including Windows 11's implicit
+/// all-group eligibility) untouched. An empty selection restores inheritance from the process defaults.
+/// Linux stores the complete, dynamically sized native CPU mask, including CPU IDs above 63.
+struct ThreadAffinity {
+#if defined(_WIN32)
+    std::vector<unsigned long> cpu_sets;
+#else
+    std::vector<unsigned long> mask;
+#endif
+    bool valid = false;
+};
+
+/// Selects one encoded processor for the caller; Windows CPU Sets respect existing hard-affinity limits.
+/// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
+ThreadAffinity pin_current_thread(int core);
+void restore_thread_affinity(const ThreadAffinity& previous);
 
 class ExpertPool {
 public:
@@ -91,7 +134,10 @@ public:
     /// With `host_works`, `run()` claims jobs itself instead of spinning on `done_`, and the pool is six
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true);
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
+                        PoolAffinity affinity = PoolAffinity::All);
+    /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
+    void diag(std::FILE* f) const;
     ~ExpertPool();
     ExpertPool(const ExpertPool&) = delete;
     ExpertPool& operator=(const ExpertPool&) = delete;
@@ -100,6 +146,12 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+
+    bool is_hybrid() const { return topo_.is_hybrid; }
+    int p_cores() const { return topo_.p_cores; }
+    int p_threads() const { return topo_.p_threads; }
+    int e_cores() const { return topo_.e_cores; }
+    PoolAffinity affinity() const { return affinity_; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -139,10 +191,31 @@ public:
         repark = ms_repark_;
     }
 
+    /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's
+    /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends
+    /// keeps every worker's core at 100% while the engine waits for a request - issue #4, "CPU 50% even when
+    /// doing nothing" (7 of the 5700X's 16 threads).  Between requests the workers block on `sleep_cv_`.  NOT only
+    /// between requests: with most experts in VRAM (a 24 GB card) many layers have no CPU work, so the workers
+    /// also sleep mid-request - which the claim protocol above must survive (issue #29).
+    /// `STRATA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).
+    static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
+    /// spinning forever, and the server starts it again (issue #29).
+    static constexpr std::chrono::seconds kStall{60};
+
 private:
     void worker(int id);
-    void drain(int id, ExpertScratch& scratch);
+    void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
+    int claim(uint32_t epoch);
+    /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
+    uint32_t begin_batch(int n);
+    /// The host's waits, bounded by `kStall`.
+    void wait_parked(const char* what);
+    void wait_done(int n);
+    /// Bump `epoch_`, and wake the workers that went to sleep.  Every publish goes through here.
+    void publish();
 
     int n_ = 0;
     bool host_works_ = true;
@@ -167,31 +240,29 @@ private:
     //
     // The counter was diagnostic only - `pauses()` was read in one place, to print a number nothing branched on
     // - so it is deleted rather than amortised.  `alignas(64)` then stops the remaining four sharing.
-    alignas(64) std::atomic<uint32_t> head_{0};
+    // issue #31 diagnostics: each worker's state (kParked, kSleeping, kBetween, or the job it runs) and the host's
+    // (kIdle, kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
+    static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
+                             kWaitDone = -12;
+    std::unique_ptr<std::atomic<int32_t>[]> wstate_;
+    std::atomic<int32_t> hstate_{kIdle};
+    std::atomic<int64_t> hstate_ms_{0};
+    alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)
     alignas(64) std::atomic<uint32_t> done_{0};
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
-    // R9a: the park is a HYBRID.  The pure `_mm_pause` spin measured 100% of every worker's CPU on a 24-thread
-    // box (perf: ExpertPool::worker = every sample) - 12-16 cores busy-waiting through the GPU's attention
-    // phases, the ring waits and the MTP draft, starving the reader threads' futex wakeups and the desktop.
-    // Each worker now spins briefly (kParkSpin pauses, ~150 us - the phases inside one layer are that close)
-    // and then blocks on the condvar.  `parked_` semantics are unchanged: it counts a worker from the moment
-    // it enters the wait (spin or blocked) until it observes a new epoch, so the publisher barrier holds.
-    std::mutex park_mu_;
-    std::condition_variable park_cv_;
-    // R10: the park spin is TUNABLE at runtime (STRATA_PARK_SPIN_US, microseconds, default 2500).  The R9a
-    // fixed 150 us was sized for the 6-core upstream box whose intra-layer phases sit ~150 us apart; on the
-    // 9900X a decode window's phases are ~0.5-2.5 ms apart, so every worker BLOCKED between phases and each
-    // publish paid a staggered futex wake while the first workers to wake ate the whole task queue - the
-    // drain ran at a fraction of its threads' capacity (measured 13.5 GB/s aggregate vs a 6.2 GB/s
-    // single-thread kernel rate on 17 claimants).  A spin that covers the intra-window gaps keeps workers
-    // hot through a window; they still block between requests.  The futex-starvation concern that motivated
-    // the block (ring readers, desktop) is bounded by leaving 8 SMT siblings unclaimed by the pool.
+    // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
+    // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
+    alignas(64) std::atomic<uint32_t> sleepers_{0};
+    std::mutex sleep_mu_;
+    std::condition_variable sleep_cv_;
+    std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    // R10 (custom, re-applied on the sleepers_ mechanism): runtime-tunable spin (STRATA_PARK_SPIN_US, default
+    // 2500) and tasks/thread (STRATA_POOL_TASKS, default 3).  Wire pool.cpp to init spin_before_sleep_ from
+    // park_spin_iters() rather than using park_mu_/park_cv_ (deleted).
     int park_spin_iters_();   // pause-iteration cap per park; ~143 pauses/us on Zen 5
     static int park_spin_iters();   // cached env read, thread-safe via function-local static
-    // R10: tasks per thread per phase (STRATA_POOL_TASKS, default 3).  51 tiny tasks per layer-phase was
-    // granularity-starved against wake jitter; with a hot spin 2-3 per thread balances tails well.
     static int tasks_per_thread();
     std::thread::id host_thread_{};   // R9a: diagnostics
     std::vector<std::thread> threads_;
@@ -215,6 +286,8 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    PoolAffinity affinity_ = PoolAffinity::All;
+    CpuTopology topo_;
 };
 
 }  // namespace strata::kernels::cpu

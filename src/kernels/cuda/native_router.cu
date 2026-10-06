@@ -58,6 +58,8 @@ __global__ void __launch_bounds__(1024) route(const float* __restrict__ logits, 
     }
     __syncthreads();
     // Preserve the pinned 32x8 block geometry; only row zero is active here.
+    // blockIdx.x = the token (a multi-token launch; 0 for the single one)
+    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
     if (threadIdx.y != 0) return;
     const int lane = threadIdx.x;
     float values[16];
@@ -125,6 +127,14 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
     route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
+    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+        !valid(weights, (size_t) n_tok * 10 * 4))
+        throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
+    route<<<(unsigned) n_tok, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

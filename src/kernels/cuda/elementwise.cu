@@ -1,5 +1,6 @@
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -202,14 +203,18 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// the write was not ordered into host-visible memory, so no amount of reading it would show it, and the driver
 /// call was flushing the whole pipeline enough to make it appear.  A 10-22 us driver call per iteration is a
 /// very expensive substitute for one fence instruction.
+///
+/// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  On RDNA4 (gfx1201) a plain store to mapped pinned
+/// memory stays in the GPU's L2 until the stream is synchronized - the host never saw the ring (tests/hip/handoff:
+/// 0 of 100 rings seen without a sync; volatile, a system-scope atomic store or a fence after the store: 100 of 100).
 __global__ void __launch_bounds__(1024) doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
-    *seq = *seq + 1u;
+    *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
 }
 
 __global__ void __launch_bounds__(1024) doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
-    while (*flag != want) __nanosleep(100);
+    while (*flag != want) strata_spin_pause();
     __threadfence_system();
 }
 
@@ -226,6 +231,54 @@ __global__ void __launch_bounds__(1024) copy_from_mapped_kernel(float4* __restri
     }
 }
 
+// the CPU rows of a verify window, skipping the rows the GPU plan computes itself (the
+// pool writes +0.0 into those, so this writes +0.0 too): block = row, the plan's hit rows `dst[0, *count)`.
+__global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t row4,
+                                             const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count) {
+    const int row = blockIdx.x;
+    __shared__ int hit;
+    if (threadIdx.x == 0) {
+        int h = 0;
+        const int c = *count;
+        for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        hit = h;
+    }
+    __syncthreads();
+    float4* d = dst + (int64_t) row * row4;
+    if (hit) {
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        const volatile float4* sr = src + (int64_t) row * row4;
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
+    }
+}
+namespace {
+__global__ void scatter_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* __restrict__ rows,
+                                    int64_t w4) {
+    const int64_t r = blockIdx.x;
+    const float4* s = src + r * w4;
+    float4* d = dst + (int64_t) rows[r] * w4;
+    for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
+}
+}  // namespace
+void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "scatter_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
+}
+void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
+                           const int32_t* count, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
+                                                                                  width / 4, hit_rows, count);
+}
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
@@ -242,13 +295,60 @@ __global__ void __launch_bounds__(1024) doorbell_publish_kernel(const float* __r
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    if ((int) threadIdx.x < k) {
+        ids_out[threadIdx.x] = ids[threadIdx.x];
+        if (w_out != nullptr) w_out[threadIdx.x] = w[threadIdx.x];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+    }
+}
+
+__global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                            const int32_t* __restrict__ d_res, int n_expert, int n, int k,
+                                            float* x_out, int32_t* ids_out, uint32_t* seq) {
+    int any_miss = 0;
+    if ((int) threadIdx.x < k) {
+        const int32_t id = ids[threadIdx.x];
+        ids_out[threadIdx.x] = id;
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+    }
+    if (__syncthreads_or(any_miss)) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+        __threadfence_system();
+    } else if ((int) threadIdx.x < k) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+    }
+}
+
+// #649 (HIP, STRATA_DOORBELL_STORE=1): the same publish, but the ring is STORED (the step's own number, known at
+// capture) instead of read-modify-written over PCIe - one store, no read of host memory from the GPU.
+__global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                              const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
+                                              float* w_out, uint32_t* seq, uint32_t value) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
     if ((int) threadIdx.x < k) { ids_out[threadIdx.x] = ids[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
-        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        *(volatile uint32_t*) seq = value;
+        __threadfence_system();
     }
+}
+
+void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
+                            float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
+                            void* stream) {
+    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    doorbell_publish_value_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out,
+                                                                          ids_out, weights_out, d_seq, value);
 }
 
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
@@ -257,6 +357,14 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     doorbell_publish_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
                                                                     weights_out, d_seq);
     check_launch("doorbell_publish");
+}
+
+void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+    if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
+    doorbell_publish_res_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, d_res, n_expert, (int) n, (int) k,
+                                                                        x_out, ids_out, d_seq);
+    check_launch("doorbell_publish_res");
 }
 
 __global__ void __launch_bounds__(1024) copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {

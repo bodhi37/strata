@@ -209,6 +209,14 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::fprintf(stderr, "kv_stream: a block's scale run must be a multiple of 16 bytes\n");
         std::exit(1);
     }
+    // one sweep step looks at RT consecutive slots `(hand + thread) % n_slots`; with fewer slots than RT two
+    // threads see the same slot and may both take it for two different misses.  The engine never streams with fewer
+    // than qsa_kv_resident_min() / page_size = 5,120 slots, so this is a guard, not a limit.
+    if (m.n_slots < RT) {
+        std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
+                             "slot twice\n", (long long) m.n_slots, RT);
+        std::exit(1);
+    }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
     copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
@@ -241,6 +249,16 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
         if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
                             (cudaStream_t) stream) != cudaSuccess)
             check("stage");
+}
+
+void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
+                        const QsaShapes& s, void* stream) {
+    if (b1 <= b0) return;
+    const Runs r = runs_of(stage, host, fmt, s);   // src: the host copy, dst: the staging pool (identity layout both)
+    for (int a = 0; a < r.n; ++a)
+        if (cudaMemcpyAsync((void*) (r.src[a] + b0 * r.len[a]), r.dst[a] + b0 * r.len[a], (size_t) ((b1 - b0) * r.len[a]),
+                            cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
+            check("unstage");
 }
 
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {

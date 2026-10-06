@@ -27,4 +27,12 @@ void native_ple_postops(const float* projected_key, const float* hidden,
                         const PleWeights& weights, const NativePlePostopsBuffers& buffers,
                         void* stream);
 
+/// The prompt path: T tokens at once, element for element the arithmetic of T calls of native_ple_postops with
+/// the history advanced after each.  `key` (T x 10240) holds the projected keys and is normalized in place;
+/// `hidden` (T x 10240) becomes the result; `value` T x 2560; `query_norm` (T x 10240, the normalized hidden, then
+/// the normalized gated values), `gated` (T x 10240) and `gate` (T x 4) are scratch; `history` (9 rows per
+/// channel) is advanced past the T tokens.
+void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                              float* query_norm, float* gated, float* gate, int T, void* stream);
+
 } // namespace strata::kernels
