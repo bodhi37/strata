@@ -2374,7 +2374,9 @@ bool pread_full(int fd, void* dst, size_t n, off_t off) {
         const ssize_t r = ::pread(fd, p + done, n - done, off + (off_t) done);
         if (r <= 0) return false;
         done += (size_t) r;
-namespace {
+    }
+    return true;
+}
 
 void hash_u64(uint64_t& h, uint64_t v) {
     h = fnv1a64((const uint8_t*) &v, sizeof v, h);
