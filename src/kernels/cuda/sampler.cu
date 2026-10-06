@@ -301,7 +301,8 @@ __global__ void __launch_bounds__(kAmThreads) sampler_greedy_cluster_kernel(cons
 /// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
 /// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
 /// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
-__global__ void __launch_bounds__(1024) sampler_kernel                               const int* __restrict__ history, int history_len, const SamplerParams p,
+__global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
+                               const int* __restrict__ history, int history_len, const SamplerParams p,
                                int* __restrict__ out) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
