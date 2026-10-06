@@ -64,8 +64,7 @@ __device__ __forceinline__ float f16_at(const uint8_t* p) {
 __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes,
                                                const uint8_t* __restrict__ scales,
                                                const uint8_t* __restrict__ x_q8_0, int n_chunks, int lane,
-                                               const float* __restrict__ x_scales = nullptr,
-                                               const int* __restrict__ hx_row = nullptr) {
+                                               const float* __restrict__ x_scales = nullptr) {
     float acc = 0.0f;
     for (int c = lane; c < n_chunks; c += 32) {
         const uint8_t* cb = codes + (size_t) c * 8;             // 8 code bytes = 32 elements
@@ -79,11 +78,7 @@ __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes
         // operands as packed int8, so each code byte becomes a word whose four bytes are its four 2-bit
         // fields - which is exactly `(c & 3) | ((c>>2)&3)<<8 | ((c>>4)&3)<<16 | ((c>>6)&3)<<24`.
         int s = 0;      // sum of code * x
-        // `hx` - the sum of x - does not depend on the weight ROW at all, so a caller that puts one hit's rows
-        // in one block computes it ONCE into shared and hands it here as `hx_row`.  Left inline it runs once
-        // per row too: with 2*FF = 1280 gate/up rows per hit, this one term is HALF the `dp4a` the kernel
-        // issues, for a value identical in all 1280 of them.
-        int hx = hx_row != nullptr ? hx_row[c] : 0;
+        int hx = 0;     // sum of x        - the weight-independent term, as ones * x
         const int ones = 0x01010101;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -98,7 +93,7 @@ __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes
             int xw;
             memcpy(&xw, xq + 4 * j, 4);
             s = STRATA_DP4A(cw, xw, s);
-            if (hx_row == nullptr) hx = STRATA_DP4A(ones, xw, hx);
+            hx = STRATA_DP4A(ones, xw, hx);
         }
         // One weight scale per 64 elements, so per TWO 32-element chunks.
         const float dw = f16_at(scales + (size_t) (c >> 1) * 2);
@@ -106,25 +101,6 @@ __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes
     }
     return acc;
 }
-
-/// The `hx` of every chunk of ONE activation row, in the same `dp4a` chain and the same `j` order as the inline
-/// form above, so the integer is identical bit for bit.  `x_q8_0` is that row, `n_chunks` its block count.
-__device__ __forceinline__ void hx_row_shared(const uint8_t* __restrict__ x_q8_0, int n_chunks,
-                                              int* __restrict__ sh, int tid) {
-    const int ones = 0x01010101;
-    for (int c = tid; c < n_chunks; c += (int) blockDim.x) {
-        const int8_t* q = (const int8_t*) (x_q8_0 + (size_t) c * 34 + 2);
-        int sum = 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            int xw;
-            memcpy(&xw, q + 4 * j, 4);
-            sum = __dp4a(ones, xw, sum);
-        }
-        sh[c] = sum;
-    }
-}
-
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -142,41 +118,29 @@ __device__ __forceinline__ float warp_sum(float v) {
 /// finite, plausible numbers.  `moe_hit_parity` caught it on the first run, at worst relative error 2.2e+03.
 ///
 /// So slot `i` is DECODED from row-slot `i` and WRITTEN to the output slot its parity says it belongs to.
-__global__ void __launch_bounds__(1024) gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
+__global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                           long long blob_bytes, const uint8_t* __restrict__ x_q8_0,
                           const float* __restrict__ x_scales, float* __restrict__ gate_up, int n_hits,
                           const int32_t* __restrict__ d_count = nullptr,
                           const int32_t* __restrict__ dst_index = nullptr, int tok_div = 0) {
     const int warps_per_block = (int) (blockDim.x >> 5);
+    const long long slot = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
     const long long rows_per_hit = 2LL * FF;
     const long long total = (long long) n_hits * rows_per_hit;
-    // **`rows_per_hit` IS AN EXACT MULTIPLE OF `warps_per_block`** (2*FF = 1280 = 160 * 8), which buys two things:
-    // a block is never split across the end of the grid (so a dead block can bail before the barrier), and every
-    // warp of a live block works on the SAME hit - hence the SAME activation row, hence ONE `hx` per block.
-    if ((long long) blockIdx.x * warps_per_block >= total) return;
-    __shared__ int s_hx[H / 32];
-    const long long slot = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+    if (slot >= total) return;
     const int h = (int) (slot / rows_per_hit);
+    if (d_count != nullptr && h >= *d_count) return;     // token graph: capacity layout, device count
     const int i = (int) (slot % rows_per_hit);
     const int lane = threadIdx.x & 31;
 
     const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
-    const uint8_t* xr = x_q8_0;
-    const float* xsc = x_scales;
     if (tok_div > 0) {   // plan v0.3 P6 verify window: each hit reads its own token's activation
         const int tok = dst_index[h] / tok_div;
-        xr += (size_t) tok * (size_t) (H / 32) * 34;
-        if (xsc != nullptr) xsc += (size_t) tok * (size_t) (H / 32);
+        x_q8_0 += (size_t) tok * (size_t) (H / 32) * 34;
+        if (x_scales != nullptr) x_scales += (size_t) tok * (size_t) (H / 32);
     }
-    // `hx` is the sum of the ACTIVATION, so it is the same for all 1280 rows of the hit.  Computed once here
-    // instead of inside `row_dot_s2_q8`'s chunk loop, where it cost one extra `dp4a` per `dp4a` - and this
-    // kernel is launched with `n_hits * 1280` rows, so that was half of every `dp4a` issued.
-    hx_row_shared(xr, H / 32, s_hx, (int) threadIdx.x);
-    __syncthreads();
-    if (d_count != nullptr && h >= *d_count) return;     // token graph: capacity layout, device count
     const float acc = row_dot_s2_q8(blob + (size_t) i * ROW_GU,
-                                    blob + O_GU_SCALES + (size_t) i * SC_GU * 2, xr, H / 32, lane, xsc, s_hx);
-
+                                    blob + O_GU_SCALES + (size_t) i * SC_GU * 2, x_q8_0, H / 32, lane, x_scales);
     const float s = warp_sum(acc);
     if (lane != 0) return;
     // ---- THE OUTPUT LAYOUT IS GATE-MAJOR, AND THAT IS NOT COSMETIC.
@@ -199,7 +163,7 @@ __global__ void __launch_bounds__(1024) gu_kernel(const uint8_t* __restrict__ bl
 ///
 /// SiLU on the GATE and multiplied by up - the reading `docs/semantics.md` records, and the one that is wrong
 /// the other way round in a way that still produces a finite number.
-__global__ void __launch_bounds__(1024) swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
+__global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_pairs) return;
     const float g = gate_up[i];
@@ -211,30 +175,24 @@ __global__ void __launch_bounds__(1024) swiglu_kernel(float* __restrict__ gate_u
 ///
 /// `dst_index[h]` is which row of the shared output buffer hit `h` fills - see the header.  It is the router's
 /// slot, not `h`, and the two differ on every layer where some experts are resident and some are not.
-__global__ void __launch_bounds__(1024) down_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
+__global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                             const int32_t* __restrict__ dst_index, long long blob_bytes,
                             const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
                             float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count = nullptr) {
     const int warps_per_block = (int) (blockDim.x >> 5);
-    // Same argument as `gu_kernel`: H = 2560 = 320 * 8, so a block covers one hit's rows and never straddles the
-    // end of the grid, and its activation row - `h_q8_0`'s row `h` - is shared by all eight of its warps.
-    const long long total = (long long) n_hits * H;
-    if ((long long) blockIdx.x * warps_per_block >= total) return;
-    __shared__ int s_hx[FF / 32];
     const long long row = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+    const long long total = (long long) n_hits * H;
+    if (row >= total) return;
     const int h = (int) (row / H);
+    if (d_count != nullptr && h >= *d_count) return;
     const int r = (int) (row % H);
     const int lane = threadIdx.x & 31;
 
     const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
     const uint8_t* xb = h_q8_0 + (size_t) h * (size_t) (FF / 32) * 34;
-    hx_row_shared(xb, FF / 32, s_hx, (int) threadIdx.x);
-    __syncthreads();
-    if (d_count != nullptr && h >= *d_count) return;
     const float acc = row_dot_s2_q8(blob + O_D_CODES + (size_t) r * ROW_D,
                                     blob + O_D_SCALES + (size_t) r * SC_D * 2, xb, FF / 32, lane,
-                                    h_scales ? h_scales + (size_t) h * (size_t) (FF / 32) : nullptr, s_hx);
-
+                                    h_scales ? h_scales + (size_t) h * (size_t) (FF / 32) : nullptr);
     const float s = warp_sum(acc);
     if (lane == 0) out[(size_t) dst_index[h] * H + r] = s;
 }
@@ -407,7 +365,7 @@ __global__ void down_pair_kernel(const uint8_t* __restrict__ blob_base, const in
 
 // The CPU subtracts the weight bias after its eight FMA accumulators have been reduced. Moving the
 // subtraction into each integer dot, as the legacy kernel does, changes rounding even with equal scales.
-__global__ void __launch_bounds__(1024) activation_correction_kernel(const uint8_t* q8, const float* scales, float* hx, int chunks) {
+__global__ void activation_correction_kernel(const uint8_t* q8, const float* scales, float* hx, int chunks) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= chunks) return;
     const int8_t* q = (const int8_t*) (q8 + (size_t) c * 34 + 2);
@@ -451,7 +409,7 @@ __device__ __forceinline__ float row_dot_cpu_order(const uint8_t* codes, const u
 }
 
 template <bool DOWN>
-__global__ void __launch_bounds__(1024) cpu_order_projection_kernel(const uint8_t* blob_base, const int32_t* slots,
+__global__ void cpu_order_projection_kernel(const uint8_t* blob_base, const int32_t* slots,
                                               const int32_t* destinations, long long blob_bytes,
                                               const uint8_t* xq, const float* xs, const float* hx,
                                               float* out, int n_hits) {
@@ -474,7 +432,7 @@ __global__ void __launch_bounds__(1024) cpu_order_projection_kernel(const uint8_
     else out[((r & 1) ? (size_t) n_hits * FF : 0) + (size_t) h * FF + (r >> 1)] = value;
 }
 
-__global__ void __launch_bounds__(1024) cpu_order_swiglu_kernel(float* gu, int pairs) {
+__global__ void cpu_order_swiglu_kernel(float* gu, int pairs) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= pairs) return;
     const float g = gu[i];
@@ -484,7 +442,7 @@ __global__ void __launch_bounds__(1024) cpu_order_swiglu_kernel(float* gu, int p
     gu[i] = __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, eg)), gu[pairs + i]);
 }
 
-__global__ void __launch_bounds__(1024) cpu_order_quantize_kernel(const float* x, uint8_t* blocks, float* scales,
+__global__ void cpu_order_quantize_kernel(const float* x, uint8_t* blocks, float* scales,
                                            float* hx, int chunks) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= chunks) return;
@@ -662,7 +620,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
 namespace {
 // Plan v0.3 P4 token graph: which of this layer's routed experts are resident, decided ON THE DEVICE from the
 // static residency row, so no host step sits between the ring and the hit kernels.  One warp; k <= 32.
-__global__ void __launch_bounds__(1024) hit_select_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int k,
+__global__ void hit_select_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int k,
                                   int n_expert, int32_t* __restrict__ slot, int32_t* __restrict__ dst,
                                   int32_t* __restrict__ count) {
     const int lane = threadIdx.x;
@@ -682,7 +640,7 @@ __global__ void __launch_bounds__(1024) hit_select_kernel(const int32_t* __restr
 
 // Plan v0.3 P6: the same for up to 128 routed entries (a verify window of T tokens x k): four warps, ballots
 // compacted in entry order.
-__global__ void __launch_bounds__(1024) hit_select_multi_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int n,
+__global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int n,
                                         int n_expert, int32_t* __restrict__ slot, int32_t* __restrict__ dst,
                                         int32_t* __restrict__ count) {
     __shared__ int warp_count[4];
@@ -705,7 +663,7 @@ __global__ void __launch_bounds__(1024) hit_select_multi_kernel(const int32_t* _
     if (i == 0) *count = warp_count[0] + warp_count[1] + warp_count[2] + warp_count[3];
 }
 
-__global__ void __launch_bounds__(1024) add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
+__global__ void add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
                                 const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
     const int h = blockIdx.y;
     if (h >= *count) return;
@@ -804,23 +762,20 @@ constexpr int D_ROWS = 64;                       // down rows per block: 8 per w
 
 // One activation chunk's contribution, `row_dot_s2_q8`'s inner body with the 32 int8 of the chunk already in
 // aligned words: same dp4a sequence, same float expression, so the result is bitwise the per-entry kernel's.
-//
-// `hx` - the sum of the activation chunk - does not depend on the weight row, so the callers hoisted it out to
-// shared (see `xs_hx`/`hs_hx`) and hand it in.  Left inline it was one `dp4a` of every two, recomputed once per
-// ROW per ENTRY: at GU_ROWS = 32 rows and up to GMAX = 8 entries, the same value was produced 256 times over.
-__device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, float dx, int hx) {
+__device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, float dx) {
     const uint8_t* cbytes = (const uint8_t*) &cb;
-    int s = 0;
+    int s = 0, hx = 0;
+    const int ones = 0x01010101;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const unsigned cbyte = cbytes[j];
         const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
                               (((cbyte >> 6) & 3u) << 24));
         s = STRATA_DP4A(cw, xw[j], s);
+        hx = STRATA_DP4A(ones, xw[j], hx);
     }
     return dw * dx * (float) (s - hx);
 }
-
 
 // Gate/up: a block = GU_ROWS rows of ONE group.  The group's activations (each entry's token row of x_q8_0 and
 // its fp32 scales) are staged once into shared memory as aligned words; each warp then walks its rows, loading
@@ -834,7 +789,6 @@ __global__ void __launch_bounds__(256) gu_grouped_kernel(const unsigned long lon
                                                          float* __restrict__ gate_up, int cap_entries) {
     __shared__ int xs_q[GMAX][H / 4];          // the entries' int8 activations as words (2560 B each)
     __shared__ float xs_d[GMAX][H / 32];
-    __shared__ int xs_hx[GMAX][H / 32];        // sum of each entry's chunk - the weight-independent half of `chunk_dot`
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
@@ -844,18 +798,12 @@ __global__ void __launch_bounds__(256) gu_grouped_kernel(const unsigned long lon
         const uint8_t* xb = x_q8_0 + (size_t) ent_tok[e0 + k] * (size_t) (H / 32) * 34 + (size_t) c * 34;
         xs_d[k][c] = x_scales ? x_scales[(size_t) ent_tok[e0 + k] * (H / 32) + c] : f16_at(xb);
         const int8_t* q = (const int8_t*) (xb + 2);
-        // The same dp4a chain and the same j order `chunk_dot` used inline, over the same words this loop is
-        // already loading - so `hx` now costs no extra load and no work in the row loop below.
-        int sum = 0;
-        const int ones = 0x01010101;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
             int v;
             memcpy(&v, q + 4 * w, 4);
             xs_q[k][c * 8 + w] = v;
-            sum = __dp4a(ones, v, sum);
         }
-        xs_hx[k][c] = sum;
     }
     __syncthreads();
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
@@ -880,7 +828,7 @@ __global__ void __launch_bounds__(256) gu_grouped_kernel(const unsigned long lon
             for (int q = 0; q < GU_CHUNKS; ++q) {
                 const int c = lane + 32 * q;
                 if (c >= H / 32) break;
-                acc += chunk_dot(cb[q], &xs_q[k][c * 8], dw[q], xs_d[k][c], xs_hx[k][c]);
+                acc += chunk_dot(cb[q], &xs_q[k][c * 8], dw[q], xs_d[k][c]);
             }
             const float sum = warp_sum(acc);
             if (lane == 0) {
@@ -903,7 +851,6 @@ __global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long l
                                                            float* __restrict__ out) {
     __shared__ int hs_q[GMAX][FF / 4];
     __shared__ float hs_d[GMAX][FF / 32];
-    __shared__ int hs_hx[GMAX][FF / 32];      // see `xs_hx`
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
     const int e0 = grp_start[g], ne = min(grp_start[g + 1] - e0, GMAX);
@@ -913,16 +860,12 @@ __global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long l
         const uint8_t* xb = h_q8_0 + (size_t) (e0 + k) * (size_t) (FF / 32) * 34 + (size_t) c * 34;
         hs_d[k][c] = h_scales ? h_scales[(size_t) (e0 + k) * (FF / 32) + c] : f16_at(xb);
         const int8_t* q = (const int8_t*) (xb + 2);
-        int sum = 0;
-        const int ones = 0x01010101;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
             int v;
             memcpy(&v, q + 4 * w, 4);
             hs_q[k][c * 8 + w] = v;
-            sum = __dp4a(ones, v, sum);
         }
-        hs_hx[k][c] = sum;
     }
     __syncthreads();
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
@@ -940,7 +883,7 @@ __global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long l
         }
         for (int k = 0; k < ne; ++k) {
             float acc = 0.0f;
-            if (c < FF / 32) acc += chunk_dot(cb, &hs_q[k][c * 8], dw, hs_d[k][c], hs_hx[k][c]);
+            if (c < FF / 32) acc += chunk_dot(cb, &hs_q[k][c * 8], dw, hs_d[k][c]);
             const float sum = warp_sum(acc);
             if (lane == 0) out[(size_t) ent_dst[e0 + k] * H + r] = sum;
         }
@@ -1101,7 +1044,7 @@ __global__ void __launch_bounds__(256) down_grouped_t_kernel(const unsigned long
 namespace {
 // Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer):
 // one block of 128 threads, groups in first-appearance order, entries of a group in routing order.
-__global__ void __launch_bounds__(1024) group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
+__global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
                                       long long blob, unsigned long long* __restrict__ grp_ptr,
                                       int32_t* __restrict__ grp_start, int32_t* __restrict__ counts,
                                       int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok) {
