@@ -3201,7 +3201,14 @@ int main(int argc, char** argv) {
     }
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
-    if (o.mmap_experts) {
+    // R5c + CS-T: a native (IQ) pack under --mmap-experts uses the FILE-BACKED arena
+    // (experts-native.bin, paged from SSD) + the mlocked hot tier + elastic governor,
+    // NOT the GGUF-shard staged path. The staged path's buffers are transient (reused
+    // after 256 assemblies / kStageAge layers), so the profile fill's verify_blob
+    // pointer goes stale and verify_slot fails at byte 0, and the hot tier / O_DIRECT /
+    // LRU / elastic never engage. Upstream's plain `if (o.mmap_experts)` lost the
+    // `&& !native_pack` guard in the v0.1.39 merge; restored here (see orca-port).
+    if (o.mmap_experts && !native_pack) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
         // mode: the experts come from the file through the OS cache instead of a pinned copy in RAM, for a PC whose
@@ -3580,6 +3587,12 @@ int main(int argc, char** argv) {
         int32_t verify_slot = strata::core::kNotResident;
         const uint8_t* verify_blob = nullptr;
         int64_t verify_bytes = 0;
+        // The GGUF-shard staged path (FileExpertSource::staged_blob) reuses its buffers
+        // after 256 assemblies / kStageAge layers, so holding the raw pointer across the
+        // fill loop goes stale and verify_slot fails at byte 0 even when the fill was
+        // correct. Copy the verified bytes at capture time; the arena/mmap paths are
+        // stable but the copy costs one blob and is always safe.
+        std::vector<uint8_t> verify_copy;
         for (int64_t i = 0; i < want; ++i) {
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
@@ -3605,14 +3618,16 @@ int main(int argc, char** argv) {
             }
             if (std::getenv("STRATA_VERIFY_LAST") != nullptr) {
                 verify_slot = slot;
-                verify_blob = b;
                 verify_bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(
                     profile[(size_t) (vram_skip + i)].first);
+                verify_copy.assign(b, b + (size_t) verify_bytes);
+                verify_blob = verify_copy.data();
             } else if (verify_slot == strata::core::kNotResident) {
                 verify_slot = slot;
-                verify_blob = b;
                 verify_bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(
                     profile[(size_t) (vram_skip + i)].first);
+                verify_copy.assign(b, b + (size_t) verify_bytes);
+                verify_blob = verify_copy.data();
             }
             ++prefilled;
             if (o.expert_cache_per_layer && prefilled >= xcache.slots()) break;   // every quota is full.
@@ -4425,7 +4440,16 @@ int main(int argc, char** argv) {
     const bool graph_hits = (hit_fn != nullptr || no_vram_tier) && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+        // STRATA_NO_HITS=1: CPU-only decode (correctness baseline for native mixed packs whose
+        // GPU hit kernels give wrong numbers/faults). The VRAM slots stay allocated (for prefill
+        // borrowing large chunks) and the hot tier stays active (for speed), but host_res/d_res stay
+        // all -1, so resident_plan finds 0 hits, grouped launches with 0 groups (early return, no work),
+        // and every expert routes via the CPU pool (correct, via hot/file). Temporary to hit the
+        // 10+1k floor correctly; FIX native grouped for mixed (Q2_0/IQ4_NL + IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS)
+        // to re-enable hits for 15+3k. See verify trace: layer 1 (Q2_0 down) VRAM hits fault.
+        const bool no_hits = std::getenv("STRATA_NO_HITS") != nullptr;
         int64_t resident = 0;
+        if (!no_hits) {
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int st = multi_gpu ? stage_of(l) : 0;
@@ -4433,6 +4457,8 @@ int main(int argc, char** argv) {
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
+        }
+        if (no_hits) std::fprintf(stderr, "strata generate: STRATA_NO_HITS=1: CPU-only decode (0 hits, correct baseline; VRAM slots kept for prefill borrowing, hot tier active)\n");
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {

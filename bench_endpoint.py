@@ -32,11 +32,22 @@ def make_prompt(target_tokens: int) -> str:
 
 
 def one(url: str, model: str, prompt: str, max_tokens: int, effort: str, timeout: float):
+    import os
+    # Bench auth: STRATA_BENCH_KEY or ~/.config/qwen-serve/api-key, else "local" (no-auth servers).
+    _key = os.environ.get("STRATA_BENCH_KEY", "")
+    if not _key:
+        try:
+            with open(os.path.expanduser("~/.config/qwen-serve/api-key")) as _kf:
+                _key = _kf.read().strip()
+        except OSError:
+            pass
+    if not _key:
+        _key = "local"
     body = {"model": model, "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "stream": True, "reasoning_effort": effort}
     req = urllib.request.Request(url + "/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json",
-                                          "Authorization": "Bearer local"})
+                                          "Authorization": f"Bearer {_key}"})
     t0 = time.time()
     tfirst = None
     n = 0
