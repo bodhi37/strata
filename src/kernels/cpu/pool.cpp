@@ -544,6 +544,19 @@ int ExpertPool::claim(uint32_t epoch) {
     }
 }
 
+void ExpertPool::publish() {
+    // Both sides are seq_cst, and that is the whole lost-wakeup argument: a worker going to sleep does
+    // `sleepers_++` and then reads `epoch_`, the host does `epoch_++` and then reads `sleepers_`.  In one total
+    // order at least one of them sees the other's write - the worker sees the new epoch and does not sleep, or
+    // the host sees the sleeper and notifies under the mutex the worker holds until it is inside `wait`.
+    // On x86 the fetch_add is a locked xadd either way, so this costs the token path nothing.
+    epoch_.fetch_add(1, std::memory_order_seq_cst);
+    if (sleepers_.load(std::memory_order_seq_cst) != 0) {
+        std::lock_guard<std::mutex> lk(sleep_mu_);
+        sleep_cv_.notify_all();
+    }
+}
+
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
         std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
