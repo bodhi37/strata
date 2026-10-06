@@ -43,7 +43,7 @@ bool overlap(const void* a, size_t a_bytes, const void* b, size_t b_bytes) {
     return aa < bb ? bb - aa < a_bytes : aa - bb < b_bytes;
 }
 
-__global__ void history_advance_kernel(float* __restrict__ history, const float* __restrict__ normalized) {
+__global__ void __launch_bounds__(1024) history_advance_kernel(float* __restrict__ history, const float* __restrict__ normalized) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= NG_HC_DIM) return;
     float* column = history + (size_t) channel * NG_HIST;
@@ -89,7 +89,7 @@ __device__ double block_sum(double v, double* scratch) {
 /// `grouped_norm`, ONE BLOCK PER STREAM.  The ggml form is `reshape_3d(x, n_embd, hc, T)` then
 /// `rms_norm(..., eps) * w`, so ne0 = n_embd is the reduction axis and each hc stream is normalised on its
 /// own.  In the flat ggml layout (ne0 fastest) stream c occupies [c*n_embd, (c+1)*n_embd).
-__global__ void gnorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
+__global__ void __launch_bounds__(1024) gnorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
                              float* __restrict__ y, int n_embd, float eps) {
     __shared__ double scratch[8];
     const int c = blockIdx.x;
@@ -112,7 +112,7 @@ __global__ void gnorm_kernel(const float* __restrict__ x, const float* __restric
 ///
 /// `mag = sqrt(clamp(|s|, 1e-6, inf))` and `gate = sigmoid(sgn(s) * mag)`.  The clamp is a floor on |s|, so
 /// it only bites near zero; the SIGN is carried separately, which is what keeps the gate symmetric about 0.5.
-__global__ void gate_kernel(const float* __restrict__ key, const float* __restrict__ query,
+__global__ void __launch_bounds__(1024) gate_kernel(const float* __restrict__ key, const float* __restrict__ query,
                             float* __restrict__ gate, int n_embd, float inv_sqrt_n) {
     __shared__ double scratch[8];
     const int c = blockIdx.x;
@@ -127,7 +127,7 @@ __global__ void gate_kernel(const float* __restrict__ key, const float* __restri
 }
 
 /// `gated[c][d] = value[d] * gate[c]` - the value broadcast across the hc streams.
-__global__ void bcast_kernel(const float* __restrict__ value, const float* __restrict__ gate,
+__global__ void __launch_bounds__(1024) bcast_kernel(const float* __restrict__ value, const float* __restrict__ gate,
                              float* __restrict__ gated, int n_embd, int hc) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_embd * hc) return;
@@ -144,7 +144,7 @@ __global__ void bcast_kernel(const float* __restrict__ value, const float* __res
 /// `kW` IS GGML-NATIVE: `kW[k + kern*c]`.  The manifest's shape is [4, 10240] with ne0 = 4 fast, and
 /// `ref/ngram.py`'s (4, 10240) numpy `kernel[k][c]` is the TRANSPOSE of that.  The source's own view
 /// (`ggml_view_2d(model.layers[il].ple_conv1d, 1, hc_dim, nb[1], k*nb[0])`) settles which one is meant.
-__global__ void conv_kernel(const float* __restrict__ hist, const float* __restrict__ norm,
+__global__ void __launch_bounds__(1024) conv_kernel(const float* __restrict__ hist, const float* __restrict__ norm,
                             const uint16_t* __restrict__ kW, float* __restrict__ out, int hc_dim, int kern,
                             int dil, int nhist) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -163,7 +163,7 @@ __global__ void conv_kernel(const float* __restrict__ hist, const float* __restr
 }
 
 /// `result = hidden + gated + conv`, elementwise over hc_dim.
-__global__ void add3_kernel(const float* __restrict__ hidden, const float* __restrict__ gated,
+__global__ void __launch_bounds__(1024) add3_kernel(const float* __restrict__ hidden, const float* __restrict__ gated,
                             const float* __restrict__ conv, float* __restrict__ result, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) result[i] = hidden[i] + gated[i] + conv[i];
@@ -172,7 +172,7 @@ __global__ void add3_kernel(const float* __restrict__ hidden, const float* __res
 /// `y[o] = sum_i bf16(x[i]) * bf16(w[o*n_in + i])`.  The weight is BF16 and so is the ACTIVATION, which is
 /// the contract for a BF16 tensor (`docs/activation-contract.md`); with both sides bf16 the products are
 /// exact in f32 and only the summation order differs from ggml's.
-__global__ void bf16_gemv_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+__global__ void __launch_bounds__(1024) bf16_gemv_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                  float* __restrict__ y, int n_in, int n_out) {
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= n_out) return;
@@ -182,7 +182,7 @@ __global__ void bf16_gemv_kernel(const uint16_t* __restrict__ x, const uint16_t*
     y[o] = (float) acc;
 }
 
-__global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int n) {
+__global__ void __launch_bounds__(1024) to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = bf16_bits(x[i]);
 }
@@ -229,10 +229,8 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                PleOut& out, void* scratch, void* stream) {
     const bool native_key = w.key_native_data != nullptr && w.key_bf16 == nullptr;
     if (native_key && (!emb || !hidden || !hist_rows || !out.result || !scratch || !stream ||
-                       !w.key_native_q8_1 ||
-                       (w.key_native_type != 42 && w.key_native_type != 18 && w.key_native_type != 23 &&
-                        w.key_native_type != 8)))
-        throw std::invalid_argument("ple_block: native key requires Q2_0, IQ3_XXS, IQ4_XS or Q8_0 weights, input/output, private scratch and explicit stream");
+                       !w.key_native_q8_1 || !native_mmvq_supported(w.key_native_type)))
+        throw std::invalid_argument("ple_block: native key requires supported native-mmvq weights, input/output, private scratch and explicit stream");
     if (emb == nullptr || hidden == nullptr || hist_rows == nullptr || out.result == nullptr) return;
     const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
     static_assert(NG_N_EMBD == 2560 && NG_HC_DIM == 10240, "native PLE key geometry changed");

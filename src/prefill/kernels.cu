@@ -63,7 +63,7 @@ void check(const char* what) {
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
 // ---------------------------------------------------------------- hyper-connection
-__global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
+__global__ void __launch_bounds__(1024) gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
                                float* __restrict__ xn, uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
@@ -168,7 +168,7 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
     lo16[i] = h;
     if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
 }
-__global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
+__global__ void __launch_bounds__(1024) gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
                               uint16_t* __restrict__ mixed16_lo) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -189,14 +189,14 @@ __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restr
     }
     if (mixed_h) mixed_h[i] = hf(s);
 }
-__global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
+__global__ void __launch_bounds__(1024) gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                                 int64_t inj_ld, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * D) return;
     const int64_t t = i / D, c = (i % D) / N, d = i % N;
     R[i] = fmaf(bo[t * N + d], 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
 }
-__global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
+__global__ void __launch_bounds__(1024) gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * D) return;
     const int64_t t = i / D, d = i % N;
@@ -204,7 +204,7 @@ __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restri
 }
 
 // ---------------------------------------------------------------- GDN
-__global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
+__global__ void __launch_bounds__(1024) gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
                                  const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
                                  int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -215,7 +215,7 @@ __global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __re
     beta[i] = sigm(ab[t * 2 * HV + HV + h]);
 }
 // one thread per channel, walks the chunk; then a second kernel normalises
-__global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
+__global__ void __launch_bounds__(1024) gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
                                 float* __restrict__ h, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -233,7 +233,7 @@ __global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restric
 // chunk (or the history before it) instead of carrying them - the conv reads inputs, not its own outputs, so the
 // tiles are independent. The same expression per element (so the same bits); the history is written afterwards.
 constexpr int CONV_TILE = 64;
-__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+__global__ void __launch_bounds__(1024) gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
                                       const float* __restrict__ w, float* __restrict__ h, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -615,7 +615,7 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
 
 // ---------------------------------------------------------------- MoE
 template <int REG>
-__global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
+__global__ void __launch_bounds__(1024) route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
     const int64_t t = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (t >= T) return;
@@ -655,7 +655,7 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
 }
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales [2560][10] f16
 template <bool HALF>
-__global__ void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu16,
+__global__ void __launch_bounds__(1024) blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu16,
                                     uint16_t* __restrict__ d16) {
     constexpr size_t O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,
                      O_D_SC = O_GU_SC + (size_t) 1280 * 40 * 2;
@@ -679,21 +679,21 @@ __global__ void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* 
         for (int k = 0; k < 4; ++k) { const float v = (float) (((c >> (2 * k)) & 3) - 1) * d; o[k] = HALF ? hf(v) : bf(v); }
     }
 }
-__global__ void swiglu_il_kernel(const float* __restrict__ gu, uint16_t* __restrict__ h16, int64_t n) {
+__global__ void __launch_bounds__(1024) swiglu_il_kernel(const float* __restrict__ gu, uint16_t* __restrict__ h16, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * 640) return;
     const int64_t r = i / 640, k = i % 640;
     const float g = gu[r * 1280 + 2 * k], u = gu[r * 1280 + 2 * k + 1];
     h16[i] = hf_sat(g / (1.0f + __expf(-g)) * u);
 }
-__global__ void swiglu_pair_kernel(const float* __restrict__ g, const float* __restrict__ u, uint16_t* __restrict__ h16,
+__global__ void __launch_bounds__(1024) swiglu_pair_kernel(const float* __restrict__ g, const float* __restrict__ u, uint16_t* __restrict__ h16,
                                    int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * 640) return;
     const float a = g[i];
     h16[i] = hf_sat(a / (1.0f + __expf(-a)) * u[i]);
 }
-__global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src,
+__global__ void __launch_bounds__(1024) gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src,
                                      uint16_t* __restrict__ dst, int64_t n, int64_t width) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one uint4 (8 bf16)
     const int64_t per = width / 8;
@@ -701,7 +701,29 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
-__global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+
+// R10 P-CHUNK: the two batch-mode pieces of the MoE combine.  With expert-batch scratch (ENTRY_CAP
+// entries), a token's ten (token,k) entries can straddle batches, so the combine cannot stay a per-
+// token pass over a full-chunk Dm.  Instead: bo is INITIALISED with the shared expert's contribution
+// per tile, and each batch SCATTER-ADDS its entries' rows into bo (atomicAdd - a cell gets at most K
+// adds, from different batches).  Numerically identical to moe_combine_kernel up to fp add order.
+__global__ void __launch_bounds__(1024) moe_shared_into_bo_kernel(float* __restrict__ bo, const float* __restrict__ shared,
+                                           const float* __restrict__ sg, int64_t t0, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N;
+    bo[(t0 + t) * N + (i % N)] = shared[(t0 + t) * N + (i % N)] * sigm(sg[t0 + t]);
+}
+
+__global__ void __launch_bounds__(1024) moe_scatter_batch_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ src,
+                                          const float* __restrict__ w, float* __restrict__ bo, int64_t n_ent) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_ent * N) return;
+    const int64_t g = i / N, d = i % N;
+    atomicAdd(&bo[(int64_t) src[g] * N + d], w[g] * Dm[(int64_t) g * N + d]);
+}
+
+__global__ void __launch_bounds__(1024) moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
                                    const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -714,7 +736,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
 }
 
 // ---------------------------------------------------------------- QSA helpers
-__global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
+__global__ void __launch_bounds__(1024) rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
     float* r = x + (int64_t) blockIdx.x * ld;
     float ss = 0.0f;
@@ -727,7 +749,7 @@ __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
 template <bool TAB>
-__global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+__global__ void __launch_bounds__(1024) rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
                             float theta_scale, float freq_scale, float corr_low, float corr_high,
                             float ext_factor, float mscale, const int32_t* __restrict__ mtab,
                             strata::kernels::RopeTab rt) {
@@ -747,13 +769,13 @@ __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, i
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
 }
-__global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
+__global__ void __launch_bounds__(1024) split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * 24 * 256) return;
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
     q[i] = qf[t * 24 * 512 + h * 512 + d];
 }
-__global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
+__global__ void __launch_bounds__(1024) gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
                                  int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * 24 * 256) return;
@@ -763,7 +785,7 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
 // resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
-__global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
+__global__ void __launch_bounds__(1024) kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
                                  uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                                  strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage) {
@@ -806,15 +828,15 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         if (threadIdx.x == 0) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
     }
 }
-__global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+__global__ void __launch_bounds__(1024) to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = hf(x[i]);
 }
-__global__ void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
+__global__ void __launch_bounds__(1024) round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = __half2float(__float2half_rn(x[i]));
 }
-__global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, uint16_t* __restrict__ ylo,
+__global__ void __launch_bounds__(1024) to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, uint16_t* __restrict__ ylo,
                                int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const uint16_t h = bf(x[i]);
@@ -985,6 +1007,16 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                  int64_t T, void* stream) {
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
     check("moe_combine");
+}
+void moe_shared_into_bo(float* bo, const float* shared, const float* sg, int64_t t0, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_shared_into_bo_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(bo, shared, sg, t0, T);
+    check("moe_shared_into_bo");
+}
+void moe_scatter_batch(const float* Dm, const int32_t* src, const float* w, float* bo, int64_t n_ent, void* stream) {
+    if (n_ent <= 0) return;
+    moe_scatter_batch_kernel<<<blocks_for(n_ent * N), 256, 0, (cudaStream_t) stream>>>(Dm, src, w, bo, n_ent);
+    check("moe_scatter_batch");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

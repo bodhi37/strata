@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
     h[(size_t) t * C + c] = y;
 }
 
-__global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
+__global__ void __launch_bounds__(1024) gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
                                        const int32_t* __restrict__ n_keep) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     }
 }
 
-__global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
+__global__ void __launch_bounds__(1024) embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
                                             const float* __restrict__ offsets, const int32_t* __restrict__ tokens,
                                             int64_t n, int code_bits, int code_bias, int group_elems,
                                             unsigned long long row_codes, unsigned long long row_groups,
@@ -253,14 +253,14 @@ __global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, c
     out[(size_t) t * n + i] = __fadd_rn(product, of ? of[group] : 0.0f);
 }
 
-__global__ void broadcast_streams_kernel(const float* __restrict__ x, float* __restrict__ R, int64_t n, int hc) {
+__global__ void __launch_bounds__(1024) broadcast_streams_kernel(const float* __restrict__ x, float* __restrict__ R, int64_t n, int hc) {
     const int t = blockIdx.y;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * hc) return;
     R[(size_t) t * n * hc + i] = x[(size_t) t * n + i % n];
 }
 
-__global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
+__global__ void __launch_bounds__(1024) copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
                                     const int32_t* __restrict__ index, int64_t n) {
     const int idx = *index;
     if (idx < 0) return;
@@ -268,7 +268,7 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
         dst[i] = src[(size_t) idx * stride + i];
 }
 
-__global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+__global__ void __launch_bounds__(1024) fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                    uint4* __restrict__ dst, long long per) {
     const long long total = (long long) *n * per;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
@@ -278,12 +278,12 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
     }
 }
 
-__global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
+__global__ void __launch_bounds__(1024) rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
     const int k = threadIdx.x;
     if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
 }
 
-__global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
+__global__ void __launch_bounds__(1024) add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
                                              float* __restrict__ R, int64_t n, int hc) {
     const int t = blockIdx.y;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -291,7 +291,7 @@ __global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const 
     R[(size_t) t * n * hc + i] = h[(size_t) t * n * hc + i] + e[(size_t) t * n + i % n];
 }
 
-__global__ void ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_t* __restrict__ slot,
+__global__ void __launch_bounds__(1024) ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_t* __restrict__ slot,
                                   int32_t* __restrict__ dst, int32_t* __restrict__ count) {
     const int i = threadIdx.x;
     if (i < n) { slot[i] = ids[i]; dst[i] = i; }
@@ -300,7 +300,7 @@ __global__ void ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_
 
 // E = the widest element the row size divides into (16, 4 or 1 bytes): a Q6_K head row of 2560 values is 2100 bytes
 template<typename E>
-__global__ void gather_rows_kernel(const E* __restrict__ src, long long row_e, const int32_t* __restrict__ ids,
+__global__ void __launch_bounds__(1024) gather_rows_kernel(const E* __restrict__ src, long long row_e, const int32_t* __restrict__ ids,
                                    long long n, E* __restrict__ dst) {
     const long long total = n * row_e;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
@@ -309,12 +309,12 @@ __global__ void gather_rows_kernel(const E* __restrict__ src, long long row_e, c
     }
 }
 
-__global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, int n) {
+__global__ void __launch_bounds__(1024) map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, int n) {
     const int i = threadIdx.x;
     if (i < n) ids[i] = table[ids[i]];
 }
 
-__global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
+__global__ void __launch_bounds__(1024) row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
                                     float* __restrict__ probs) {
     __shared__ float part[32];
     const int t = blockIdx.x;
@@ -332,7 +332,7 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     }
 }
 
-__global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const int32_t* __restrict__ ids,
+__global__ void __launch_bounds__(1024) mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const int32_t* __restrict__ ids,
                                   const int32_t* __restrict__ row_dev, float* __restrict__ R_dst,
                                   int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p) {
     const int row = *row_dev;
@@ -348,7 +348,7 @@ __global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t strid
     }
 }
 
-__global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
+__global__ void __launch_bounds__(1024) dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
     const int i = threadIdx.x;
     if (i >= n) return;
     const int c = cells[i];
@@ -413,7 +413,7 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 }
 
 namespace {
-__global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {
+__global__ void __launch_bounds__(1024) window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {
     const int q = blockIdx.y;
     int32_t* st = steps + q * 4;
     const int n_kv = st[1];
@@ -493,7 +493,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+__global__ void __launch_bounds__(1024) wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
