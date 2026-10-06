@@ -145,6 +145,8 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                                std::getenv("STRATA_NO_IQ4NL") == nullptr;
     if (avx512 && nt >= 2 && f.d_type == 20) {   // GGML_TYPE_IQ4_NL
         iq4nl_rows_multi(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;

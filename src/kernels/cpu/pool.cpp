@@ -454,6 +454,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    // R10 custom: STRATA_PARK_SPIN_US (default 2500us) overrides when set
+    if (const char* e2 = std::getenv("STRATA_PARK_SPIN_US"))
+        spin_before_sleep_ = std::chrono::microseconds((std::max)(1, std::atoi(e2)));
     if (n_workers > 0) {
         n_ = n_workers;
     } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
@@ -485,8 +488,7 @@ ExpertPool::~ExpertPool() {
     g_diag_pool.compare_exchange_strong(self, nullptr);
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }
-    park_cv_.notify_all();
+    publish();
     for (auto& t : threads_) t.join();
 }
 
@@ -498,13 +500,11 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        // R9a/R10: HYBRID PARK with a RUNTIME-TUNED spin.  Spin `park_spin_iters()` pauses (default ~2.5 ms,
-        // which covers every intra-window gap: attention, router, act-quant, MTP draft), then block on the
-        // condvar - so a worker stays hot on its core through a whole generation window and only sleeps
-        // between requests.  `parked_` still counts this worker from entry into the wait (spin or blocked)
-        // until it observes the new epoch, so the publisher barrier is unchanged.
-        const int spin_cap = park_spin_iters();
-        for (int spun = 0; epoch_.load(std::memory_order_acquire) == seen; ++spun) {
+        // Park: spin briefly then sleep (issue #4). R10 tunable: spin_before_sleep_ init from
+        // STRATA_PARK_SPIN_US (default 2500us) in ctor; upstream default 20ms.
+        const auto parked_at = std::chrono::steady_clock::now();
+        uint32_t spins = 0;
+        while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;

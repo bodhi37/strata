@@ -125,22 +125,6 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
-        // R21: the pin can fail with cudaErrorDevicesUnavailable right after a hard engine kill - the
-        // driver needs seconds to release the previous context.  Retry with backoff before giving up
-        // (a failed start costs the whole ~90 s load, and the guard script's 10 s wait is not always
-        // enough after an OOM-killed or crashed run).
-        for (int attempt = 0;; ++attempt) {
-            if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) break;
-            const cudaError_t herr = cudaGetLastError();
-            host_ = nullptr;
-            if (attempt >= 5) {
-                err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB (cuda: " +
-                      cudaGetErrorString(herr) + ")";
-                return false;
-            }
-            std::fprintf(stderr, "strata generate: embedding pin failed (%s); retrying in 5 s (%d/5)\n",
-                         cudaGetErrorString(herr), attempt + 1);
-            std::this_thread::sleep_for(std::chrono::seconds(5));
         // the table is copied out of the mapping below: a truncated shard must be an error, not a read past EOF
         if (!model.in_bounds(*t, at) || strata::tensor_payload_bytes(*t) != bytes_) {
             err = "native embedding: token_embd.weight's payload is truncated or not " + std::to_string(bytes_) +
@@ -148,7 +132,19 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             bytes_ = 0;
             return false;
         }
-        if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        // R21: the pin can fail with cudaErrorDevicesUnavailable right after a hard engine kill - the
+        // driver needs seconds to release the previous context.  Retry with backoff before VRAM fallback
+        // (a failed start costs the whole ~90 s load).
+        for (int attempt = 0;; ++attempt) {
+            if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) break;
+            const cudaError_t herr = cudaGetLastError();
+            host_ = nullptr;
+            if (attempt >= 5) break;  // fall through to VRAM fallback below
+            std::fprintf(stderr, "strata generate: embedding pin failed (%s); retrying in 5 s (%d/5)\n",
+                         cudaGetErrorString(herr), attempt + 1);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+        if (host_ == nullptr) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
             // instead: it costs its size there and reads faster than over PCIe.
