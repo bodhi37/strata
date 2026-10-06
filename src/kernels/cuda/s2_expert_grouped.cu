@@ -817,7 +817,6 @@ __device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, fl
         const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
                               (((cbyte >> 6) & 3u) << 24));
         s = STRATA_DP4A(cw, xw[j], s);
-        hx = STRATA_DP4A(ones, xw[j], hx);
     }
     return dw * dx * (float) (s - hx);
 }
