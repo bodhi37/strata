@@ -21,7 +21,7 @@ namespace {
 constexpr int QK = 64;             // S2 group = Q2_0 block = 64 elements
 constexpr int CODES_PER_BYTE = 4;
 
-__global__ void dequant_s2_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
+__global__ void __launch_bounds__(1024) dequant_s2_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
                                   float* __restrict__ out, long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;

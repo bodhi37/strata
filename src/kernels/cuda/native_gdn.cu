@@ -56,15 +56,15 @@ step(float* __restrict__ state, const float* __restrict__ q, const float* __rest
     for (int r = 0; r < 4; ++r) {
         const int i = r * 32 + lane;
         s_shard[r] = state[(size_t(i) * h_v + head) * S + col];
-        k_reg[r] = k[q_head * S + i];
-        q_reg[r] = q[q_head * S + i];
+        k_reg[r] = __ldg(&k[q_head * S + i]);
+        q_reg[r] = __ldg(&q[q_head * S + i]);
     }
-    const float g_val = expf(gate[head]);
+    const float g_val = __expf(__ldg(&gate[head]));
     float kv_shard = 0.0f;
 #pragma unroll
     for (int r = 0; r < 4; ++r) kv_shard += s_shard[r] * k_reg[r];
     const float kv_col = warp_sum(kv_shard);
-    const float delta_col = (v[head * S + col] - g_val * kv_col) * beta[head];
+    const float delta_col = (__ldg(&v[head * S + col]) - g_val * kv_col) * __ldg(&beta[head]);
     float attn_partial = 0.0f;
 #pragma unroll
     for (int r = 0; r < 4; ++r) {

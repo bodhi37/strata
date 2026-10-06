@@ -118,7 +118,7 @@ __device__ __forceinline__ float h2f(uint16_t bits) { return f32_from_f16(bits);
 
 // ================= 1. kv_append =================
 
-__global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
+__global__ void __launch_bounds__(1024) kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
                                  const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                  const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
                                  int head_dim, int page_size, KvHostPools host) {
@@ -151,7 +151,7 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
 /// `pos`, which forced `pos` to be a host scalar, which meant a captured graph would replay the first token's
 /// position forever.  Doing it here reads the position from `pos_dev` like every other kernel, so the grid and
 /// the arguments are the same for every token and the graph replays correctly.
-__global__ void indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+__global__ void __launch_bounds__(1024) indexer_key_append_kernel(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                                           int pos_base, const float* __restrict__ w_k_norm, float eps,
                                           float* __restrict__ tail, float* __restrict__ dead,
                                           float* __restrict__ pooled, int32_t* __restrict__ block_pos,
@@ -237,7 +237,7 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
 
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
 /// the row's score onto its cells.  The reference's Relu is PER HEAD, so the dots cannot be summed first.
-__global__ void qsa_index_kernel(const float* __restrict__ pooled,
+__global__ void __launch_bounds__(1024) qsa_index_kernel(const float* __restrict__ pooled,
                                  const float* __restrict__ q_idx, const float* __restrict__ bias,
                                  int idx_n_head, int idx_dim, long long r,
                                  const int32_t* __restrict__ step, float* __restrict__ cell_scores) {
@@ -295,7 +295,7 @@ __device__ __forceinline__ uint32_t order_key(float s) {
 
 constexpr int TOPK_THREADS = 256;
 
-__global__ void topk_kernel(const float* __restrict__ scores, const int32_t* __restrict__ step,
+__global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ scores, const int32_t* __restrict__ step,
                            int* __restrict__ out_ids) {
     const long long n_kv = (long long) __ldg(step + kStepNKv);
     const long long width = (long long) __ldg(step + kStepWidth);
@@ -394,7 +394,7 @@ __global__ void topk_kernel(const float* __restrict__ scores, const int32_t* __r
 
 // ================= 5. kv_gather =================
 
-__global__ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __restrict__ v_pool,
+__global__ void __launch_bounds__(1024) kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __restrict__ v_pool,
                                  const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
                                 const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
                                 uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
@@ -427,7 +427,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 /// One block per query head.  `s` holds the scores, which are then overwritten with the softmax weights.
-__global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
+__global__ void __launch_bounds__(1024) qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
                                   const uint16_t* __restrict__ v_scratch, const int32_t* __restrict__ step,
                                  int n_head, int n_head_kv, int head_dim,
                                  float* __restrict__ attn, float* __restrict__ weights) {
@@ -474,7 +474,7 @@ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* _
 
     float sum = 0.0f;
     for (long long j = d; j < n_ids; j += blockDim.x) {
-        const float e = expf(w[j] - mx);
+        const float e = __expf(w[j] - mx);
         w[j] = e;
         sum += e;
     }
@@ -501,14 +501,17 @@ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* _
 
 // ================= 7. qsa_gate_apply =================
 
-__global__ void qsa_gate_apply_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+__global__ void __launch_bounds__(1024) qsa_gate_apply_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
                                       int n_head, int head_dim, uint16_t* __restrict__ out) {
     const long long i = blockIdx.x * (long long) blockDim.x + threadIdx.x;
     if (i >= (long long) n_head * head_dim) return;
     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
-    const double sig = 1.0 / (1.0 + exp(-g));
-    out[i] = f16_from_f32((float) ((double) attn[i] * sig));
+    // FP32 fast-math sigmoid: was DOUBLE+libm exp at 1/64 rate on GeForce for
+    // 6144 elems x12 QSA layers/token. Output rounds to fp16 (11-bit mantissa);
+    // f32-vs-f64 sigmoid diff ~1e-7 is 1000x below that quantization. The SECOND half.
+    const float g = __ldg(&q_full[((size_t) h * 2 * head_dim) + head_dim + d]);
+    const float sig = __fdividef(1.0f, 1.0f + __expf(-g));
+    out[i] = f16_from_f32(__ldg(&attn[i]) * sig);
 }
 
 inline unsigned grid_for(long long n, int threads) {
@@ -776,7 +779,7 @@ void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scr
 
 /// The same multiply as `qsa_gate_apply_kernel` WITHOUT the fp16 round - see the header for why the caller
 /// whose weight is a K-quant needs the f32 form.  Identical arithmetic up to the last step.
-__global__ void qsa_gate_apply_f32_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+__global__ void __launch_bounds__(1024) qsa_gate_apply_f32_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
                                           int n_head, int head_dim, float* __restrict__ out) {
     const long long i = blockIdx.x * (long long) blockDim.x + threadIdx.x;
     if (i >= (long long) n_head * head_dim) return;

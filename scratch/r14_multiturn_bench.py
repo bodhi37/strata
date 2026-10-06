@@ -1,4 +1,9 @@
-import json, time, urllib.request, sys
+import json, time, urllib.request, sys, os
+
+# Host + auth come from the env so this works against the Tailscale-bound live endpoint.
+# Defaults keep the old behaviour (localhost, no auth) when both are unset.
+HOST = os.environ.get("STRATA_BENCH_HOST", "127.0.0.1")
+KEY = os.environ.get("STRATA_BENCH_KEY", "")
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8123
 NTOK = int(sys.argv[2]) if len(sys.argv) > 2 else 200
@@ -28,8 +33,11 @@ TOPICS = [
 ]
 
 def post(payload, timeout=3600):
-    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
-                                 json.dumps(payload).encode(), {"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if KEY:
+        headers["Authorization"] = f"Bearer {KEY}"
+    req = urllib.request.Request(f"http://{HOST}:{PORT}/v1/chat/completions",
+                                 json.dumps(payload).encode(), headers)
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 all_gen23 = []

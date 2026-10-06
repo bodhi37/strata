@@ -1,11 +1,11 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -1000,9 +1000,15 @@ bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     // file mapping never is.  `blob()` answers tier residents first, so this predicate agrees with the pointer
     // `blob()` returns for exactly the blobs that can be staged to the GPU.
     if (file_map_ != nullptr) {
-        if (!hot_dev_ok_ || hot_slot_.empty()) return false;
+        // R22: a blob is DMA-able when its slot's SLICE still has a live registration (the governor may have
+        // shed the slice: unregistered pages are reclaimable, and a DMA over them would read zero-fill or
+        // garbage); hot_slot_ alone is no longer the whole truth.
+        if (hot_reg_.empty() || hot_slot_.empty()) return false;
         const int64_t idx = layer * n_expert_ + expert;
-        return idx >= 0 && idx < blobs_ && hot_slot_[(size_t) idx] >= 0;
+        if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] < 0) return false;
+        // the offset is slot_id * dc_slot_bytes_; the slice id is slot_id / hot_slice_slots_
+        return hot_reg_[(size_t) ((uint64_t) hot_slot_[(size_t) idx] / (hot_slice_slots_ * dc_slot_bytes_))].load(
+            std::memory_order_acquire);
     }
     const auto& lay = strata::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
@@ -1164,40 +1170,36 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
     // `cudaHostRegister` wants - and tier-resident blobs are 97%+ of routed traffic, so registering it turns
     // `fetch_dma` (default --pcie-mode auto -> DMA for native packs, --pcie-frac 0.55) back on: the copy
     // engine moves the layer's PCIe share into VRAM staging beside the CPU's own work and the grouped kernel
-    // computes it on the GPU.  Whole-range registration first; 2 GiB slices as the fallback, because a
-    // failure here must degrade to the CPU-only path, never to torn reads.
+    // computes it on the GPU.
+    //
+    // R22: **REGISTER IN SLICES, NOT ONE WHOLE RANGE.**  Registering pins the pages (unswappable), which is
+    // exactly the over-subscription that kills a long-horizon box at deep context (the 24 GiB tier + KV pools
+    // + desktop left no headroom: zram collapse, then cublasCreate died inside the driver - 2026-10-04/05
+    // twice).  Slices of whole slots (12 per 24 GiB tier, ~2 GiB) get their own registration so the pressure
+    // governor (`shed_pressure`) can UNREGISTER the cold-end slices first, drop their pages and put their
+    // slots back on the free list: the tier SHRINKS under pressure and refills when it passes, instead of
+    // being pinned until the OOM.  Only the direct/kernel alias form (a single whole-range `hot_dev_base_`,
+    // pcie-mode direct) is lost - the served mode is DMA (auto -> DMA for native packs), which needs only
+    // `pinned()` per blob, and slice-shaped registrations can no longer hand out a single alias pointer.
     if (hot_locked_ && hot_arena_ != nullptr && hot_cap_ > 0 && file_map_ != nullptr) {
-        void* dev = nullptr;
         auto reg = [&](uint8_t* p, uint64_t n) {
             return cudaHostRegister(p, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped);
         };
-        if (reg(hot_arena_, hot_cap_) == cudaSuccess) {
-            if (cudaHostGetDevicePointer(&dev, hot_arena_, 0) == cudaSuccess) {
-                hot_dev_ok_ = true;
-                hot_dev_base_ = (const uint8_t*) dev;
+        const int64_t ideal_slices = 12;
+        hot_slice_slots_ = (dc_slots_ + ideal_slices - 1) / ideal_slices;   // whole slots per ~2 GiB slice
+        const int64_t nslice = (dc_slots_ + hot_slice_slots_ - 1) / hot_slice_slots_;
+        hot_reg_ = std::vector<std::atomic<bool>>((size_t) nslice);   // each slice's flag starts false
+        hot_dev_ok_ = true;
+        hot_dev_base_ = nullptr;
+        for (int64_t i = 0; i < nslice; ++i) {
+            const int64_t s0 = i * hot_slice_slots_;
+            const uint64_t off = (uint64_t) s0 * dc_slot_bytes_;
+            const uint64_t n = std::min((uint64_t) hot_slice_slots_ * dc_slot_bytes_, hot_cap_ - off);
+            if (reg(hot_arena_ + off, n) == cudaSuccess) {
+                hot_reg_[(size_t) i].store(true, std::memory_order_relaxed);
             } else {
-                (void) cudaGetLastError();
-                cudaHostUnregister(hot_arena_);
-            }
-        } else {
-            (void) cudaGetLastError();
-            const uint64_t slice = (uint64_t) 2 << 30;
-            hot_dev_ok_ = true;
-            std::vector<void*> parts;
-            for (uint64_t off = 0; off < hot_cap_ && hot_dev_ok_; off += slice) {
-                const uint64_t n = std::min<uint64_t>(slice, hot_cap_ - off);
-                if (reg(hot_arena_ + off, n) != cudaSuccess) { hot_dev_ok_ = false; break; }
-                void* d = nullptr;
-                if (cudaHostGetDevicePointer(&d, hot_arena_ + off, 0) != cudaSuccess) { hot_dev_ok_ = false; break; }
-                parts.push_back(d);
-            }
-            if (hot_dev_ok_ && parts.size() == 1) hot_dev_base_ = (const uint8_t*) parts[0];
-            if (!hot_dev_ok_) {
-                for (size_t i = 0; i < parts.size(); ++i) cudaHostUnregister(hot_arena_ + (uint64_t) i * slice);
-            } else if (parts.size() > 1) {
-                // multi-slice: DMA (pcie-mode 0) works because it only needs `pinned()` == true; the
-                // single-pointer `device_alias()` form (direct/kernel modes) stays off with a null base.
-                hot_dev_base_ = nullptr;
+                (void) cudaGetLastError();   // a slice that cannot register loses DMA for its blobs only:
+                                             // pinned() gates per slice, and the pool computes them instead
             }
         }
     }
@@ -1219,6 +1221,120 @@ void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& 
 
 // ---- R8: the adaptive LRU tier ---------------------------------------------------------------------------
 
+// R22: THE PRESSURE GOVERNOR'S SHED.  See the header.  Called from the serve loop's line handler between
+// requests, so no decode window is active and no reads are in flight; the epoch guard still refuses a slice
+// whose slots were touched or admitted this window (a late commit or a stray caller would otherwise see
+// zero-fill memory where its bytes used to be).
+//
+// R22b AUDIT: the shed order is SCORE-BASED, not positional.  The "arena END = the coldest" assumption only
+// holds for a FRESH tier: the decode-side LRU (dc_alloc runs from begin_layer even in the static tier)
+// recycles slot CONTENT over a long session, so the tail slices hold an arbitrary mix and a positional shed
+// could drop the session's actual working set - the exact speed cliff this feature was built to avoid.  Each
+// slice is scored by its slots' frequency counts plus a freshness bonus for anything touched this or the
+// previous window (decode patterns repeat windows: `win_repeat`), and the coldest scored slice is shed
+// first.  Ties break toward the arena's end (old profile placements).
+uint64_t ArenaExpertSource::shed_pressure(uint64_t bytes_to_free) {
+    if (hot_arena_ == nullptr || hot_slot_.empty() || dc_slot_bytes_ == 0 || hot_slice_slots_ <= 0) return 0;
+    const int64_t nslice = (int64_t) hot_reg_.size();
+    if (nslice <= 1) return 0;                      // never shed the tier's single (hottest) slice
+    uint64_t freed = 0;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    std::vector<int64_t> eligible_present;
+    eligible_present.clear();
+    // eligible = slices with a live registration whose slots are not part of this window's traffic
+    for (int64_t i = nslice - 1; i > 0; --i) {
+        if (!hot_reg_[(size_t) i].load(std::memory_order_relaxed)) continue;
+        const int64_t s0 = i * hot_slice_slots_;
+        bool safe = true;
+        for (int64_t s = s0; s < dc_slots_ && s < s0 + hot_slice_slots_; ++s) {
+            if (dc_idx_[(size_t) s] < 0) continue;
+            const uint32_t e = dc_epoch_[(size_t) s];
+            if (e == window_epoch_ || (e > 0 && e == window_epoch_ - 1)) { safe = false; break; }
+        }
+        if (safe) eligible_present.push_back(i);
+    }
+    while (freed < bytes_to_free && !eligible_present.empty()) {
+        // score every eligible slice: the sum of its slots' frequency credits (a 0-count slot counts 1 -
+        // never cheaper than a warm slot, since the profile placements under it have rank value), then pick
+        // the lowest score; ties break toward the higher index (the old profile tail).  Freshness is folded
+        // into eligibility above; nothing can move under dc_mu_ while we score, but the entry is re-checked
+        // by exactly the same read that built the eligibility list.
+        int64_t best_i = -1;
+        uint64_t best_score = ~0ull;
+        for (const int64_t i : eligible_present) {
+            const int64_t s0 = i * hot_slice_slots_;
+            uint64_t score = 0;
+            for (int64_t s = s0; s < dc_slots_ && s < s0 + hot_slice_slots_; ++s)
+                score += dc_count_[(size_t) s] ? (uint64_t) dc_count_[(size_t) s] : 1ull;
+            if (score < best_score || (score == best_score && i > best_i)) { best_score = score; best_i = i; }
+        }
+        if (best_i < 0) break;
+        {
+            const int64_t s0 = best_i * hot_slice_slots_;
+            const uint64_t off = (uint64_t) s0 * dc_slot_bytes_;
+            const uint64_t n = std::min((uint64_t) hot_slice_slots_ * dc_slot_bytes_, hot_cap_ - off);
+            if (n == 0) break;
+            cudaHostUnregister(hot_arena_ + off);            // the pointer must match the registration's own
+            (void) cudaGetLastError();
+            ::munlock(hot_arena_ + off, (size_t) n);        // the whole-arena mlock splits per range at munlock
+            (void) ::madvise(hot_arena_ + off, (size_t) n, MADV_DONTNEED);   // drop the pages: the RAM is given back
+            hot_reg_[(size_t) best_i].store(false, std::memory_order_release);
+            for (int64_t s = s0; s < dc_slots_ && s < s0 + hot_slice_slots_; ++s) {
+                const int64_t vi = dc_idx_[(size_t) s];
+                if (vi < 0) continue;          // already free: pushing it again would double-allocate it
+                if (vi < (int64_t) hot_slot_.size()) {
+                    hot_slot_[(size_t) vi] = -1;
+                    dc_unlink((int32_t) s);
+                }
+                dc_idx_[(size_t) s] = -1;
+                dc_count_[(size_t) s] = 0;
+                dc_epoch_[(size_t) s] = 0;
+                dc_free_.push_back((int32_t) s);
+            }
+            hot_shed_ += n;
+            freed += n;
+        }
+        {   // drop the winner from the eligible list; unregistered slices cannot be re-scored
+            std::vector<int64_t> keep;
+            keep.reserve(eligible_present.size());
+            for (const int64_t i : eligible_present) if (i != best_i) keep.push_back(i);
+            eligible_present.swap(keep);
+        }
+    }
+    return freed;
+}
+
+// R22b: THE GOVERNOR'S REGROW.  See the header.  The server sends `REGROW <bytes>` only when ITS reading of
+// MemAvailable is comfortably above the floor (>= floor + 2.5 GiB), which together with this precheck
+// (MemAvailable >= slice + 1024 MiB) gives the regrow a double hysteresis: the tier can never regrow into
+// the pressure that made it shed.
+uint64_t ArenaExpertSource::regrow_pressure(uint64_t bytes) {
+    if (hot_arena_ == nullptr || hot_reg_.empty() || dc_slot_bytes_ == 0 || hot_slice_slots_ <= 0) return 0;
+    const int64_t nslice = (int64_t) hot_reg_.size();
+    int64_t target = -1;
+    for (int64_t i = nslice - 1; i > 0; --i) {      // the arena's END slices first: the LIFO free list pops the
+        if (!hot_reg_[(size_t) i].load(std::memory_order_relaxed)) { target = i; break; }   // high slots first
+    }
+    if (target < 0) return 0;                       // nothing is shed; no regrow needed
+    const int64_t s0 = target * hot_slice_slots_;
+    const uint64_t off = (uint64_t) s0 * dc_slot_bytes_;
+    const uint64_t n = std::min((uint64_t) hot_slice_slots_ * dc_slot_bytes_, hot_cap_ - off);
+    if (n == 0) return 0;
+    if (bytes > 0 && n > bytes) return 0;           // the caller budgets per call; one slice at a time
+    const uint64_t avail = strata::platform::host_available_bytes();
+    if (avail < n + ((uint64_t) 1024 << 20)) return 0;   // the regrow faults the whole slice back at once
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    if (cudaHostRegister(hot_arena_ + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped)
+        != cudaSuccess) {
+        (void) cudaGetLastError();     // refuse the regrow rather than half-pinning: the next cycle retries
+        return 0;
+    }
+    ::mlock(hot_arena_ + off, (size_t) n);             // VM_LOCKED splits per range, as it did at pin_hot
+    hot_reg_[(size_t) target].store(true, std::memory_order_release);
+    hot_shed_ = hot_shed_ > n ? hot_shed_ - n : 0;
+    return n;
+}
+
 void ArenaExpertSource::dc_init(int64_t slot_bytes) {
     dc_slot_bytes_ = (uint64_t) slot_bytes;
     dc_slots_ = hot_cap_ > 0 ? (int64_t) (hot_cap_ / dc_slot_bytes_) : 0;
@@ -1234,7 +1350,12 @@ void ArenaExpertSource::dc_init(int64_t slot_bytes) {
 }
 
 void ArenaExpertSource::dc_unlink(int32_t s) {
+    // R22: a slot in `dc_free_` is DETACHED (prev = next = -1, head != s): touching the -1 sentinels here used
+    // to set head = tail = -1 and silently collapse the LRU to one slot (the double-unlink bug the alloc
+    // comment warns about).  Shed slots join the free list, so allocations from it now hit this path: detached
+    // nodes are skipped, the list stays intact.
     const int32_t p = dc_prev_[(size_t) s], n = dc_next_[(size_t) s];
+    if (p < 0 && n < 0 && dc_head_ != (int32_t) s) return;
     if (p >= 0) dc_next_[(size_t) p] = n; else dc_head_ = n;
     if (n >= 0) dc_prev_[(size_t) n] = p; else dc_tail_ = p;
     dc_prev_[(size_t) s] = dc_next_[(size_t) s] = -1;
@@ -1313,7 +1434,7 @@ int32_t ArenaExpertSource::dc_alloc_locked(int64_t idx) {
 // lowest-value victim) and memcpy's in.  Called from prefill's consume step, host thread, serialized against
 // the decode path - but NOT against prefill's own reader threads touching resident blobs, hence the lock.
 bool ArenaExpertSource::dc_stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes) {
-    if (!dynamic_tier_ || dc_slots_ <= 0 || hot_slot_.empty() || bytes == nullptr) return false;
+    if (dc_slots_ <= 0 || hot_slot_.empty() || bytes == nullptr) return false;
     if (layer < 0 || expert < 0 || expert >= n_expert_) return false;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return false;
@@ -1321,6 +1442,15 @@ bool ArenaExpertSource::dc_stage_admit(int64_t layer, int64_t expert, const uint
     const uint64_t len = lay.blob_bytes(layer);
     if (len == 0 || len > dc_slot_bytes_) return false;
     std::lock_guard<std::mutex> lk(dc_mu_);
+    // R22: THE STATIC TIER REFILLS THE GOVERNOR'S SHED.  A static tier (STRATA_STATIC_TIER) used to refuse
+    // every runtime admission; that is still the case while all its slots are home - but after
+    // `shed_pressure` frees slots for the host's RAM, the prefill staging is exactly the path that can put
+    // the prompt's own working set back, so a static tier admits INTO THE FREE LIST only.  The check sits
+    // INSIDE the tier lock on purpose: a reader that raced the empty-check past the lock could otherwise
+    // fall into dc_alloc_locked's EVICT path (path B) and flush profile content - the one thing a static
+    // tier must never do.  The R10 flood rules (count = 0) cap it: a shed tier cannot be refilled past
+    // its own freed size.
+    if (!dynamic_tier_ && dc_free_.empty()) return false;
     if (hot_slot_[(size_t) idx] >= 0) {          // resident: this prompt's evidence of reuse
         dc_touch_locked((int32_t) ((uint64_t) hot_slot_[(size_t) idx] / dc_slot_bytes_));
         return true;

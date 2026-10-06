@@ -42,7 +42,7 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 template<int BlockSize>
-__global__ void norm(const float* input, const float* __restrict__ gamma, float* output,
+__global__ void __launch_bounds__(1024) norm(const float* input, const float* __restrict__ gamma, float* output,
                      int n_cols, float epsilon) {
     const int tid = threadIdx.x;
     const std::size_t row_offset = std::size_t(blockIdx.x) * n_cols;
@@ -66,7 +66,7 @@ __global__ void norm(const float* input, const float* __restrict__ gamma, float*
     for (std::size_t col = tid; col < std::size_t(n_cols); col += BlockSize)
         output[col] = scale * input[col] * gamma[col];
 }
-__global__ void gate(const float* attn, const float* __restrict__ q_full, float* output,
+__global__ void __launch_bounds__(1024) gate(const float* attn, const float* __restrict__ q_full, float* output,
                      int n_head, int head_dim) {
     const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= std::size_t(n_head) * head_dim) return;

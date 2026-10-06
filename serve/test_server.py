@@ -440,6 +440,207 @@ class DesyncGuard(unittest.TestCase):
         self.assertIs(eng.proc, proc_before, "a clean queue must not trigger an engine replacement")
 
 
+class EngineInfraFault(unittest.TestCase):
+    """An ERR about the ENGINE's own machinery (cuBLAS/CUDA allocation, the prefill path) is not a request error:
+    the engine wedges behind it and every later request sits silent until the watchdog.  The server must fail the
+    request AND replace the engine in the background, without restarting on request-scoped answers."""
+
+    @staticmethod
+    def script() -> str:
+        """A fake `--serve` engine.  The MODE file is read at EVERY GEN: 'cublas' prints the wedged prefill-gemm
+        ERR and then goes silent (exactly the real wedged engine), 'overflow' prints a request-scoped ERR and
+        would answer the next GEN, anything else answers normally."""
+        return ("#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "print('INFO context=4096', flush=True)\n"
+                "print('READY 4096 stop', flush=True)\n"
+                "for line in sys.stdin:\n"
+                "    if line.startswith('QUIT'):\n"
+                "        break\n"
+                "    if not line.startswith('GEN'):\n"
+                "        continue\n"
+                "    MODE = open(sys.argv[-1]).read().strip()\n"
+                "    if MODE == 'cublas':\n"
+                "        print('ERR prefill gemm: cublasCreate failed', flush=True)\n"
+                "        time.sleep(3600)\n"
+                "        continue\n"
+                "    if MODE == 'overflow':\n"
+                "        print('ERR prompt (5 tokens) leaves no room to answer in the context (4096)', flush=True)\n"
+                "        continue\n"
+                "    print('T 67', flush=True)\n"
+                "    print('DONE 1 3 1.0 40.0 stop 0 0 0', flush=True)\n")
+
+    def engine(self, mode: str) -> tuple[StrataEngine, Path]:
+        d = tempfile.mkdtemp(prefix="strata-infra-")
+        mode_file = Path(d) / "mode"
+        mode_file.write_text(mode)
+        exe = Path(d) / "fake-engine"
+        exe.write_text(self.script())
+        exe.chmod(0o755)
+        eng = StrataEngine(str(exe), [str(mode_file)], watchdog_s=30.0)
+        self.addCleanup(eng.close)
+        return eng, mode_file
+
+    def test_classifier(self):
+        from serve.server import is_engine_infra_error
+        self.assertTrue(is_engine_infra_error("prefill gemm: cublasCreate failed"))
+        self.assertTrue(is_engine_infra_error("prefill gemm: workspace"))
+        self.assertTrue(is_engine_infra_error("prefill: device buffers for a chunk of 16384 tokens do not fit"))
+        self.assertTrue(is_engine_infra_error("strata serve: cudaErrorDeviceUnavailable"))
+        self.assertTrue(is_engine_infra_error("sample_tokens: out of memory"))
+        for scoped in ("prompt (119684 tokens) + max tokens (20826) exceeds the context (131072)",
+                       "prompt (5 tokens) leaves no room to answer in the context (4096)",
+                       "bad request: max_new", "a token id is outside the vocabulary", "cancelled"):
+            self.assertFalse(is_engine_infra_error(scoped), scoped)
+
+    def test_infra_err_replaces_the_engine(self):
+        import serve.server as server
+        eng, mode_file = self.engine("cublas")
+        cancel = threading.Event()
+        proc_before = eng.proc
+        old = server.DRAIN_S
+        server.DRAIN_S = 0.5
+        try:
+            with self.assertRaises(ValueError):
+                gen = eng.generate([1, 2, 3], 10, {}, cancel)
+                try:
+                    next(gen)
+                finally:
+                    gen.close()
+        finally:
+            server.DRAIN_S = old
+        deadline = time.time() + 15
+        while not eng._ready.is_set() and time.time() < deadline:
+            time.sleep(0.25)
+        self.assertTrue(eng._ready.is_set(), "the engine was not replaced after an infra-fault ERR")
+        self.assertIsNot(eng.proc, proc_before, "an infra-fault ERR must replace the wedged engine")
+        mode_file.write_text("answer")     # the cublas wedge lives in the file: clear it for the next request
+        eng.lines.queue.clear()
+        got = [t for t in eng.generate([1, 2, 3], 10, {}, cancel) if t is not None]
+        self.assertEqual(got, [67], "the next request should be served by the fresh engine")
+
+    def test_request_scoped_err_does_not_restart_the_engine(self):
+        import serve.server as server
+        eng, mode_file = self.engine("overflow")
+        cancel = threading.Event()
+        proc_before = eng.proc
+        old = server.DRAIN_S
+        server.DRAIN_S = 0.5
+        try:
+            with self.assertRaises(ValueError):
+                gen = eng.generate([1, 2, 3], 10, {}, cancel)
+                try:
+                    next(gen)
+                finally:
+                    gen.close()
+        finally:
+            server.DRAIN_S = old
+        deadline = time.time() + 2
+        while not eng._ready.is_set() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertIs(eng.proc, proc_before, "a request-scoped ERR must not replace the engine")
+        self.assertTrue(eng._ready.is_set())
+        mode_file.write_text("answer")
+        got = [t for t in eng.generate([1, 2, 3], 10, {}, cancel) if t is not None]
+        self.assertEqual(got, [67])
+
+
+class _RecordingStdin:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def write(self, text):
+        self.sink.append(text)
+
+    def flush(self):
+        pass
+
+
+class FakeGovernableEngine:
+    """Small engine stand-in for the governor tests: a proc stub whose stdin records writes."""
+
+    max_context = CTX
+    _ready = threading.Event()
+    _in_request = False
+
+    def __init__(self):
+        self._ready.set()
+        self.written = []
+        from types import SimpleNamespace
+        self.proc = SimpleNamespace(stdin=_RecordingStdin(self.written))
+
+
+class MemGovernor(unittest.TestCase):
+    """R22: when MemAvailable dips under the floor and no request owns the engine, the server's governor
+    sends `SHED <bytes>`; a live request or a restarting engine blocks it.  The tests drive the REAL thread
+    with a shortened cadence (gov_period)."""
+
+    def service(self):
+        tok = ByteTokenizer()
+        eng = FakeGovernableEngine()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.gov_period = 0.05
+        return svc, eng
+
+    def test_sheds_only_while_idle_and_under_the_floor(self):
+        svc, eng = self.service()
+        svc.mem_floor_bytes = 1024 << 20
+        svc.mem_available_bytes = lambda: 256 << 20          # deep under the floor
+        svc._gov_stop = threading.Event()
+        thread = threading.Thread(target=svc._mem_governor, daemon=True)
+        thread.start()
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline and not eng.written:
+                time.sleep(0.05)
+            self.assertTrue(eng.written, "the governor never sent SHED")
+            line = eng.written[0]
+            self.assertTrue(line.startswith("SHED "))
+            self.assertEqual(int(line.split()[1]), (1024 << 20) + (512 << 20) - (256 << 20))
+            # a request that takes the engine stops further sheds
+            eng.written.clear()
+            eng._in_request = True
+            time.sleep(0.3)
+            self.assertEqual(eng.written, [], "the governor shed while a request held the engine")
+        finally:
+            svc._gov_stop.set()
+            thread.join(timeout=2)
+
+    def test_no_shed_when_memory_is_fine(self):
+        svc, eng = self.service()
+        svc.mem_available_bytes = lambda: 3072 << 20         # between floor and reg_high: nothing to do
+        svc._gov_stop = threading.Event()
+        thread = threading.Thread(target=svc._mem_governor, daemon=True)
+        thread.start()
+        try:
+            time.sleep(0.3)
+            self.assertEqual(eng.written, [], "shed or regrow sent inside the hysteresis band")
+        finally:
+            svc._gov_stop.set()
+            thread.join(timeout=2)
+
+    def test_regrow_sent_when_headroom_is_comfortable(self):
+        svc, eng = self.service()
+        svc.mem_available_bytes = lambda: 8192 << 20         # well above reg_high
+        svc._gov_stop = threading.Event()
+        thread = threading.Thread(target=svc._mem_governor, daemon=True)
+        thread.start()
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline and not eng.written:
+                time.sleep(0.05)
+            self.assertTrue(eng.written and eng.written[0].startswith("REGROW"),
+                            f"the governor never asked for the regrow: {eng.written}")
+            # a request that takes the engine stops the regrow too
+            eng.written.clear()
+            eng._in_request = True
+            time.sleep(0.3)
+            self.assertEqual(eng.written, [], "the governor regrew while a request held the engine")
+        finally:
+            svc._gov_stop.set()
+            thread.join(timeout=2)
+
+
 class ThinkingControl(unittest.TestCase):
     """reasoning_effort reaches the chat template: none closes the think block, the levels map onto the model's."""
 

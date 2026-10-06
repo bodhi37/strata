@@ -458,6 +458,27 @@ public:
     int64_t hot_hits() const { return hot_hits_; }
     int64_t hot_lookups() const { return hot_lookups_; }
 
+    /// R22: **THE PRESSURE GOVERNOR (the elastic tier).**  `pin_hot`'s tier is `mlock`ed and
+    /// `cudaHostRegister`ed - only reclaimable RAM frees itself; a hard-hosted session (24 GiB tier + KV pools
+    /// + everything else on ~30 GiB) reaches zero headroom, thrashes the swap and dies inside CUDA
+    /// (cublasCreate, 2026-10-04/05 twice).  `shed_pressure` returns WHOLE tier slices to the host: the
+    /// cold-end slices' slots leave the tier (`hot_slot_` cleared under the tier lock - every consumer gate
+    /// checks it, so the DMA/GPU path and the CPU pool stop using them), the slice's registration is undone
+    /// (registration PINS the pages - it must be unregistered before they can be reclaimed) and the pages are
+    /// dropped.  Decode on a shed slice pays a pread/miss instead of a DMA hit: slower but correct, and the
+    /// tier's former free space is what keeps the engine (and the machine) alive.  Returns the bytes granted.
+    uint64_t shed_pressure(uint64_t bytes_to_free);
+    /// Bytes the governor has already shed (diagnostics / the note line).
+    uint64_t hot_shed_bytes() const { return hot_shed_; }
+    /// Slots the shed freed (refillable by the LRU admissions when pressure passes).
+    int64_t shed_free_slots() const { return dc_free_.size(); }
+    /// R22b: **THE GOVERNOR'S REGROW.**  Re-register + re-mlock the most-recently-refill-gravity shed slice
+    /// (the arena's END slices refill first: the LIFO free list pops high slot ids), one per call, and only
+    /// when the host has MemAvailable >= slice + 1024 MiB of its own (the engine reads /proc/meminfo itself).
+    /// Returns the bytes regrown; 0 = refused (no headroom) or nothing to regrow.  The refilled slots' blobs
+    /// are re-admitted by ordinary LRU traffic afterwards; a regrown slice does not resurrect content.
+    uint64_t regrow_pressure(uint64_t bytes);
+
     /// R7: **WHERE THE EXPERT BYTES ACTUALLY CAME FROM.**  The old pair above counts only the lookups that
     /// reached the HOT-TIER CHECK, so a blob answered from the pread ring or straight out of the mapping was
     /// invisible - which is how "100% hot tier" coexisted with a disk-bound run.  These counters are inclusive
@@ -552,6 +573,15 @@ private:
     std::vector<int64_t> dc_admit_list_;       ///< this layer's pending admissions (blob idx), committed in wait_layer
     int64_t dc_admits_ = 0, dc_evicts_ = 0, dc_fallbacks_ = 0;
     int64_t dc_stage_admits_ = 0;              ///< R8b: prefill admissions
+    // ---- R22: the ELASTIC tier (the pressure governor).  `cudaHostRegister` pins pages (unswappable) and a
+    // tier whose whole 24 GiB is registered+mlocked is what an over-subscribed box dies on (2026-10-04/05:
+    // zram collapse, then cublasCreate).  Registration is in 2 GiB SLICES and `hot_reg_` tracks which slices
+    // still have a live registration; `shed_pressure` (called by the server's governor thread) picks whole
+    // slices from the arena's end (the coldest rank tail), unregisters + munlocks + drops their pages and
+    // puts their slots on the free list for the LRU admissions to refill when headroom returns.
+    std::vector<std::atomic<bool>> hot_reg_;    ///< per slice (~2 GiB = 12 slices per 24 GiB tier): the registration is live
+    uint64_t hot_slice_slots_ = 0;              ///< whole slots per slice, computed in pin_hot
+    uint64_t hot_shed_ = 0;                     ///< bytes handed back to the host so far
     /// R8b: guards the LRU structures when prefill's READER threads touch them (decode's mutators are all
     /// host-thread and never overlap prefill, but prefill touches run concurrently on the reader pool).
     ///

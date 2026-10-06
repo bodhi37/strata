@@ -5,8 +5,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <cstdio>
 #else
 #include <sys/mman.h>
+#include <cstdio>
+#include <cstring>
 #endif
 
 namespace strata::platform {
@@ -58,6 +61,20 @@ void unlock_resident(void* p, uint64_t bytes) {
         VirtualUnlock((uint8_t*) p + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk));
 }
 #else
+// R22b: the host's MemAvailable, in bytes (procfs; 0 when unreadable).  The pressure governor (the server)
+// and the engine's REGROW precheck both read /proc/meminfo; a shared helper keeps them honest about the same
+// figure.
+uint64_t host_available_bytes() {
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return 0;
+    char l[128];
+    uint64_t av = 0;
+    while (std::fgets(l, sizeof l, f))
+        if (std::strncmp(l, "MemAvailable:", 13) == 0) { std::sscanf(l + 13, "%llu", &av); av <<= 10; break; }
+    std::fclose(f);
+    return av;
+}
+
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }

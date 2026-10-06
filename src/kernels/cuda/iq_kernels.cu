@@ -27,11 +27,11 @@ void check(const char* what) {
 // ---------------------------------------------------------------- llama.cpp helpers (vecdotq.cuh)
 __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     const uint16_t* x16 = (const uint16_t*) x;
-    int x32 = x16[2 * i32 + 0] << 0;
-    x32 |= x16[2 * i32 + 1] << 16;
+    int x32 = __ldg(&x16[2 * i32 + 0]) << 0;
+    x32 |= __ldg(&x16[2 * i32 + 1]) << 16;
     return x32;
 }
-__device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+__device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return __ldg(&((const int*) x)[i32]); }
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -402,7 +402,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     }
 }
 
-__global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
+__global__ void __launch_bounds__(1024) swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                       long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -433,7 +433,7 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
-__global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
+__global__ void __launch_bounds__(1024) quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float xi = x[i];
@@ -652,12 +652,12 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
 
 // flat: superblock i -> y + 256 i
 template<typename dst_t>
-__global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y) {
+__global__ void __launch_bounds__(1024) dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y) {
     const int64_t i = blockIdx.x;
     dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x);
 }
 // gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
-__global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
+__global__ void __launch_bounds__(1024) dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
                                   __half* __restrict__ y) {
     const int64_t i = blockIdx.x;
     const int parity = blockIdx.y;
@@ -724,7 +724,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
 }
 
 namespace {
-__global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, size_t row_bytes,
+__global__ void __launch_bounds__(1024) embed_rows_kernel(int ty, const uint8_t* __restrict__ table, size_t row_bytes,
                                   const int32_t* __restrict__ tokens, int64_t n_embd, float* __restrict__ y) {
     const int t = blockIdx.y;
     const int64_t b = blockIdx.x;

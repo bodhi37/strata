@@ -27,7 +27,7 @@ void validate(const QsaShapes& s, const char* what) {
 }
 
 // One block = one 64-value group of one KV head of K (blockIdx.z = 0) or V (1); 64 threads, one value each.
-__global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q,
+__global__ void __launch_bounds__(1024) kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q,
                                     uint16_t* __restrict__ k_scale, uint16_t* __restrict__ v_scale,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
@@ -66,7 +66,7 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
 }
 
 // One thread = 4 consecutive values of one cell and head (as the FP16 gather does with uint2).
-__global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restrict__ v_q,
+__global__ void __launch_bounds__(1024) kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t* __restrict__ v_q,
                                     const uint16_t* __restrict__ k_scale, const uint16_t* __restrict__ v_scale,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
                                     const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,

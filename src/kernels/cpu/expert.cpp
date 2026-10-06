@@ -176,6 +176,12 @@ inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& 
     const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
     for (int b0 = 0; b0 < nblocks; b0 += 8) {
         const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        // Prefetch the next 8-block working set while the current one computes: codes stream
+        // (~128 B) + activation Quantized rows.  Hint-only, no semantic change.
+        if (b0 + 8 < nblocks) {
+            __builtin_prefetch(codes + (b0 + 8) * 16, 0, 3);
+            __builtin_prefetch(a.q + (b0 + 8) * QK, 0, 3);
+        }
         __m512 p, dd;
         scales8(scales, a, b0, nb, p, dd);
         const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);

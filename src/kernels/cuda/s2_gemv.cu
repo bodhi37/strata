@@ -16,7 +16,7 @@ namespace {
 
 constexpr int QK = 64;
 
-__global__ void s2_gemv_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+__global__ void __launch_bounds__(1024) s2_gemv_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
                                const float* __restrict__ scales, float* __restrict__ y, long long n_in,
                                long long n_out) {
     const long long o = (long long) blockIdx.x * blockDim.x + threadIdx.x;

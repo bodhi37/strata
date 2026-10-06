@@ -152,7 +152,7 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
 }
 
 template <int TYPE, typename T>
-__global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+__global__ void __launch_bounds__(1024) dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                                int64_t groups_per_row, T* __restrict__ out) {
     const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * groups_per_row) return;

@@ -1,6 +1,7 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 namespace strata {
@@ -24,6 +26,17 @@ void ck(cublasStatus_t s, const char* what) {
 // R21: cublasCreate can fail transiently when the context is under VRAM pressure (long sessions with
 // per-request prefill allocs) or right after a driver hiccup.  A failure here used to take the whole
 // engine down; reclaim, wait, and retry before giving up.
+// R22: this now runs exactly ONCE per process (Prefill::init, at engine setup) - the per-request creation
+// that put this under pressure is gone.  The diagnostic matters: CUBLAS_STATUS_ALLOC_FAILED under host
+// thrash (the hot tier + KV pools + zram: check MemAvailable) or a drained VRAM ledger (check the device).
+static void free_mem_note() {
+    size_t fb = 0, tb = 0;
+    cudaMemGetInfo(&fb, &tb);
+    const uint64_t host_av = strata::platform::host_available_bytes();
+    std::fprintf(stderr, "prefill gemm: free VRAM %zu MiB of %zu MiB, MemAvailable %lld MiB\n",
+                 fb >> 20, tb >> 20, host_av == 0 ? -1l : (long long) (host_av >> 20));
+}
+
 bool create_handle(cublasHandle_t* h) {
     for (int attempt = 0;; ++attempt) {
         if (cublasCreate(h) == CUBLAS_STATUS_SUCCESS) return true;
@@ -31,6 +44,7 @@ bool create_handle(cublasHandle_t* h) {
         (void) cudaFree(0);
         if (attempt >= 3) return false;
         std::fprintf(stderr, "prefill gemm: cublasCreate failed; reclaiming and retrying (%d/3)\n", attempt + 1);
+        free_mem_note();
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 }
