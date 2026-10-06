@@ -44,6 +44,67 @@ int ExpertPool::tasks_per_thread() {
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
+#if defined(_WIN32)
+    // Ask the OS rather than assuming a layout.  `hardware_concurrency()` returns LOGICAL processors, and on
+    // every SMT machine half of them are siblings - pinning one worker to each of the first N would put two
+    // workers on each physical core and halve the bandwidth the expert kernel is bound by.
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
+    } else {
+        std::vector<char> buf(len);
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                             (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+            const char* p = buf.data();
+            const char* end = p + len;
+            while (p < end) {
+                const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+                if (e->Relationship == RelationProcessorCore) {
+                    const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
+                    for (int bit = 0; bit < 64; ++bit)
+                        if (g.Mask & (1ull << bit)) { cores.push_back((int) (g.Group * 64 + bit)); break; }
+                }
+                p += e->Size;
+            }
+        }
+    }
+#else
+    // R9a: ONE LOGICAL CPU PER PHYSICAL CORE (the first thread of each sibling set), followed by the SMT
+    // siblings in core order.  The old form listed every logical CPU the affinity mask allows and then took
+    // them in index order, so 12 workers on a 12C/24T 9900X landed as {1,2,3,...,16}: cores 0-7 each got TWO
+    // workers (both running AVX-512 drains at ~60% speed against each other) while cores 9-11 sat idle, and
+    // nothing ever ran on the siblings except by accident.  With this order the first 11 workers are alone on
+    // their cores, worker 12+ takes a sibling, and the readers/server/GPU threads have 12 siblings to land on.
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        std::vector<int> phys, sib;
+        for (long i = 0; i < ncpu && i < CPU_SETSIZE; ++i) {
+            if (!CPU_ISSET((int) i, &set)) continue;
+            char path[128];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            std::ifstream f(path);
+            long first = i;
+            if (f) {
+                std::string line;
+                std::getline(f, line);
+                first = strtol(line.c_str(), nullptr, 10);
+            }
+            if (first == i) phys.push_back((int) i);
+            else sib.push_back((int) i);
+        }
+        for (int c : phys) cores.push_back(c);
+        for (int c : sib) cores.push_back(c);
+    } else {
+        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
+    }
+#endif
+    if (skip_first && !cores.empty()) cores.erase(cores.begin());
+    return cores;
+}
+
 namespace {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
