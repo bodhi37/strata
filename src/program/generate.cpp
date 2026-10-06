@@ -3603,7 +3603,12 @@ int main(int argc, char** argv) {
                              (long long) i, err.c_str());
                 return 1;
             }
-            if (verify_slot == strata::core::kNotResident) {
+            if (std::getenv("STRATA_VERIFY_LAST") != nullptr) {
+                verify_slot = slot;
+                verify_blob = b;
+                verify_bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(
+                    profile[(size_t) (vram_skip + i)].first);
+            } else if (verify_slot == strata::core::kNotResident) {
                 verify_slot = slot;
                 verify_blob = b;
                 verify_bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(
