@@ -2037,55 +2037,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e))) ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_ready();
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
-        // R21: --gpu-share.  A deterministic fraction of ALL distinct experts - RAM-tier hits included,
-        // not just VRAM-cache misses - is computed on the GPU, so the window's expert bytes stream from
-        // DRAM through the pool's cores AND through the PCIe path at the same time instead of
-        // serializing behind the pool.  The split is per (layer, expert), so a blob lands on the same
-        // side every window; correctness is unaffected either way (the combine adds the shares, and the
-        // float-order difference is the same class the VRAM-hit path already carries).
-        const bool share_gpu = d.gpu_share > 0;
-        GpuPlanSink& P = *d.plan;
-        const int64_t fcap = P.pcie_mode == 1 ? 64 : P.staging_cap;   // zero-copy needs no staging
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
+        GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
-        for (int64_t q = 0; q < nd; ++q) {
+        for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                bool gpu = false;
-                if (share_gpu) {
-                    uint32_t h = (uint32_t) e * 0x9E3779B1u;
-                    h ^= (uint32_t) d.layers * 0x85EBCA6Bu;
-                    h *= 0xC2B2AE35u;
-                    h ^= h >> 15;
-                    gpu = (h >> 24) < (uint32_t) d.gpu_share;
-                } else if (slot < 0) {
-                    gpu = miss_rank >= nmiss - m;
-                }
-                if (gpu && fetches < fcap && fetches < 64) {
-                    const uint8_t* src = d.src->blob(d.layers, e);
-                    if (src != nullptr && d.src->pinned(d.layers, e)) {
-                        kd = 1;
-                        dma_src[fetches] = src;
-                        pcie_i0[fetches] = i0;
-                        ++fetches;
-                        if (slot >= 0) ++d.pcie_residents;
-                    }
-                }
-                if (kd != 1) {
-                    if (slot >= 0) {
-                        kd = 0;
-                        ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                     : (size_t) slot * (size_t) d.cache_blob));
-                    } else {
-                        ++miss_rank;
                 if (slot >= 0) {
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
@@ -2102,6 +2066,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                             ++fetches;
                         }
                     }
+                    ++miss_rank;
                 }
             }
             for (int64_t i = i0; i < n; ++i)
@@ -2191,26 +2156,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
-    // ---- R7: TWO PASSES, SO THE DRIVE'S LATENCY HIDES BEHIND THE CPU'S OWN WORK.
-    //
-    // The layer's routed experts split into two sets that need nothing from each other:
-    //
-    //   * the ones whose bytes are ALREADY available - the host hot tier, or the mapping - and
-    //   * the ones `begin_layer` has put on the wire and that are still landing.
-    //
-    // Measured with the one-pass form on the IQ3_XXS pack, a 20 GiB host tier and `--spec 4`: of a 272 ms
-    // window, **176 ms was `begin_layer`'s blocking wait** while the CPU had **57 ms** of resident-expert work
-    // queued behind it, and the GPU sat idle through both.  Running pass 1 first puts that 57 ms inside the
-    // wait instead of after it.  Entries are consistent about which pass they belong to because `ring_pending`
-    // is a property of `(layer, expert)`, so an expert's rows never straddle the two pool calls.
-    auto dispatch_pass = [&](int pass) {
-        int njobs = 0;
-        for (int64_t t = 0; t < n_tok; ++t)
-            for (int64_t j = 0; j < k; ++j) {
-                const int64_t i = t * k + j;
-                const int64_t e = ids[i];
-                float* row = out + (size_t) i * H;
-                if (pass == 0 && (e < 0 || e >= d.n_expert)) {
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
         miss.clear();
@@ -2250,54 +2195,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const uint8_t* b = d.src->blob(d.layers, e);
                 if (b == nullptr) {
                     d.failed = true;
-                    d.fail = "a routed expert id is out of range";
+                    d.fail = "the expert source could not produce a blob";
                     d.fail_layer = d.layers;
                     d.fail_expert = e;
-                    return false;
+                    ++d.missing;
+                    return;
                 }
-                if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
-                    if (pass == 0) {
-                        if (kind[i] == 0) ++d.cache_hits;
-                        std::memset(row, 0, (size_t) H * sizeof(float));
-                    }
-                    continue;
-                }
-                if (d.src->ring_pending(d.layers, e) != (pass == 1)) continue;
-                ++d.cache_refused;
-                int16_t& jo = d.job_of[(size_t) e];
-                if (jo < 0) {
-                    const uint8_t* b = d.src->blob(d.layers, e);
-                    if (b == nullptr) {
-                        d.failed = true;
-                        d.fail = "the expert source could not produce a blob";
-                        d.fail_layer = d.layers;
-                        d.fail_expert = e;
-                        ++d.missing;
-                        return false;
-                    }
-                    jo = (int16_t) njobs++;
-                    ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                    nj.blob = b;
-                    nj.nt = 0;
-                }
-                ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-                jb.act[jb.nt] = &d.act_multi[(size_t) t];
-                jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-                jb.out[jb.nt] = row;
-                ++jb.nt;
-                ++d.multi_entries;
+                jo = (int16_t) njobs++;
+                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                nj.blob = b;
+                nj.nt = 0;
             }
-        if (njobs > 0) {
-            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-            else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            jb.act[jb.nt] = &d.act_multi[(size_t) t];
+            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+            jb.out[jb.nt] = row;
+            ++jb.nt;
+            ++d.multi_entries;
         }
-        return true;
-    };
-    if (!dispatch_pass(0)) return;
-    const auto c2b = std::chrono::steady_clock::now();
-    d.src->wait_layer();          // the reads submitted by `begin_layer` are awaited HERE, after the residents
-    const auto c2c = std::chrono::steady_clock::now();
-    if (!dispatch_pass(1)) return;
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
@@ -2327,16 +2242,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
-    d.ms_run += ms(c2, c2b);            // pass 0: the resident experts, computed while the reads are in flight
-    d.ms_wait += ms(c2b, c2c);          // the part of the drive's latency the resident work did NOT cover
+    d.ms_run += ms(c3, c4);
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
-    d.multi_misses += d.cache_refused;
-    if (!d.usage_total.empty())
-        for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) ++d.usage_total[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]];
+    d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;
 }
