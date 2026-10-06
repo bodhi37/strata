@@ -52,9 +52,9 @@ __global__ __launch_bounds__(64,1) void score_kernel(
         const float* __restrict__ pooled,const float* __restrict__ query,
         const float* __restrict__ bias,const int32_t* __restrict__ step,
         int max_cells,float* __restrict__ cells) {
-    const int n=step[kStepNKv],full=step[kStepNBid];
-    if(n<1||n>max_cells||step[kStepPos]!=n-1||full!=n/R||
-       step[kStepWidth]!=(n<2051?n:2051))return;
+    const int n=__ldg(&step[kStepNKv]),full=__ldg(&step[kStepNBid]);
+    if(n<1||n>max_cells||__ldg(&step[kStepPos])!=n-1||full!=n/R||
+       __ldg(&step[kStepWidth])!=(n<2051?n:2051))return;
     const int row0=blockIdx.x*ROWS;
     if(row0>full)return;
     const int lane=threadIdx.x,warp=threadIdx.y;
@@ -71,7 +71,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
 #pragma unroll
             for(int i=0;i<16;++i){
                 const int row=row0+ia*16+i;
-                tile[i*STRIDE+lane]=row<=full?pooled[size_t(row)*D+col]:0.0f;
+                tile[i*STRIDE+lane]=row<=full?__ldg(&pooled[size_t(row)*D+col]):0.0f;
             }
             __syncwarp();
 #pragma unroll
@@ -79,7 +79,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
         }
         __syncwarp();
 #pragma unroll
-        for(int h=0;h<8;++h)tile[h*STRIDE+lane]=h<HEADS?query[h*D+col]:0.0f;
+        for(int h=0;h<8;++h)tile[h*STRIDE+lane]=h<HEADS?__ldg(&query[h*D+col]):0.0f;
         __syncwarp();
 #pragma unroll
         for(int k=0;k<4;++k){
@@ -112,7 +112,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
             h[j]=fmaxf(v,0.0f);
         }
         float sum=__fadd_rn(__fadd_rn(__fadd_rn(h[0],h[1]),h[2]),h[3]);
-        if(bias)sum=__fadd_rn(sum,bias[row]);
+        if(bias)sum=__fadd_rn(sum,__ldg(&bias[row]));
         sum=__fadd_rn(sum,row==full&&n%R?1e9f:0.0f);
         // The live causal mask is +0. Invalid/padded cells are never exported.
         sum=__fadd_rn(sum,0.0f);

@@ -30,9 +30,10 @@ namespace {
 constexpr int QK_S2 = 64;
 constexpr int CODES_PER_BYTE_S2 = 4;
 
-__global__ void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
-                                     const float* __restrict__ scales, float* __restrict__ y, long long n_in,
-                                     long long n_out, int threads_per_row) {
+__global__ void __launch_bounds__(256)
+s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+                     const float* __restrict__ scales, float* __restrict__ y, long long n_in,
+                     long long n_out, int threads_per_row) {
     extern __shared__ float partial[];
     const long long o = blockIdx.x;
     if (o >= n_out) return;
@@ -43,9 +44,18 @@ __global__ void s2_gemv_quads_kernel(const uint16_t* __restrict__ x, const uint8
     const float* s = scales + o * (n_in / QK_S2);
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    // The S2 group covers 16 consecutive quads, so consecutive loop iterations often share the
+    // same scale.  Cache it instead of reloading s[q>>4] per quad (16x redundant global loads
+    // per group).  Same value, same expression - purely fewer loads.
+    long long cached_g = -1;
+    float d = 0.0f;
     for (long long q = tid; q < n_quads; q += threads_per_row) {
-        const uint8_t byte = c[q];                      // ONE load for four codes
-        const float d = s[q >> 4];                      // (q*4) >> 6, the group index as a shift
+        const uint8_t byte = __ldg(&c[q]);              // ONE load for four codes
+        const long long g = (q >> 4);                   // (q*4) >> 6, the group index as a shift
+        if (g != cached_g) {
+            d = __ldg(&s[g]);
+            cached_g = g;
+        }
         // ONE 64-bit load for four halves.  `x` is 256-byte aligned and four halves are eight bytes, so
         // this is an aligned uint2 - if it were not, the misaligned access would fault rather than be slow.
         const uint2 xw = *reinterpret_cast<const uint2*>(x + q * 4);

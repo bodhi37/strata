@@ -30,9 +30,10 @@ namespace {
 constexpr int QK_S2 = 64;
 constexpr int QK8_0 = 32;
 
-__global__ void s2_gemv_q8_kernel(const uint8_t* __restrict__ act, const uint8_t* __restrict__ codes,
-                                  const float* __restrict__ scales, float* __restrict__ y, long long n_in,
-                                  long long n_out, int threads_per_row) {
+__global__ void __launch_bounds__(256)
+s2_gemv_q8_kernel(const uint8_t* __restrict__ act, const uint8_t* __restrict__ codes,
+                  const float* __restrict__ scales, float* __restrict__ y, long long n_in,
+                  long long n_out, int threads_per_row) {
     extern __shared__ float partial[];
     const long long o = blockIdx.x;
     if (o >= n_out) return;
@@ -43,16 +44,32 @@ __global__ void s2_gemv_q8_kernel(const uint8_t* __restrict__ act, const uint8_t
     const float* s = scales + o * (n_in / QK_S2);
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    // Hoist the loop-invariant scales: the S2 group covers 16 quads, one Q8_0 block covers 8
+    // quads.  Cache both instead of recomputing div/mod + reloading per quad.  q >= 0 always,
+    // so (q*4)/32 == q>>3 and (q*4)%32 == (q&7)*4 exactly - no division instruction.
+    long long cached_g = -1;
+    float d = 0.0f;
+    long long cached_ablk = -1;
+    float dx = 0.0f;
+    const int8_t* xq_base = nullptr;
     for (long long q = tid; q < n_quads; q += threads_per_row) {
-        const uint8_t byte = c[q];
-        const float d = s[q >> 4];                      // (q*4) >> 6, the S2 group index as a shift
+        const uint8_t byte = __ldg(&c[q]);
+        const long long g = (q >> 4);                   // (q*4) >> 6, the S2 group index as a shift
+        if (g != cached_g) {
+            d = __ldg(&s[g]);
+            cached_g = g;
+        }
         // the activation quad: four int8 in one 32-element block, so one block scale
-        const long long ablk = (q * 4) / QK8_0;
-        const uint8_t* blk = act + ablk * 34;
-        const uint16_t dbits = (uint16_t) (blk[0] | (blk[1] << 8));
-        const float dx = __half2float(__ushort_as_half(dbits));
-        const int8_t* xq = reinterpret_cast<const int8_t*>(blk + 2);
-        const int off = (int) ((q * 4) % QK8_0);
+        const long long ablk = (q >> 3);                // (q*4)/32, exact for q >= 0
+        const int off = (int) ((q & 7) * 4);            // (q*4)%32, exact for q >= 0
+        if (ablk != cached_ablk) {
+            const uint8_t* blk = act + ablk * 34;
+            const uint16_t dbits = (uint16_t) (__ldg(&blk[0]) | (__ldg(&blk[1]) << 8));
+            dx = __half2float(__ushort_as_half(dbits));
+            xq_base = reinterpret_cast<const int8_t*>(blk + 2);
+            cached_ablk = ablk;
+        }
+        const int8_t* xq = xq_base;
 
         const float w0 = (float) ((int) (byte & 3) - 1) * d;
         const float w1 = (float) ((int) ((byte >> 2) & 3) - 1) * d;

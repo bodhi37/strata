@@ -35,7 +35,13 @@ LOGF="logs/srv-$(basename "$CFG" .json).log.srv"
 # 2x-4x margin); 180 (server default) is one QLC/zram hiccup away from killing a HEALTHY engine and
 # losing every cache. 0 disables.
 WATCHDOG_S="${STRATA_WATCHDOG_S:-300}"
+# R22: the memory governor's floor (MiB of MemAvailable).  Under it, between requests, the server tells the
+# engine to shed cold-scored slices of the mlocked hot tier instead of letting the box swap-storm to where
+# CUDA allocations die (the 2026-10-04/05 cublasCreate deaths); 2.5 GiB above it, shed slices regrow and
+# DMA comes back.  STRATA_MEM_FLOOR_MIB=0 disables the governor entirely (a nop for A/B arms).
+MEM_FLOOR_MIB="${STRATA_MEM_FLOOR_MIB:-1536}"
 tmux new-session -d -s "$SESSION" -e STRATA_API_KEY="$API_KEY" -e STRATA_WATCHDOG_S="$WATCHDOG_S" \
+  -e STRATA_MEM_FLOOR_MIB="$MEM_FLOOR_MIB" \
   "./venv/bin/python serve/server.py --engine strata --config '$CFG' --port '$PORT' --host '$TS_IP' 2>&1 | tee -a $LOGF"
 # wait for readiness
 for i in $(seq 1 90); do

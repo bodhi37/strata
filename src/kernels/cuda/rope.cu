@@ -53,7 +53,7 @@ namespace {
 //
 // A row is head_dim floats (256 here) and there are batch x heads of them, so one thread per row is a
 // handful of threads for a token and removes the ordering question entirely rather than synchronising it.
-__global__ void rope_neox_kernel(const float* __restrict__ x, float* __restrict__ out, long long rows,
+__global__ void __launch_bounds__(1024) rope_neox_kernel(const float* __restrict__ x, float* __restrict__ out, long long rows,
                                  int head_dim, int n_rot, const float* __restrict__ cos_tab,
                                  const float* __restrict__ sin_tab, const int* __restrict__ pos,
                                  const int32_t* __restrict__ mtab) {

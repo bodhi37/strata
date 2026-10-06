@@ -133,7 +133,7 @@ __device__ double block_sum(double v, double* scratch) {
 /// normalise by its own square.  That mistake is silent - it produces a plausible vector of the right shape -
 /// and it is what `gr_parity`'s `mixed vs reference` caught at 2.0e+01 in round 196.
 template <bool FP32_ACT>
-__global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w_norm, float eps,
+__global__ void __launch_bounds__(1024) gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w_norm, float eps,
                                int n_embd, float* __restrict__ xn, uint16_t* __restrict__ xq) {
     __shared__ double scratch[8];
     const int c = blockIdx.x;
@@ -162,7 +162,7 @@ __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restr
 
 /// `lo = silu((bf16(xn) @ w_down.T) / hc)`, ONE BLOCK PER OUTPUT ROW with its warps splitting the reduction.
 template <typename Activation>
-__global__ void gr_down_kernel(const Activation* __restrict__ xq, const uint16_t* __restrict__ w_down, int hc_dim,
+__global__ void __launch_bounds__(1024) gr_down_kernel(const Activation* __restrict__ xq, const uint16_t* __restrict__ w_down, int hc_dim,
                                int hc_lr, int hc, Activation* __restrict__ lq) {
     const int k = blockIdx.x;
     if (k >= hc_lr) return;
@@ -231,7 +231,7 @@ __global__ void gr_down_kernel(const Activation* __restrict__ xq, const uint16_t
 
 /// `gated[i] = xn[i] * sigmoid(bf16(lo) @ w_up.T)`, one warp per output row, lanes striding hc_lr.
 template <typename Activation>
-__global__ void gr_gate_kernel(const Activation* __restrict__ lq, const uint16_t* __restrict__ w_up,
+__global__ void __launch_bounds__(1024) gr_gate_kernel(const Activation* __restrict__ lq, const uint16_t* __restrict__ w_up,
                                const float* __restrict__ xn, int hc_dim, int hc_lr, float* __restrict__ gated) {
     const int i = blockIdx.x * WARPS + (threadIdx.x >> 5);
     if (i >= hc_dim) return;
@@ -248,7 +248,7 @@ __global__ void gr_gate_kernel(const Activation* __restrict__ lq, const uint16_t
 
 /// `mixed[d] = mean over c of gated[c][d]`.  Flat elementwise: the mean is over the streams, which are
 /// strided by n_embd, so no cross-thread reduction is needed at all.
-__global__ void gr_mean_kernel(const float* __restrict__ gated, int n_embd, int hc, float* __restrict__ mixed) {
+__global__ void __launch_bounds__(1024) gr_mean_kernel(const float* __restrict__ gated, int n_embd, int hc, float* __restrict__ mixed) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= n_embd) return;
     float m = 0.0f;
@@ -263,7 +263,7 @@ __global__ void gr_mean_kernel(const float* __restrict__ gated, int n_embd, int 
 /// work; a warp per stream is the same shape as the down projection and reuses its pattern exactly.  The
 /// whole kernel is one block of `32*hc` threads, which is small - and it is a 4-value output, so it is.
 template <typename Activation>
-__global__ void gr_inject_kernel(const Activation* __restrict__ xq, const uint16_t* __restrict__ w_inject,
+__global__ void __launch_bounds__(1024) gr_inject_kernel(const Activation* __restrict__ xq, const uint16_t* __restrict__ w_inject,
                                  int hc_dim, int hc, float* __restrict__ inject) {
     const int c = threadIdx.x >> 5;
     if (c >= hc) return;
@@ -280,7 +280,7 @@ __global__ void gr_inject_kernel(const Activation* __restrict__ xq, const uint16
     if (lane == 0) inject[c] = acc;
 }
 
-__global__ void gr_write_kernel(const float* __restrict__ R, const float* __restrict__ block_out,
+__global__ void __launch_bounds__(1024) gr_write_kernel(const float* __restrict__ R, const float* __restrict__ block_out,
                                 const float* __restrict__ inject, int n_embd, int hc, float* __restrict__ out) {
     // w = 2*sigmoid(inject/hc), computed once per stream in shared rather than per element.
     extern __shared__ unsigned char smem_raw[];

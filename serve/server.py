@@ -53,6 +53,25 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 READY_WAIT_S = 600.0        # how long a request waits for a restarting engine before giving up (retryable)
 DRAIN_S = 90.0              # how long an early-stopped request waits for the engine's STOP/DONE (covers a prefill
                             # chunk cancel plus the engine's lent-slot refill cleanup before the FIFO moves on)
+READY_SPAWN_TIMEOUT_S = 300.0   # the engine normally reaches READY in ~75-90 s; silence beyond this is a startup
+                                # hang (a wedged driver, a stuck NVMe read), not a slow load - kill and report
+
+
+def is_engine_infra_error(msg: str) -> bool:
+    """True for engine faults that are about the ENGINE, not about one request: allocation/CUDA failures
+    (cuBLAS handle, workspace, dequant scratch, device buffers), the prefill path dying under a deep
+    session's memory pressure.  The engine answers such faults with `prefill gemm: ...` / `prefill: ...`
+    ERR lines and often wedges behind them (2026-10-04, x86/rce: 'prefill gemm: cublasCreate failed', then
+    the next request sat in a stalled cublasCreate for 300 s).  These get the engine REPLACED in the
+    background (like the watchdog does) so the next request lands on a fresh one instead of another
+    5-minute silence.  Request-scoped engine answers (overflow, bad token id, no room) return False: the
+    engine handles those correctly and must NOT be restarted."""
+    m = msg.strip().lower()
+    if m.startswith("prefill"):
+        return True
+    return any(mark in m for mark in
+               ("cublas", "cuda", "out of memory", "workspace", "dequant scratch", "device buffers",
+                "could not allocate", "hit path could not allocate", "sample_tokens"))
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -107,6 +126,21 @@ class StrataEngine:
         self._ready = threading.Event()
         self._spawn()
 
+    def _spawn_kill_after(self, proc, box):
+        """Ready-deadline enforcement that works even when the engine prints NOTHING: a hung startup (a wedged
+        driver, a stuck load) must not hang the server's spawn read forever.  When the deadline passes without
+        READY, kill the process; the spawn read then sees EOF and raises the timeout message.  `proc` is bound:
+        a newer engine (a restart replaced it) is never killed by an old guard."""
+        time.sleep(READY_SPAWN_TIMEOUT_S)
+        if box.get("ready"):
+            return
+        box["hang"] = True
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
     def _spawn(self):
         """Start `strata --serve` and read it up to READY.  Safe to call again: a stalled engine is killed and
         replaced by restart(), so a hung request cannot take the endpoint down for good."""
@@ -122,6 +156,10 @@ class StrataEngine:
             self.info["version"] = json.loads((Path(self.exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
+        box = {"ready": False}
+        guard = threading.Timer(READY_SPAWN_TIMEOUT_S, self._spawn_kill_after, args=(self.proc, box))
+        guard.daemon = True
+        guard.start()
         for line in self.proc.stdout:
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
@@ -132,6 +170,11 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 break
+        box["ready"] = True
+        guard.cancel()
+        if box.get("hang"):
+            raise RuntimeError(f"the engine did not reach READY in {READY_SPAWN_TIMEOUT_S:.0f} s (startup hang?)"
+                               + (f" (see {self.log_path})" if self.log_path else ""))
         if self.max_context <= 0:
             raise RuntimeError("the engine exited before it was ready" +
                                (f" (see {self.log_path})" if self.log_path else ""))
@@ -151,6 +194,7 @@ class StrataEngine:
     def start_restart(self, reason: str):
         """Replace a stalled engine on its own thread: the request that noticed the stall fails first, and later
         requests wait (with heart-beats) for the new engine to reach READY."""
+        self._ready.clear()            # a restart is in flight: the waits in generate()/prepare() must not pass early
         threading.Thread(target=self.restart, args=(reason,), daemon=True).start()
 
     def restart(self, reason: str):
@@ -245,7 +289,6 @@ class StrataEngine:
             sample = str(stale[0])[:60].replace("\n", " ")
             print(f"[strata] engine output out of step ({len(stale)} line(s) left by an earlier request, "
                   f"first: {sample!r}); replacing the engine", flush=True)
-            self._ready.clear()            # before the restart thread runs: the wait below must not pass early
             self.start_restart("stale engine output left by an earlier request")
             waited = time.time()
             while not self._ready.is_set():
@@ -283,6 +326,9 @@ class StrataEngine:
                 last_output = time.time()
                 if line is None:
                     done = True
+                    # the engine died: replace it in the background NOW (the failure is already terminal for this
+                    # request), so the next request waits for a fresh one instead of erroring the same way forever.
+                    self.start_restart("the engine process ended")
                     raise RuntimeError("the engine process ended")
                 if line.startswith("T "):
                     if cancel.is_set():
@@ -301,7 +347,13 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    msg = line[4:].strip()
+                    if is_engine_infra_error(msg):
+                        # an ENGINE fault (allocation/CUDA/prefill-path class, see is_engine_infra_error): this
+                        # request is terminal; without a replacement the next request would sit inside the same
+                        # wedged engine until the watchdog fires (5 min of silence per pi retry).
+                        self.start_restart(f"engine infra fault: {msg[:80]}")
+                    raise ValueError(msg)
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -504,6 +556,65 @@ class Service:
         self.status_lock = threading.Lock()
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # R22: the memory governor.  The engine's hot tier is mlocked and cudaHostRegistered - pinned forever -
+        # and on a 30 GB box a deep long-horizon session (tier + KV pools + desktop) converges to zero
+        # headroom: the swap storm then kills allocations inside CUDA ("prefill gemm: cublasCreate failed",
+        # 2026-10-04/05) and the 300 s watchdog replaces an otherwise-healthy engine.  This thread watches
+        # /proc/meminfo's MemAvailable and, BETWEEN requests (the engine runs one GEN at a time and reads stdin
+        # only there), sends `SHED <bytes>` so the hot tier SHRINKS to keep the floor: whole rank-tail slices of
+        # the tier are unregistered/unlocked/dropped; their blobs serve from preads (slower, correct) until the
+        # LRU refills the freed slots; and REGROW <bytes> (one shed slice per call) when MemAvailable is
+        # comfortably above the floor.  STRATA_MEM_FLOOR_MIB (default 1536; 0 disables) is the floor.
+        try:
+            self.mem_floor_bytes = int(os.environ.get("STRATA_MEM_FLOOR_MIB", "") or 1536) << 20
+        except ValueError:
+            self.mem_floor_bytes = 1536 << 20
+        self.gov_period = 2.0              # the governor's sampling cadence (tests shorten it)
+        self._gov_stop = threading.Event()
+
+    def start_governor(self):
+        """The memory-governor thread for a resident StrataEngine (see __init__) - started by the server
+        bootstrap beside start_telemetry."""
+        if self.mem_floor_bytes <= 0 or getattr(self, "_gov_thread", None) is not None or \
+                not hasattr(self.engine, "proc"):
+            return
+        self._gov_thread = threading.Thread(target=self._mem_governor, daemon=True)
+        self._gov_thread.start()
+
+    @staticmethod
+    def mem_available_bytes():
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        return 1 << 60
+
+    def _mem_governor(self):
+        # R22b: regrows only when MemAvailable is 2.5 GiB above the floor (hysteresis: shed below the floor,
+        # regrow far above it, so a tier can never grow back into the pressure that made it shed).
+        reg_high = self.mem_floor_bytes + (2560 << 20)
+        while not self._gov_stop.wait(self.gov_period):
+            eng = self.engine
+            if not eng._ready.is_set():          # restarting: nothing coursecorrect yet
+                continue
+            if getattr(eng, "_in_request", False):   # a request owns the engine: shed lands on its next gap
+                continue
+            avail = self.mem_available_bytes()
+            if avail >= reg_high:
+                try:
+                    eng.proc.stdin.write("REGROW 0\n")     # one slice per call; the engine prechecks too
+                    eng.proc.stdin.flush()
+                except (OSError, BrokenPipeError):
+                    return
+                continue
+            if avail >= self.mem_floor_bytes:
+                continue
+            want = (self.mem_floor_bytes + (512 << 20)) - avail
+            try:
+                eng.proc.stdin.write(f"SHED {want}\n")
+                eng.proc.stdin.flush()
+            except (OSError, BrokenPipeError):
+                return
 
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
@@ -657,6 +768,7 @@ class Service:
                     self.status["queued"] -= 1
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
+                setattr(self.engine, "_in_request", True)     # R22: the governor must not SHED a live request
                 last_print = time.time()
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
                     self.engine.generate(ids, max_new, sampling, cancel)
@@ -691,6 +803,7 @@ class Service:
             finish = "error"                            # history must not report a stalled request as "length"
             raise
         finally:
+            setattr(self.engine, "_in_request", False)   # R22: the governor may shed between requests
             if emb:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
@@ -1109,6 +1222,7 @@ class Server(ThreadingHTTPServer):
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
+    svc.start_governor()
     httpd = Server((host, port), make_handler(svc))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd

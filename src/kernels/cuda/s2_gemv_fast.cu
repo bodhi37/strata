@@ -64,7 +64,7 @@ void ensure_lut() {
 // One block per output row.  `staged` says whether x was copied to shared, so the SAME kernel covers both
 // configurations and the bench can measure them against each other with nothing else changed.
 template <bool STAGE_X>
-__global__ void s2_gemv_fast_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+__global__ void __launch_bounds__(1024) s2_gemv_fast_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
                                     const float* __restrict__ scales, float* __restrict__ y, long long n_in,
                                     long long n_out, int threads_per_row) {
     extern __shared__ float smem[];

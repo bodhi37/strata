@@ -1284,10 +1284,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
     }
+    // ---- THE HOST HOT TIER, BEFORE THE VRAM TIER.  The profile ranks (layer, expert) by routing frequency, so
+    // the pinned host tier takes the top of that list; the VRAM tier then takes the top of what the card can
+    // hold.  Ordered on purpose: `srcp->blob` must answer from the hot arena before the cache fill copies
+    // out of it, or the fill would pull the same bytes through the mapping and re-fault them from disk.
+    // This ALSO has to run before the sized-slot build below: the VRAM tier takes the NEXT slice of the
+    // profile, so its per-pair sizes start at `skip`, not at the top of the list.
+    if (o.hot_ram_gib > 0.0 && !profile.empty() && srcp == &arena_src) {
+        arena_src.pin_hot(profile, (uint64_t) (o.hot_ram_gib * 1073741824.0));
+        std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+    } else if (o.hot_ram_gib > 0.0 && srcp != &arena_src) {
+        std::fprintf(stderr, "strata generate: --hot-ram-gib is unnecessary here: the resident arena is already "
+                             "anonymous host memory\n");
+    }
+    // R5c: with the host hot tier active, the VRAM tier takes the NEXT slice of the profile, not the same
+    // top pairs the hot tier already holds - duplicated residents serve no extra routing traffic and the
+    // card's slots are the scarcest tier on a 12 GiB card.
+    const int64_t vram_skip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_blobs() : 0;
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
     std::vector<int64_t> sized_slots;
-    if (native_pack && o.expert_cache > 0 && !profile.empty()) {
+    if (false && native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -1295,7 +1312,8 @@ int main(int argc, char** argv) {
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
-        for (const auto& pr : profile) {
+        for (int64_t pi = vram_skip; pi < (int64_t) profile.size(); ++pi) {
+            const auto& pr = profile[(size_t) pi];
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;
@@ -1376,44 +1394,30 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
-    // ---- THE HOST HOT TIER, BEFORE THE VRAM TIER.  The profile ranks (layer, expert) by routing frequency, so
-    // the pinned host tier takes the top of that list; the VRAM tier then takes the top of what the card can
-    // hold.  Ordered here on purpose: `srcp->blob` must answer from the hot arena before the cache fill copies
-    // out of it, or the fill would pull the same bytes through the mapping and re-fault them from disk.
-    if (o.hot_ram_gib > 0.0 && !profile.empty() && srcp == &arena_src) {
-        arena_src.pin_hot(profile, (uint64_t) (o.hot_ram_gib * 1073741824.0));
-        std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
-    } else if (o.hot_ram_gib > 0.0 && srcp != &arena_src) {
-        std::fprintf(stderr, "strata generate: --hot-ram-gib is unnecessary here: the resident arena is already "
-                             "anonymous host memory\n");
-    }
+    // -------------------------------------------------- fill the VRAM tier from the profile.
     if (!profile.empty() && srcp != nullptr) {
-        // R5c: with the host hot tier active, the VRAM tier takes the NEXT slice of the profile, not the same
-        // top pairs the hot tier already holds - duplicated residents serve no extra routing traffic and the
-        // card's slots are the scarcest tier on a 12 GiB card.
-        const int64_t skip = (o.hot_ram_gib > 0.0 && srcp == &arena_src) ? arena_src.hot_blobs() : 0;
         // Per-layer quotas skip pairs whose layer is full, so the scan runs past `slots` pairs to the end
         // of the profile until every layer quota is full (shared mode keeps the old top-`want` slice).
         const int64_t end = (int64_t) profile.size();
-        const int64_t want = o.expert_cache_per_layer ? end - skip
-                                                      : std::min<int64_t>(end - skip, xcache.slots());
+        const int64_t want = o.expert_cache_per_layer ? end - vram_skip
+                                                      : std::min<int64_t>(end - vram_skip, xcache.slots());
         int32_t verify_slot = strata::core::kNotResident;
         const uint8_t* verify_blob = nullptr;
         int64_t verify_bytes = 0;
         for (int64_t i = 0; i < want; ++i) {
-            const int32_t slot = xcache.admit(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
+            const int32_t slot = xcache.admit(profile[(size_t) (vram_skip + i)].first, profile[(size_t) (vram_skip + i)].second);
             if (slot == strata::core::kNotResident) {
                 if (!o.expert_cache_per_layer) break;   // shared mode: the tier itself is full.
                 continue;   // per-layer mode: this pair's layer quota is full; later pairs may fit.
             }
-            const uint8_t* b = srcp->blob(profile[(size_t) (skip + i)].first, profile[(size_t) (skip + i)].second);
+            const uint8_t* b = srcp->blob(profile[(size_t) (vram_skip + i)].first, profile[(size_t) (vram_skip + i)].second);
             // R7: the byte count must come from the SAME pair the blob did.  This read `profile[i].first` while
-            // the blob came from `profile[skip + i]`, so with the host hot tier active the fill copied layer
-            // `i`'s blob size for layer `skip + i`'s expert - right for IQ4_XS (every blob is 2,662,400 B) and
+            // the blob came from `profile[vram_skip + i]`, so with the host hot tier active the fill copied layer
+            // `i`'s blob size for layer `vram_skip + i`'s expert - right for IQ4_XS (every blob is 2,662,400 B) and
             // WRONG for IQ3_M, whose blob sizes differ (2,329,600 vs 2,534,400) - a short slot that verifies
             // clean and computes from stale bytes.
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) (skip + i)].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) (vram_skip + i)].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
@@ -1422,7 +1426,7 @@ int main(int argc, char** argv) {
                 verify_slot = slot;
                 verify_blob = b;
                 verify_bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(
-                    profile[(size_t) (skip + i)].first);
+                    profile[(size_t) (vram_skip + i)].first);
             }
             ++prefilled;
             if (o.expert_cache_per_layer && prefilled >= xcache.slots()) break;   // every quota is full.
@@ -2386,6 +2390,38 @@ int main(int argc, char** argv) {
         };
         while (next_line(line)) {
             if (line == "QUIT") break;
+            if (line.rfind("SHED ", 0) == 0) {
+                // R22: the pressure governor's shed, sent by the server BETWEEN requests when /proc/meminfo's
+                // MemAvailable dips below its floor (STRATA_MEM_FLOOR_MIB, default 1536).  Cold-scored slices
+                // of the hot tier are unregistered (the registration pins pages - they cannot be reclaimed
+                // until it is undone), munlocked and dropped; their slots go back on the free list for the LRU
+                // to refill when headroom exists.  Decode on a shed slice pays a pread instead of a DMA hit -
+                // slower but correct; the alternative at this memory level was the swap storm that killed
+                // cublasCreate (2026-10-04/05).  The serve loop only reads stdin BETWEEN requests, so nothing
+                // can be holding tier bytes while the pages drop.
+                const long long want = std::strtoll(line.c_str() + 5, nullptr, 10);
+                const uint64_t got = arena_src.shed_pressure(want > 0 ? (uint64_t) want : 0);
+                std::printf("SHEDN shed=%.2fGiB tier=%.2fGiB free_slots=%lld\n",
+                            (double) got / 1073741824.0,
+                            (double) (arena_src.hot_bytes() - arena_src.hot_shed_bytes()) / 1073741824.0,
+                            (long long) arena_src.shed_free_slots());
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("REGROW ", 0) == 0) {
+                // R22b: the governor's regrow (sent only when MemAvailable is comfortably above the floor):
+                // one shed slice per call is re-registered + re-locked, with the engine's own /proc/meminfo
+                // precheck refusing to regrow into pressure.  AUDIT-order: the arena's END slices refill
+                // first (their slots are the LIFO free list's head), so their DMA comes back first.
+                const long long want = std::strtoll(line.c_str() + 7, nullptr, 10);
+                const uint64_t got = arena_src.regrow_pressure(want > 0 ? (uint64_t) want : 0);
+                std::printf("REGN regrew=%.2fGiB tier=%.2fGiB free_slots=%lld\n",
+                            (double) got / 1073741824.0,
+                            (double) (arena_src.hot_bytes() - arena_src.hot_shed_bytes()) / 1073741824.0,
+                            (long long) arena_src.shed_free_slots());
+                std::fflush(stdout);
+                continue;
+            }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {

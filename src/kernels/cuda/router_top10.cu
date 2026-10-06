@@ -66,7 +66,7 @@ constexpr int RT_MAX_THREADS = 512;
 
 /// One BLOCK per token, so the reductions have somewhere to happen.  `n_tokens` is 1 in decode; the grid keeps
 /// the batch case working without a second code path.
-__global__ void router_top10_kernel(const float* __restrict__ logits, int n_tokens, int n_expert, int k,
+__global__ void __launch_bounds__(1024) router_top10_kernel(const float* __restrict__ logits, int n_tokens, int n_expert, int k,
                                     int* __restrict__ ids, float* __restrict__ weights) {
     // **`s_taken` IS FIRST SO THE OTHER TWO KEEP THEIR ALIGNMENT WITHOUT AN OFFSET PARAMETER**, and `s_p`'s
     // existing `s_ex + n_expert` stays correct because it is relative to `s_ex`.  One byte per expert.
@@ -87,7 +87,7 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
     // ---- softmax over ALL experts, for stability: the max.  A tree of `fmaxf` is EXACT and order-independent,
     // so this is bit-identical to the serial scan.
     float mx = -INFINITY;
-    for (int e = tid; e < n_expert; e += nt) mx = fmaxf(mx, l[e]);
+    for (int e = tid; e < n_expert; e += nt) mx = fmaxf(mx, __ldg(&l[e]));
     for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
     if ((tid & 31) == 0) s_red[tid >> 5] = mx;
     __syncthreads();
@@ -102,7 +102,7 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
 
     // ---- THE 512 EXPONENTIALS, ONCE EACH AND IN PARALLEL.  `exp` in double is software-emulated on this die
     // and was 5,632 serial calls before; it is 512 parallel ones now.
-    for (int e = tid; e < n_expert; e += nt) s_ex[e] = exp((double) l[e] - (double) mx);
+    for (int e = tid; e < n_expert; e += nt) s_ex[e] = __expf(__ldg(&l[e]) - mx);
     __syncthreads();
 
     // ---- the sum, ascending, on one thread: see the note above on why this is NOT parallelised.

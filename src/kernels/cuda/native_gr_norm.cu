@@ -43,7 +43,7 @@ __device__ __forceinline__ float norm_warp_sum(float value) {
 }
 
 template<int BlockSize>
-__global__ void weighted_rms_norm(const float* __restrict__ input,
+__global__ void __launch_bounds__(1024) weighted_rms_norm(const float* __restrict__ input,
                                    const float* __restrict__ gamma,
                                    float* __restrict__ output, int n_cols, float epsilon) {
     const int tid = threadIdx.x;

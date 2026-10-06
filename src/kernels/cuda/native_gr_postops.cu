@@ -39,14 +39,14 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-
 __device__ __forceinline__ float scale_zero_bias(float x, float scale) {
     return __fmaf_rn(scale, x, 0.0f);
 }
-__global__ void down_silu(float* lo, int count, float scale) {
+__global__ void __launch_bounds__(1024) down_silu(float* lo, int count, float scale) {
     const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= std::size_t(count)) return;
     const float x = scale_zero_bias(lo[i], scale);
     lo[i] = x / (1.0f + expf(-x));
 }
 template<bool Fused>
-__global__ void pre_gated(const float* __restrict__ xn, float* __restrict__ gate,
+__global__ void __launch_bounds__(1024) pre_gated(const float* __restrict__ xn, float* __restrict__ gate,
                           float* __restrict__ mixed, int n_embd, int hc, float scale) {
     const std::size_t d = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (d >= std::size_t(n_embd)) return;
@@ -62,7 +62,7 @@ __global__ void pre_gated(const float* __restrict__ xn, float* __restrict__ gate
     if constexpr (Fused) mixed[d] = scale * sum;
     else mixed[d] = scale_zero_bias(sum, scale);
 }
-__global__ void post(const float* residual, const float* __restrict__ block_out,
+__global__ void __launch_bounds__(1024) post(const float* residual, const float* __restrict__ block_out,
                      const float* __restrict__ inject, float* output,
                      int n_embd, int hc, float scale) {
     const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;

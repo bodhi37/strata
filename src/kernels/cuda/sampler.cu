@@ -87,7 +87,7 @@ __device__ __forceinline__ float apply_penalties(float logit, int count, const S
 /// ascending with `if (s > bv)`, so the LOWEST index wins a tie.  Each thread keeps that rule over its own
 /// strided subset and the reduction resolves two candidates by taking the larger value and, on equality, the
 /// SMALLER index - the same total order, so `sampler_parity` and C1 see no change.
-__global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vocab,
+__global__ void __launch_bounds__(1024) sampler_greedy_kernel(const float* __restrict__ logits, int n_vocab,
                                       const int* __restrict__ history, int history_len, const SamplerParams p,
                                       int pmin, int plen, int* __restrict__ out) {
     const int t = blockIdx.x;
@@ -109,15 +109,41 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     extern __shared__ unsigned int penal_bits[];
     const int bits_words = (int) ((n_vocab + 31) / 32);
     const bool use_bits = hrow != nullptr && bits_words > 0;
+    // Unique-count cache: one O(hlen^2) build per block instead of O(n_vocab*hlen) rescans.
+    // hrow's window is tiny (tens of entries); the per-candidate hit_count below then scans at most
+    // nunique (<= hlen) shared entries.  Bit-identical counts to history_count(hrow, hlen, v).
+    __shared__ int uniq_vals[256];
+    __shared__ int uniq_cnts[256];
+    __shared__ int nunique;
     if (use_bits) {
         for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
         __syncthreads();
         for (int i = threadIdx.x; i < hlen; i += blockDim.x)
             if (hrow[i] >= 0) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
         __syncthreads();
+        if (threadIdx.x == 0) {
+            int nu = 0;
+            for (int i = 0; i < hlen && nu < 256; ++i) {
+                const int v = hrow[i];
+                if (v < 0) continue;
+                bool seen = false;
+                for (int j = 0; j < nu; ++j)
+                    if (uniq_vals[j] == v) { seen = true; break; }
+                if (!seen) {
+                    uniq_vals[nu] = v;
+                    uniq_cnts[nu] = history_count(hrow, hlen, v);
+                    ++nu;
+                }
+            }
+            nunique = nu;
+        }
+        __syncthreads();
     }
     auto hit_count = [&](int v) -> int {
         if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        for (int j = 0; j < nunique; ++j)
+            if (uniq_vals[j] == v) return uniq_cnts[j];
+        // Window larger than the cache (hlen > 256 unique): fall back to the exact scan.
         return history_count(hrow, hlen, v);
     };
 
@@ -166,7 +192,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
 /// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
-__global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
+__global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
                                int* __restrict__ out) {
     const int t = blockIdx.x;
@@ -191,15 +217,37 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     extern __shared__ unsigned int penal_bits[];
     const int bits_words = (int) ((n_vocab + 31) / 32);
     const bool use_bits = hrow != nullptr && bits_words > 0;
+    __shared__ int uniq_vals[256];
+    __shared__ int uniq_cnts[256];
+    __shared__ int nunique;
     if (use_bits) {
         for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
         __syncthreads();
         for (int i = threadIdx.x; i < hlen; i += blockDim.x)
             if (hrow[i] >= 0) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
         __syncthreads();
+        if (threadIdx.x == 0) {
+            int nu = 0;
+            for (int i = 0; i < hlen && nu < 256; ++i) {
+                const int v = hrow[i];
+                if (v < 0) continue;
+                bool seen = false;
+                for (int j = 0; j < nu; ++j)
+                    if (uniq_vals[j] == v) { seen = true; break; }
+                if (!seen) {
+                    uniq_vals[nu] = v;
+                    uniq_cnts[nu] = history_count(hrow, hlen, v);
+                    ++nu;
+                }
+            }
+            nunique = nu;
+        }
+        __syncthreads();
     }
     auto hit_count = [&](int v) -> int {
         if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        for (int j = 0; j < nunique; ++j)
+            if (uniq_vals[j] == v) return uniq_cnts[j];
         return history_count(hrow, hlen, v);
     };
 

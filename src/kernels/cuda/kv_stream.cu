@@ -158,7 +158,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 }
 
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+__global__ void __launch_bounds__(1024) copy_kernel(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
@@ -170,7 +170,7 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
     }
 }
 
-__global__ void reset_kernel(KvStreamMap m) {
+__global__ void __launch_bounds__(1024) reset_kernel(KvStreamMap m) {
     const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
     for (long long i = i0; i < m.n_blocks; i += st) m.page_table[i] = -1;
     for (long long i = i0; i < m.n_slots; i += st) {
@@ -181,7 +181,7 @@ __global__ void reset_kernel(KvStreamMap m) {
     if (i0 < kKvCtlInts) m.ctl[i0] = 0;
 }
 
-__global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slots) {
+__global__ void __launch_bounds__(1024) ring_kernel(int32_t* table, long long n_blocks, long long n_slots) {
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n_blocks;
          i += (long long) gridDim.x * blockDim.x)
         table[i] = (int32_t) (i % n_slots);

@@ -90,6 +90,10 @@ struct Prefill::Impl {
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
+    // R22: the persistent GEMM block (dequant scratch + workspace + the cuBLAS handle), created once in init.
+    // `owned_gemm`: device pointers freed only by ~Prefill (the no-borrow mode owns the block; the borrow mode's
+    // block lives inside the lent cache slots and must never be cudaFree'd).
+    std::vector<void*> owned_gemm;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
@@ -206,6 +210,7 @@ Prefill::~Prefill() {
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     for (void* p : impl_->owned) cudaFree(p);
+    for (void* p : impl_->owned_gemm) cudaFree(p);   // R22: the persistent block (no-borrow mode owns it)
 }
 
 namespace {
@@ -241,8 +246,35 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.borrow = borrow;
     m.borrow_bytes = borrow_bytes;
     m.rd_stop_ = false;
-    // R10: no alloc_all here - the buffers are per-run (see run), so the startup ordering cannot pin
-    // VRAM that the decode path's own lazy allocations (verify captures, sample buffers) need first.
+    // R22: the GEMM's cuBLAS handle is created HERE, once, and outlives every request.  A fresh
+    // cublasCreate per prompt boundary (alloc_all used to own it) is what dies under pressure: it needs the
+    // CUDA runtime while the deep session's own ledger (MTP head, KV pools, verify captures) is at its
+    // tightest, so it fails four times in ~8 s ("prefill gemm: cublasCreate failed" -> the request dies) or
+    // hangs inside the driver while the host thrashes, and the next request then sits silent until the
+    // watchdog kills the engine.  At setup the VRAM ledger is at its fairest, and the handle needs only a
+    // few MiB: created here it never runs at a prompt boundary again.  The scratch/workspace stay IN the
+    // borrowed region (its head), so the carve costs nothing the borrowed slots did not already cover, and
+    // alloc_all still accounts that head with the same two takes so the buffer offsets stay aligned with
+    // bytes_needed().  Between runs the lent slots get REFILLED (fills overwrite the whole region) - safe:
+    // free_all synchronizes both streams before the refill's memcpy, and cuBLAS reads its workspace only
+    // inside a GEMM on the same stream.
+    const bool have_handle = m.gemm.ready();   // R22: usually false; a re-init with a live handle reuses it
+    if (!have_handle) {
+        bool ok = true;
+        Alloc o;
+        o.owned = &m.owned_gemm;
+        if (m.borrow) {
+            o.base = (uint8_t*) m.borrow;
+            o.cap = m.borrow_bytes;
+        }
+        uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+        void* ws = o.take<uint8_t>(GEMM_WS, ok);
+        if (!ok || !m.gemm.init_external(m.cs, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) {
+            err = "prefill: the prefill GEMM's cuBLAS handle failed to initialize" +
+                  (err.empty() ? std::string() : ": " + err);
+            return false;
+        }
+    }
     if (!init_readers()) { err = "prefill: the reader pool failed to start"; return false; }
     return true;
 }
@@ -261,10 +293,18 @@ bool Prefill::alloc_all(std::string& err) {
     o.cap = m.borrow_bytes;
     o.owned = &m.owned;
     {
-        uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-        void* ws = o.take<uint8_t>(GEMM_WS, ok);
-        if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
-        if (!m.gemm.init_external(m.cs, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
+        // R22: the cuBLAS handle, its workspace and the dequant scratch are PERSISTENT (init created them
+        // inside the borrowed region's head, or owns them outright in the no-borrow mode) - a fresh
+        // cublasCreate per prompt boundary is what died under a deep session's VRAM pressure.  In the borrow
+        // mode the two takes below are pure ACCOUNTING (no allocation happens: the head's slices were carved
+        // once in init) and they keep the offsets exactly the ones bytes_needed() promised the reservation.
+        // In the no-borrow mode they are skipped: those slices are owned by the persistent block since init.
+        if (m.borrow) {
+            (void) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+            (void) o.take<uint8_t>(GEMM_WS, ok);
+            if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
+        }
+        if (!m.gemm.ready()) { err = "prefill: the prefill GEMM's cuBLAS handle is missing (init failed)"; return false; }
     }
     m.emb = o.take<float>((size_t) m.tile * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>((size_t) m.tile * D, ok);
     m.xn16 = o.take<uint16_t>((size_t) m.tile * D, ok); m.lo = o.take<float>((size_t) m.tile * LR, ok); m.lo16 = o.take<uint16_t>((size_t) m.tile * LR, ok);
@@ -344,6 +384,7 @@ bool Prefill::alloc_all(std::string& err) {
 }
 
 // R10: frees everything alloc_all created.  The reader pool is left parked (it only touches the source).
+// R22: the persistent GEMM block (see init) lives here too, not in `owned`.
 void Prefill::free_all() {
     Impl& m = *impl_;
     if (!m.bufs_live) return;

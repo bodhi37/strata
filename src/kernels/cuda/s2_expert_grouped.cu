@@ -138,7 +138,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 /// finite, plausible numbers.  `moe_hit_parity` caught it on the first run, at worst relative error 2.2e+03.
 ///
 /// So slot `i` is DECODED from row-slot `i` and WRITTEN to the output slot its parity says it belongs to.
-__global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
+__global__ void __launch_bounds__(1024) gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                           long long blob_bytes, const uint8_t* __restrict__ x_q8_0,
                           const float* __restrict__ x_scales, float* __restrict__ gate_up, int n_hits,
                           const int32_t* __restrict__ d_count = nullptr,
@@ -195,7 +195,7 @@ __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* 
 ///
 /// SiLU on the GATE and multiplied by up - the reading `docs/semantics.md` records, and the one that is wrong
 /// the other way round in a way that still produces a finite number.
-__global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
+__global__ void __launch_bounds__(1024) swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_pairs) return;
     const float g = gate_up[i];
@@ -207,7 +207,7 @@ __global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
 ///
 /// `dst_index[h]` is which row of the shared output buffer hit `h` fills - see the header.  It is the router's
 /// slot, not `h`, and the two differ on every layer where some experts are resident and some are not.
-__global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
+__global__ void __launch_bounds__(1024) down_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                             const int32_t* __restrict__ dst_index, long long blob_bytes,
                             const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
                             float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count = nullptr) {
@@ -237,7 +237,7 @@ __global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t
 
 // The CPU subtracts the weight bias after its eight FMA accumulators have been reduced. Moving the
 // subtraction into each integer dot, as the legacy kernel does, changes rounding even with equal scales.
-__global__ void activation_correction_kernel(const uint8_t* q8, const float* scales, float* hx, int chunks) {
+__global__ void __launch_bounds__(1024) activation_correction_kernel(const uint8_t* q8, const float* scales, float* hx, int chunks) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= chunks) return;
     const int8_t* q = (const int8_t*) (q8 + (size_t) c * 34 + 2);
@@ -281,7 +281,7 @@ __device__ __forceinline__ float row_dot_cpu_order(const uint8_t* codes, const u
 }
 
 template <bool DOWN>
-__global__ void cpu_order_projection_kernel(const uint8_t* blob_base, const int32_t* slots,
+__global__ void __launch_bounds__(1024) cpu_order_projection_kernel(const uint8_t* blob_base, const int32_t* slots,
                                               const int32_t* destinations, long long blob_bytes,
                                               const uint8_t* xq, const float* xs, const float* hx,
                                               float* out, int n_hits) {
@@ -304,7 +304,7 @@ __global__ void cpu_order_projection_kernel(const uint8_t* blob_base, const int3
     else out[((r & 1) ? (size_t) n_hits * FF : 0) + (size_t) h * FF + (r >> 1)] = value;
 }
 
-__global__ void cpu_order_swiglu_kernel(float* gu, int pairs) {
+__global__ void __launch_bounds__(1024) cpu_order_swiglu_kernel(float* gu, int pairs) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= pairs) return;
     const float g = gu[i];
@@ -314,7 +314,7 @@ __global__ void cpu_order_swiglu_kernel(float* gu, int pairs) {
     gu[i] = __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, eg)), gu[pairs + i]);
 }
 
-__global__ void cpu_order_quantize_kernel(const float* x, uint8_t* blocks, float* scales,
+__global__ void __launch_bounds__(1024) cpu_order_quantize_kernel(const float* x, uint8_t* blocks, float* scales,
                                            float* hx, int chunks) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= chunks) return;
@@ -414,7 +414,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
 namespace {
 // Plan v0.3 P4 token graph: which of this layer's routed experts are resident, decided ON THE DEVICE from the
 // static residency row, so no host step sits between the ring and the hit kernels.  One warp; k <= 32.
-__global__ void hit_select_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int k,
+__global__ void __launch_bounds__(1024) hit_select_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int k,
                                   int n_expert, int32_t* __restrict__ slot, int32_t* __restrict__ dst,
                                   int32_t* __restrict__ count) {
     const int lane = threadIdx.x;
@@ -434,7 +434,7 @@ __global__ void hit_select_kernel(const int32_t* __restrict__ ids, const int32_t
 
 // Plan v0.3 P6: the same for up to 128 routed entries (a verify window of T tokens x k): four warps, ballots
 // compacted in entry order.
-__global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int n,
+__global__ void __launch_bounds__(1024) hit_select_multi_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ res_row, int n,
                                         int n_expert, int32_t* __restrict__ slot, int32_t* __restrict__ dst,
                                         int32_t* __restrict__ count) {
     __shared__ int warp_count[4];
@@ -457,7 +457,7 @@ __global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const i
     if (i == 0) *count = warp_count[0] + warp_count[1] + warp_count[2] + warp_count[3];
 }
 
-__global__ void add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
+__global__ void __launch_bounds__(1024) add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
                                 const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
     const int h = blockIdx.y;
     if (h >= *count) return;
@@ -706,7 +706,7 @@ __global__ void __launch_bounds__(256) down_grouped_kernel(const unsigned long l
 namespace {
 // Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer):
 // one block of 128 threads, groups in first-appearance order, entries of a group in routing order.
-__global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
+__global__ void __launch_bounds__(1024) group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
                                       long long blob, unsigned long long* __restrict__ grp_ptr,
                                       int32_t* __restrict__ grp_start, int32_t* __restrict__ counts,
                                       int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok) {

@@ -47,7 +47,7 @@ __device__ __forceinline__ float warp_max(float x) {
 // four values (float2) per load, four V columns per iteration. Padded length256
 // gives ntiles_KV=ceil(256/D)=1, so the pinned launcher selects grid.y=1.
 __launch_bounds__(128, 1)
-__global__ void attend(const float* __restrict__ q, const half* __restrict__ k,
+__global__ void __launch_bounds__(1024) attend(const float* __restrict__ q, const half* __restrict__ k,
                        const half* __restrict__ v, const int32_t* __restrict__ step,
                        int max_context, int padded_length, float scale, float* __restrict__ out, int32_t* __restrict__ status,
                        const half* __restrict__ mask) {
