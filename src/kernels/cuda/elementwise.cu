@@ -16,7 +16,7 @@ namespace {
 
 constexpr int THREADS = 256;
 
-__global__ void __launch_bounds__(1024) embedding_gather_kernel(const uint8_t* __restrict__ codes,
+__global__ void embedding_gather_kernel(const uint8_t* __restrict__ codes,
                                        const float* __restrict__ scales,
                                        const float* __restrict__ offsets, int64_t n,
                                        int code_bits, int code_bias, int group_elems,
@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(1024) embedding_gather_kernel(const uint8_t* _
 /// relative precision; above 20 the function is `x` to within f32 anyway.
 __device__ __forceinline__ float softplus_dev(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
-__global__ void __launch_bounds__(1024) gdn_gate_kernel(const float* __restrict__ alpha, const float* __restrict__ dt,
+__global__ void gdn_gate_kernel(const float* __restrict__ alpha, const float* __restrict__ dt,
                                 const float* __restrict__ ssm_a, float* __restrict__ gate, int64_t h_v) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= h_v) return;
@@ -47,37 +47,36 @@ __global__ void __launch_bounds__(1024) gdn_gate_kernel(const float* __restrict_
     (void) t;
 }
 
-__global__ void __launch_bounds__(1024) scale_kernel(float* __restrict__ x, int64_t n, float s) {
+__global__ void scale_kernel(float* __restrict__ x, int64_t n, float s) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= s;
 }
 
 // `dst[i] += src[i]`.  See the header: this is what lets R4's GPU half and CPU half run at the same
 // time and still add up to one `parts` buffer.
-__global__ void __launch_bounds__(1024) add_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n) {
+__global__ void add_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] += src[i];
 }
 
-__global__ void __launch_bounds__(1024) to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+__global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = f16_from_f32(x[i]);
 }
 
-__global__ void __launch_bounds__(1024) to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+__global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = bf16_from_f32(x[i]);
 }
 
-__global__ void __launch_bounds__(1024) silu_kernel(float* __restrict__ x, int64_t n) {
+__global__ void silu_kernel(float* __restrict__ x, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // FP32 fast-math: was DOUBLE+libm exp at 1/64 rate for 10240 elems x36 GDN
-    // layers/token. np.exp on f32 arrays is f32-precision by a *different* algorithm
-    // than expf anyway, so last-bit parity against the oracle was never exact; the
-    // fused/conv path already ships __expf for this same math and passes parity.
-    const float v = __ldg(&x[i]);
-    x[i] = __fdividef(v, 1.0f + __expf(-v));
+    // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
+    // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
+    // difference is in the last bits and this is one line.
+    const double v = (double) x[i];
+    x[i] = (float) (v / (1.0 + exp(-v)));
 }
 
 /// A bounded launch: a zero-length grid is illegal, and `n == 0` is a real call (an empty selection).
@@ -86,7 +85,7 @@ inline unsigned grid_for(int64_t n) { return (unsigned) ((n + THREADS - 1) / THR
 /// One WARP per row, reduced through shuffles.  The rows here are short and few - (24, 256), (2, 256),
 /// (4, 128) - so a block-per-row tree would spend its time in `__syncthreads` for 8 warps of 32, and the whole
 /// call is 30 rows.  A warp reduction with NO shared memory and NO barrier is the shape that fits.
-__global__ void __launch_bounds__(1024) rms_norm_weighted_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t rows,
+__global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t rows,
                                          int64_t cols, float eps) {
 
     const int lane = threadIdx.x & 31;
@@ -207,12 +206,12 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  On RDNA4 (gfx1201) a plain store to mapped pinned
 /// memory stays in the GPU's L2 until the stream is synchronized - the host never saw the ring (tests/hip/handoff:
 /// 0 of 100 rings seen without a sync; volatile, a system-scope atomic store or a fence after the store: 100 of 100).
-__global__ void __launch_bounds__(1024) doorbell_ring_kernel(uint32_t* seq) {
+__global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
     *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
 }
 
-__global__ void __launch_bounds__(1024) doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
+__global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
     while (*flag != want) strata_spin_pause();
     __threadfence_system();
@@ -224,7 +223,7 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     check_launch("doorbell_wait");
 }
 
-__global__ void __launch_bounds__(1024) copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
+__global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
         const float4 v = const_cast<const float4*>(src)[i];
         dst[i] = v;
@@ -291,7 +290,7 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
-__global__ void __launch_bounds__(1024) doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+__global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
@@ -367,7 +366,7 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
     check_launch("doorbell_publish_res");
 }
 
-__global__ void __launch_bounds__(1024) copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
+__global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
