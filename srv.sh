@@ -11,7 +11,7 @@ SESSION="srv${PORT}"
 # Bind to the Tailscale address (not 0.0.0.0) so the model is reachable from the laptop
 # over the tailnet without being exposed on the LAN. Auth comes from a 0600 key file because
 # this box has no passwordless sudo, so the firewall cannot be used as a second layer.
-TS_IP="${STRATA_HOST:-100.87.70.9}"
+TS_IP="${STRATA_HOST:-100.80.130.126}"
 API_KEY="$(cat "$HOME/.config/qwen-serve/api-key" 2>/dev/null || true)"
 
 stop_server() {

@@ -12,10 +12,6 @@ converted to PNG first with Pillow.
 Requests whose prompt plus max tokens exceed the engine's context are shortened to the room left (never a 400);
 only a prompt that leaves no room at all is rejected with 400 - the prompt itself is never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
-An engine that stops producing output (no PP while reading, no T while decoding) is a stalled request, not a slow
-one: after STRATA_WATCHDOG_S seconds of silence (default 180, 0 disables) the request fails with a finish_reason
-instead of a bare EOF, and the engine is replaced in the background.  Every stream ends with a finish_reason (or an
-Anthropic error event), so clients always see an ordinary provider error rather than a protocol-level stream break.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
 `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
@@ -50,28 +46,6 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
-READY_WAIT_S = 600.0        # how long a request waits for a restarting engine before giving up (retryable)
-DRAIN_S = 90.0              # how long an early-stopped request waits for the engine's STOP/DONE (covers a prefill
-                            # chunk cancel plus the engine's lent-slot refill cleanup before the FIFO moves on)
-READY_SPAWN_TIMEOUT_S = 300.0   # the engine normally reaches READY in ~75-90 s; silence beyond this is a startup
-                                # hang (a wedged driver, a stuck NVMe read), not a slow load - kill and report
-
-
-def is_engine_infra_error(msg: str) -> bool:
-    """True for engine faults that are about the ENGINE, not about one request: allocation/CUDA failures
-    (cuBLAS handle, workspace, dequant scratch, device buffers), the prefill path dying under a deep
-    session's memory pressure.  The engine answers such faults with `prefill gemm: ...` / `prefill: ...`
-    ERR lines and often wedges behind them (2026-10-04, x86/rce: 'prefill gemm: cublasCreate failed', then
-    the next request sat in a stalled cublasCreate for 300 s).  These get the engine REPLACED in the
-    background (like the watchdog does) so the next request lands on a fresh one instead of another
-    5-minute silence.  Request-scoped engine answers (overflow, bad token id, no room) return False: the
-    engine handles those correctly and must NOT be restarted."""
-    m = msg.strip().lower()
-    if m.startswith("prefill"):
-        return True
-    return any(mark in m for mark in
-               ("cublas", "cuda", "out of memory", "workspace", "dequant scratch", "device buffers",
-                "could not allocate", "hit path could not allocate", "sample_tokens"))
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -109,57 +83,19 @@ class StrataEngine:
     """
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, watchdog_s: float | None = None):
-        self.exe, self.args = exe, list(args)
-        self.cwd, self.env, self.log_path = cwd, env, log
+                 env: dict | None = None):
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
-        # Silence is a fault, not slowness: a prompt being read prints PP chunk lines and a decoding request prints
-        # a T per token, so minutes of quiet mean the request is stuck.  The server notices within
-        # |watchdog_s| and the engine is replaced, instead of heart-beating while a hung engine blocks everyone.
-        # 0 disables the watchdog; STRATA_WATCHDOG_S overrides the default (anything, not only the CLI).
-        try:
-            self.watchdog_s = float(watchdog_s if watchdog_s is not None
-                                    else os.environ.get("STRATA_WATCHDOG_S", "") or 180.0)
-        except ValueError:
-            self.watchdog_s = 180.0
-        self.restart_lock = threading.Lock()
-        self._ready = threading.Event()
-        self._spawn()
-
-    def _spawn_kill_after(self, proc, box):
-        """Ready-deadline enforcement that works even when the engine prints NOTHING: a hung startup (a wedged
-        driver, a stuck load) must not hang the server's spawn read forever.  When the deadline passes without
-        READY, kill the process; the spawn read then sees EOF and raises the timeout message.  `proc` is bound:
-        a newer engine (a restart replaced it) is never killed by an old guard."""
-        time.sleep(READY_SPAWN_TIMEOUT_S)
-        if box.get("ready"):
-            return
-        box["hang"] = True
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:
-            pass
-
-    def _spawn(self):
-        """Start `strata --serve` and read it up to READY.  Safe to call again: a stalled engine is killed and
-        replaced by restart(), so a hung request cannot take the endpoint down for good."""
-        self.proc = subprocess.Popen([self.exe, "--serve", *self.args], cwd=self.cwd, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8",
-                                     bufsize=1, env=self.env)
+        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
-            self.info["version"] = json.loads((Path(self.exe).parent / "BUILD.json").read_text()).get("version")
+            self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
-        box = {"ready": False}
-        guard = threading.Timer(READY_SPAWN_TIMEOUT_S, self._spawn_kill_after, args=(self.proc, box))
-        guard.daemon = True
-        guard.start()
         for line in self.proc.stdout:
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
@@ -170,52 +106,16 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 break
-        box["ready"] = True
-        guard.cancel()
-        if box.get("hang"):
-            raise RuntimeError(f"the engine did not reach READY in {READY_SPAWN_TIMEOUT_S:.0f} s (startup hang?)"
-                               + (f" (see {self.log_path})" if self.log_path else ""))
         if self.max_context <= 0:
-            raise RuntimeError("the engine exited before it was ready" +
-                               (f" (see {self.log_path})" if self.log_path else ""))
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks).
-        # The process and queue are bound HERE: a restart replaces both, and the old pump must not feed the new
-        # queue from the new process's pipe.
+            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
-        self._ready.set()
+        threading.Thread(target=self._pump, daemon=True).start()
 
-    @staticmethod
-    def _pump(proc, lines):
-        for line in proc.stdout:
-            lines.put(line)
-        lines.put(None)
-
-    def start_restart(self, reason: str):
-        """Replace a stalled engine on its own thread: the request that noticed the stall fails first, and later
-        requests wait (with heart-beats) for the new engine to reach READY."""
-        self._ready.clear()            # a restart is in flight: the waits in generate()/prepare() must not pass early
-        threading.Thread(target=self.restart, args=(reason,), daemon=True).start()
-
-    def restart(self, reason: str):
-        with self.restart_lock:
-            self._ready.clear()
-            print(f"[strata] restarting the engine: {reason}", flush=True)
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=30)
-            except Exception:
-                pass
-            for stream in (self.proc.stdin, self.proc.stdout):   # close the old pipes (ResourceWarning otherwise)
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            try:
-                self._spawn()
-                print(f"[strata] the engine is back (context {self.max_context})", flush=True)
-            except Exception as e:
-                print(f"[strata] the engine did NOT come back: {e}", flush=True)
+    def _pump(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
 
     def _parse_done(self, line):
         f = line.split()
@@ -267,50 +167,12 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
-        # a restart may be in flight (watchdog, engine death): wait with heart-beats instead of failing blind
-        while not self._ready.is_set():
-            if cancel.is_set():
-                return
-            yield None
-            time.sleep(0.5)
-        # A request that ended early (client disconnect, cancel, a drain that gave up) leaves its engine output
-        # unconsumed in the queue: the engine answers exactly one GEN at a time, so that DONE (or worse, that
-        # request's tokens) belongs to a request nobody is serving any more.  Without this guard the next
-        # request reads the stale DONE as its own - it returns instantly with 0 tokens and finish "length",
-        # which pi shows as "Response was truncated before completion" with nothing in it (reproduced live
-        # 2026-10-04: sessions 05:00/05:09 UTC, metrics "length prompt=2463/34303 out=0" in ~1 s).
-        stale = []
-        try:
-            while True:
-                stale.append(self.lines.get_nowait())
-        except queue.Empty:
-            pass
-        # R22 governor acks (SHEDN/REGN) share this queue but answer the governor thread's
-        # commands, not requests: consume them here instead of mistaking them for a prior
-        # request's leftover output (which needlessly replaced a healthy engine).
-        stale = [ln for ln in stale
-                 if not str(ln).startswith(("SHEDN", "REGN"))]
-        if stale:
-            sample = str(stale[0])[:60].replace("\n", " ")
-            print(f"[strata] engine output out of step ({len(stale)} line(s) left by an earlier request, "
-                  f"first: {sample!r}); replacing the engine", flush=True)
-            self.start_restart("stale engine output left by an earlier request")
-            waited = time.time()
-            while not self._ready.is_set():
-                if cancel.is_set():
-                    return
-                if time.time() - waited > READY_WAIT_S:
-                    raise RuntimeError("server error: the engine failed to come back after a restart "
-                                       f"({int(READY_WAIT_S)} s); retrying is safe")
-                yield None
-                time.sleep(0.5)
         self.progress = None
         head = f"GENI {int(max_new)} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         self.proc.stdin.flush()
         done = False
-        last_output = time.time()
         try:
             while True:
                 try:
@@ -318,22 +180,10 @@ class StrataEngine:
                 except queue.Empty:
                     if cancel.is_set():
                         return
-                    quiet = time.time() - last_output
-                    if self.watchdog_s > 0 and quiet > self.watchdog_s:
-                        # The engine prints a T per decoded token and PP chunks while reading a prompt, so this
-                        # much silence is a stalled request, not a slow one (a hung prefill once sat here for
-                        # hours).  Fail the request cleanly and replace the engine in the background.
-                        self.start_restart(f"no output for {int(quiet)} s during a request")
-                        done = True                  # the engine is being replaced: there is no DONE to drain for
-                        raise TimeoutError(f"the engine stopped responding (no output for {int(quiet)} s)")
                     yield None
                     continue
-                last_output = time.time()
                 if line is None:
                     done = True
-                    # the engine died: replace it in the background NOW (the failure is already terminal for this
-                    # request), so the next request waits for a fresh one instead of erroring the same way forever.
-                    self.start_restart("the engine process ended")
                     raise RuntimeError("the engine process ended")
                 if line.startswith("T "):
                     if cancel.is_set():
@@ -352,13 +202,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    msg = line[4:].strip()
-                    if is_engine_infra_error(msg):
-                        # an ENGINE fault (allocation/CUDA/prefill-path class, see is_engine_infra_error): this
-                        # request is terminal; without a replacement the next request would sit inside the same
-                        # wedged engine until the watchdog fires (5 min of silence per pi retry).
-                        self.start_restart(f"engine infra fault: {msg[:80]}")
-                    raise ValueError(msg)
+                    raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -367,18 +211,8 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                # BOUNDED: an engine that stalled (the watchdog path) may never answer the STOP, and an unbounded
-                # drain here would pin the service FIFO forever - exactly the failure the watchdog exists to end.
-                # DRAIN_S covers a prefill-chunk cancel plus the engine's lent-slot refill cleanup; anything left
-                # unconsumed after the deadline is caught by generate()'s stale-output guard on the next request.
-                deadline = time.time() + DRAIN_S
-                while time.time() < deadline:
-                    try:
-                        line = self.lines.get(timeout=1.0)
-                    except queue.Empty:
-                        if self.proc.poll() is not None:
-                            break
-                        continue
+                while True:
+                    line = self.lines.get()
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
@@ -561,65 +395,6 @@ class Service:
         self.status_lock = threading.Lock()
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
-        # R22: the memory governor.  The engine's hot tier is mlocked and cudaHostRegistered - pinned forever -
-        # and on a 30 GB box a deep long-horizon session (tier + KV pools + desktop) converges to zero
-        # headroom: the swap storm then kills allocations inside CUDA ("prefill gemm: cublasCreate failed",
-        # 2026-10-04/05) and the 300 s watchdog replaces an otherwise-healthy engine.  This thread watches
-        # /proc/meminfo's MemAvailable and, BETWEEN requests (the engine runs one GEN at a time and reads stdin
-        # only there), sends `SHED <bytes>` so the hot tier SHRINKS to keep the floor: whole rank-tail slices of
-        # the tier are unregistered/unlocked/dropped; their blobs serve from preads (slower, correct) until the
-        # LRU refills the freed slots; and REGROW <bytes> (one shed slice per call) when MemAvailable is
-        # comfortably above the floor.  STRATA_MEM_FLOOR_MIB (default 1536; 0 disables) is the floor.
-        try:
-            self.mem_floor_bytes = int(os.environ.get("STRATA_MEM_FLOOR_MIB", "") or 1536) << 20
-        except ValueError:
-            self.mem_floor_bytes = 1536 << 20
-        self.gov_period = 2.0              # the governor's sampling cadence (tests shorten it)
-        self._gov_stop = threading.Event()
-
-    def start_governor(self):
-        """The memory-governor thread for a resident StrataEngine (see __init__) - started by the server
-        bootstrap beside start_telemetry."""
-        if self.mem_floor_bytes <= 0 or getattr(self, "_gov_thread", None) is not None or \
-                not hasattr(self.engine, "proc"):
-            return
-        self._gov_thread = threading.Thread(target=self._mem_governor, daemon=True)
-        self._gov_thread.start()
-
-    @staticmethod
-    def mem_available_bytes():
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-        return 1 << 60
-
-    def _mem_governor(self):
-        # R22b: regrows only when MemAvailable is 2.5 GiB above the floor (hysteresis: shed below the floor,
-        # regrow far above it, so a tier can never grow back into the pressure that made it shed).
-        reg_high = self.mem_floor_bytes + (2560 << 20)
-        while not self._gov_stop.wait(self.gov_period):
-            eng = self.engine
-            if not eng._ready.is_set():          # restarting: nothing coursecorrect yet
-                continue
-            if getattr(eng, "_in_request", False):   # a request owns the engine: shed lands on its next gap
-                continue
-            avail = self.mem_available_bytes()
-            if avail >= reg_high:
-                try:
-                    eng.proc.stdin.write("REGROW 0\n")     # one slice per call; the engine prechecks too
-                    eng.proc.stdin.flush()
-                except (OSError, BrokenPipeError):
-                    return
-                continue
-            if avail >= self.mem_floor_bytes:
-                continue
-            want = (self.mem_floor_bytes + (512 << 20)) - avail
-            try:
-                eng.proc.stdin.write(f"SHED {want}\n")
-                eng.proc.stdin.flush()
-            except (OSError, BrokenPipeError):
-                return
 
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
@@ -695,20 +470,6 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        # An engine restart may be in flight (watchdog abort, engine death): the dead engine reads
-        # max_context 0, and without this wait every request in the restart window would 400 with a LIE -
-        # "leaves no room to answer in the context (0)" - which overflow-aware clients (pi) act on by
-        # compacting.  Wait for the engine instead; after the deadline say honestly that the engine is
-        # unreachable rather than inventing a context-size error.
-        ready = getattr(self.engine, "_ready", None)
-        if ready is not None and not ready.is_set():
-            print("[strata] waiting for the engine restart ...", flush=True)
-            deadline = time.time() + READY_WAIT_S
-            while not ready.is_set() and time.time() < deadline:
-                time.sleep(0.5)
-            if not ready.is_set():
-                raise RuntimeError("server error: the engine failed to come back after a restart "
-                                   f"({int(READY_WAIT_S)} s); retrying is safe")
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if room < 1:
             # The prompt alone fills the context, so nothing could be generated - the prompt itself is never
@@ -773,7 +534,6 @@ class Service:
                     self.status["queued"] -= 1
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
-                setattr(self.engine, "_in_request", True)     # R22: the governor must not SHED a live request
                 last_print = time.time()
                 gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
                     self.engine.generate(ids, max_new, sampling, cancel)
@@ -797,18 +557,13 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                 finally:
-                    try:
-                        gen.close()                     # STOP+drain to THIS request's DONE while still holding the
-                    except Exception:                   # fifo - but a drain failure must not mask the request's
-                        pass                            # own outcome (and the stale-output guard recovers below)
+                    gen.close()                         # STOP+drain to THIS request's DONE while still holding the
+                    #                                     fifo, so a stop-token break can't leave the shared engine
+                    #                                     queue mid-drain for the next request to read as its own DONE
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise
-        except Exception:                               # an engine fault (ERR line, watchdog, dead process)
-            finish = "error"                            # history must not report a stalled request as "length"
-            raise
         finally:
-            setattr(self.engine, "_in_request", False)   # R22: the governor may shed between requests
             if emb:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
@@ -1131,12 +886,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                try:
-                    return self._json(200, openai_collect(chunks))
-                except Exception as e:
-                    print(f"[strata] request failed: {e!r}", flush=True)
-                    return self._json(500, {"error": {"type": "server_error",
-                                                      "message": "server error: " + str(e) + " (transient; retrying is safe)"}})
+                return self._json(200, openai_collect(chunks))
             self._sse()
             try:
                 for c in chunks:
@@ -1146,34 +896,8 @@ def make_handler(svc: Service):
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
                 cancel.set()                                 # client went away: stop the engine
-                chunks.close()
-            except Exception as e:                           # NOTE: TimeoutError is an OSError - handled here, not above
-                # An engine fault must still TERMINATE the stream: a bare EOF makes clients report a protocol error
-                # (Pi: "Stream ended without finish_reason") and hides the real cause.  A final chunk with a
-                # finish_reason is an ordinary provider error, and the client's own retry policy applies.
-                # The finish_reason NAME is the contract: pi-ai never reads a chunk's `error` field, it reports
-                # "Provider finish_reason: <name>" - and pi only retries names matching its retryable patterns
-                # (server.?error, timeout, ...) and only runs compact-and-retry when the name matches its
-                # overflow patterns (no room to answer, exceeds the context).  So an engine ERR about context
-                # size must finish as "no room to answer" (-> pi compacts and retries), everything else as
-                # "server_error" (-> pi retries the request itself).
-                cancel.set()
-                which = str(e)
-                reason = ("no room to answer" if ("no room to answer" in which or "exceeds the context" in which)
-                          else "server_error")
-                print(f"[strata] request failed: {e!r}", flush=True)
-                last = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
-                        "created": int(time.time()), "model": svc.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
-                        "error": {"type": "server_error", "message": "server error: " + str(e) + " (transient; retrying is safe)"}}
-                try:
-                    self.wfile.write(b"data: " + json.dumps(last, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                except OSError:
-                    pass
                 chunks.close()
 
         def _anthropic(self, req):
@@ -1184,12 +908,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                try:
-                    return self._json(200, anthropic_collect(events))
-                except Exception as e:
-                    print(f"[strata] request failed: {e!r}", flush=True)
-                    return self._json(500, {"type": "error", "error": {"type": "server_error",
-                                                                       "message": "server error: " + str(e) + " (transient; retrying is safe)"}})
+                return self._json(200, anthropic_collect(events))
             self._sse()
             try:
                 for item in events:
@@ -1200,20 +919,8 @@ def make_handler(svc: Service):
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
                 cancel.set()
-                events.close()
-            except Exception as e:                           # see _openai: terminate, never a bare EOF
-                cancel.set()
-                print(f"[strata] request failed: {e!r}", flush=True)
-                try:
-                    err = {"type": "error", "error": {"type": "server_error",
-                                                      "message": "server error: " + str(e) + " (transient; retrying is safe)"}}
-                    self.wfile.write(b"event: error\ndata: " + json.dumps(err, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
-                    self.wfile.flush()
-                except OSError:
-                    pass
                 events.close()
 
     return Handler
@@ -1227,7 +934,6 @@ class Server(ThreadingHTTPServer):
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
-    svc.start_governor()
     httpd = Server((host, port), make_handler(svc))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -1336,9 +1042,6 @@ def main() -> int:
                             env=env)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
-        if engine.watchdog_s > 0:
-            print(f"[strata] engine watchdog: {engine.watchdog_s:.0f} s of silence aborts the request and restarts "
-                  f"the engine (STRATA_WATCHDOG_S=0 disables)", flush=True)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's

@@ -54,3 +54,9 @@ llama.cpp/
 data/*.bin
 llama-pinned.tar.gz
 /tests/
+
+# 2026-10-08 NVMe migration: superseded hillclimb configs (historical value only)
+/defunct/
+
+# 2026-10-09: local removal pile (never commit)
+/no/

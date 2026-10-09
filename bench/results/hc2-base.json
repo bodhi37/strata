@@ -1,0 +1,136 @@
+{
+ "tag": "base",
+ "cfg": "strata-sc117-iq3s-final.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 11.946036338806152,
+     "prefill_tok_s": 352.08330869855143,
+     "decode_tok_s": 24.93623594509728,
+     "wall_s": 19.60557246208191,
+     "sample": "The"
+    },
+    {
+     "i": 1,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 146.56762790679932,
+     "prefill_tok_s": 28.696650550110203,
+     "decode_tok_s": 21.10614071163323,
+     "wall_s": 155.6171269416809,
+     "sample": "The"
+    },
+    {
+     "i": 2,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 133.630597114563,
+     "prefill_tok_s": 31.474827553110085,
+     "decode_tok_s": 23.1813012040495,
+     "wall_s": 141.86999654769897,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 23.1813012040495,
+   "decode_min": 21.10614071163323,
+   "decode_max": 24.93623594509728,
+   "prefill_med": 31.474827553110085,
+   "telemetry": {
+    "mtp_windows": 90,
+    "tok_per_win": 2.36,
+    "accept_pct": 48.1,
+    "ms_per_win": 92.1,
+    "req_per_tok": 298.1,
+    "hot": 52802,
+    "ring": 4433,
+    "disk_blobs": 8154,
+    "disk_gb": 16.5,
+    "disk_gbs": 1.99,
+    "ver_wait": 18.9,
+    "ver_pool": 66.4,
+    "ver_host": 2.4,
+    "commit": 0.8,
+    "plan": 2.9,
+    "actq": 0.4,
+    "jobs": 63.2,
+    "run": 13.1,
+    "ringwait": 689.6,
+    "drain": 255.7,
+    "gu": 168.9,
+    "down": 85.3,
+    "gen_ms": 8286,
+    "gen_tok": 192,
+    "gen_tps": 23.2
+   }
+  },
+  "26214": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 26614,
+     "completion_tokens": 192,
+     "ttft_s": 44.88913536071777,
+     "prefill_tok_s": 592.8828832664432,
+     "decode_tok_s": 22.98292019782399,
+     "wall_s": 53.1996545791626,
+     "sample": "The"
+    },
+    {
+     "i": 1,
+     "prompt_tokens": 26614,
+     "completion_tokens": 192,
+     "ttft_s": 0.44303393363952637,
+     "prefill_tok_s": 60072.147930895124,
+     "decode_tok_s": 25.198888107549536,
+     "wall_s": 8.022733449935913,
+     "sample": "The"
+    },
+    {
+     "i": 2,
+     "prompt_tokens": 26614,
+     "completion_tokens": 192,
+     "ttft_s": 75.4094705581665,
+     "prefill_tok_s": 352.9264932243689,
+     "decode_tok_s": 22.030551688296946,
+     "wall_s": 84.07924890518188,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 22.98292019782399,
+   "decode_min": 22.030551688296946,
+   "decode_max": 25.198888107549536,
+   "prefill_med": 592.8828832664432,
+   "telemetry": {
+    "mtp_windows": 89,
+    "tok_per_win": 2.49,
+    "accept_pct": 47.3,
+    "ms_per_win": 97.9,
+    "req_per_tok": 320.6,
+    "hot": 56550,
+    "ring": 4996,
+    "disk_blobs": 9532,
+    "disk_gb": 19.31,
+    "disk_gbs": 2.22,
+    "ver_wait": 18.1,
+    "ver_pool": 74.3,
+    "ver_host": 0.8,
+    "commit": 0.7,
+    "plan": 3.2,
+    "actq": 0.4,
+    "jobs": 70.8,
+    "run": 14.1,
+    "ringwait": 955.7,
+    "drain": 349.9,
+    "gu": 231.4,
+    "down": 116.5,
+    "gen_ms": 8711,
+    "gen_tok": 192,
+    "gen_tps": 22.0
+   }
+  }
+ }
+}

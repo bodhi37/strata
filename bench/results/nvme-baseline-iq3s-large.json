@@ -1,0 +1,15 @@
+[
+ {
+  "target": 32768,
+  "prompt_tokens": 33260,
+  "completion_tokens": 192,
+  "ttft_s": 42.44443917274475,
+  "prefill_tok_s": 783.6126627715595,
+  "decode_tok_s": 24.249552255757095,
+  "wall_s": 50.32087326049805
+ },
+ {
+  "target": 131072,
+  "error": "<HTTPError 400: 'Bad Request'>"
+ }
+]
