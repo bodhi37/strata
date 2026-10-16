@@ -8376,6 +8376,7 @@ int main(int argc, char** argv) {
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+        int64_t ckpt_root_len = -1;   // unify: this request's root checkpoint length (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
@@ -8710,6 +8711,7 @@ int main(int argc, char** argv) {
                 }
             }
             c.used = ++check_clock;
+            c.root = L == ckpt_root_len;
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
                 checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
@@ -8739,8 +8741,22 @@ int main(int argc, char** argv) {
                         for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned;
                         break;
                     }
-                const size_t victim = strata::program::conv_cache::eviction_victim(
-                    stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
+                // unify: checks[0] is pinned only when it is a root; otherwise the plain least-recently-used item goes
+                // (never the one just saved, never a pin=N prefix)
+                static const bool any_first = [] { const char* e = std::getenv("STRATA_CKPT_PIN_FIRST"); return e && std::atoi(e) != 0; }();
+                size_t victim;
+                if (!checks.front().root && !any_first) {
+                    size_t newest = 0;
+                    for (size_t i = 1; i < stamps.size(); ++i) if (stamps[i] > stamps[newest]) newest = i;
+                    victim = stamps.size();
+                    for (size_t i = 0; i < stamps.size(); ++i)
+                        if (i != newest && !(pin_flags && pin_flags[i]) && (victim == stamps.size() || stamps[i] < stamps[victim])) victim = i;
+                    if (victim == stamps.size()) victim = strata::program::conv_cache::eviction_victim(
+                        stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
+                } else {
+                    victim = strata::program::conv_cache::eviction_victim(
+                        stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
+                }
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -12128,6 +12144,7 @@ int main(int argc, char** argv) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            ckpt_root_len = root_at;
             static const bool message_checkpoint = [] {
                 const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
                 return e != nullptr && std::atoi(e) != 0;

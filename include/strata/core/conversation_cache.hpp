@@ -29,6 +29,11 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // unify: this checkpoint is the chain's root (the end of a system prompt of --prompt-cache-root tokens or more).
+    // Retention pins checks[0] only when it is one: a first checkpoint that is just a periodic one (a short system
+    // prompt never makes a root) must not hold a slot forever - with --prompt-cache 2 that left one rotating slot and a
+    // branch of a long prompt lost its turn checkpoint (orca-port kept it).  A run-time mark, not in the session file.
+    bool root = false;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
