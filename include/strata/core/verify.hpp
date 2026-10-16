@@ -314,7 +314,6 @@ public:
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
     const float* head_logits_dev() const { return head_logits_; }   ///< TF: [T][n_vocab] on the device
-    int64_t vocab() const { return n_vocab_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.

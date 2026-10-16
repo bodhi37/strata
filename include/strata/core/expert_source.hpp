@@ -281,6 +281,10 @@ public:
     /// checked with `pinned`).  The arena answers per layer through its expert 0; the resident RAM mode's compact
     /// copy has no expert 0 when the GPU cache holds it, so it answers for the whole copy.
     virtual bool pcie_layer(int64_t layer) const { return device_alias(layer, 0) != nullptr; }
+    /// R9b: can this source feed the GPU's PCIe expert path at all?  The plan builder needs a cheap per-layer
+    /// gate that does not depend on one arbitrary expert being resident (the old test,
+    /// `device_alias(layer, 0) != nullptr`, flapped per layer with an LRU tier).
+    virtual bool pcie_ready() const { return device_alias(0, 0) != nullptr; }
 
     /// CS-T: whether `blob(layer, expert)` would be assembled into a short-lived buffer (a native pack read from its
     /// GGUF shards in place, where an expert's gate, up and down rows are three separate slices).  Such a pointer
@@ -388,10 +392,6 @@ private:
     uint64_t st_windows_ = 0;
     uint64_t st_vhit_[3] = {0, 0, 0}, st_vpred_[3] = {0, 0, 0}, st_pch_ = 0, st_pcov_[3] = {0, 0, 0};
     static constexpr int kVoteN = 16;
-    /// R9b: can this source feed the GPU's PCIe expert path at all?  The plan builder needs a cheap per-layer
-    /// gate that does not depend on one arbitrary expert being resident (the old test,
-    /// `device_alias(layer, 0) != nullptr`, flapped per layer with an LRU tier).
-    virtual bool pcie_ready() const { return device_alias(0, 0) != nullptr; }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right

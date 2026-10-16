@@ -4279,7 +4279,7 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
 namespace {
 
 /// Full pread; a short read on a valid regular fd is EOF-level trouble, so it fails the read.
-bool pread_full(int fd, void* dst, size_t n, off_t off) {
+bool pread_full_d(int fd, void* dst, size_t n, off_t off) {
     uint8_t* p = (uint8_t*) dst;
     size_t done = 0;
     while (done < n) {
@@ -4343,7 +4343,7 @@ int64_t ArenaExpertSource::direct_read_blob(int64_t layer, int64_t expert, uint8
     const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
     uint8_t* bounce = tls_bounce((size_t) span);
     if (bounce == nullptr) return -1;
-    if (!pread_full(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return -1;
+    if (!pread_full_d(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return -1;
     std::memcpy(dst, bounce + (off - off_al), (size_t) len);
     return (int64_t) len;
 }
@@ -4363,14 +4363,14 @@ bool ArenaExpertSource::direct_read_span(uint64_t off, uint64_t len, uint8_t* ds
     const uint64_t A = direct_align_;
     const bool dst_al = ((reinterpret_cast<uintptr_t>(dst) & (uintptr_t)(A - 1)) == 0);
     if (((off | len) & (A - 1)) == 0 && dst_al)
-        return pread_full(direct_fd_, dst, (size_t) len, (off_t) off);   // the no-copy path
+        return pread_full_d(direct_fd_, dst, (size_t) len, (off_t) off);   // the no-copy path
     // Something is genuinely unaligned for this device: cover the blob with the enclosing aligned span in the
     // bounce buffer, exactly as R13 did.  Correct on every filesystem, just slower.
     const uint64_t off_al = off & ~(A - 1);
     const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
     uint8_t* bounce = tls_bounce((size_t) span);
     if (bounce == nullptr) return false;
-    if (!pread_full(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return false;
+    if (!pread_full_d(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return false;
     std::memcpy(dst, bounce + (off - off_al), (size_t) len);
     return true;
 }

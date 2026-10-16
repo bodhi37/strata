@@ -13038,49 +13038,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 int a = 0;
-                if (h3 && !from_sfx && T > 1) {
-                    // H3: row a's target distribution p (the sampler's kept candidates) against draft a's q.
-                    // Accept d with probability min(1, p(d)/q(d)); on rejection emit a draw from
-                    // norm(max(p - q, 0)).  All drafts accepted: outv[T-1] is the ordinary sample.
-                    while (a < T - 1) {
-                        const int32_t d = window[(size_t) a + 1];
-                        const int pn = ver.cand_n(a), qn = mtp.cand_n(a);
-                        const int32_t* pid = ver.cand_id(a);
-                        const float* pp = ver.cand_p(a);
-                        if (qn <= 0 || pn <= 0) {   // no q for this draft: the exact-match rule
-                            if (outv[(size_t) a] == d) { ++a; continue; }
-                            break;
-                        }
-                        const int32_t* qid = mtp.cand_id(a);
-                        const float* qq = mtp.cand_q(a);
-                        auto qof = [&](int32_t x) { for (int i = 0; i < qn; ++i) if (qid[i] == x) return (double) qq[i]; return 0.0; };
-                        double pd = 0.0;
-                        for (int i = 0; i < pn; ++i) if (pid[i] == d) { pd = pp[i]; break; }
-                        const double qd = qof(d);
-                        if (qd > 0.0 && h3u(h3rng) * qd < pd) { outv[(size_t) a] = d; ++a; continue; }
-                        double z = 0.0;
-                        for (int i = 0; i < pn; ++i) z += std::max(0.0, (double) pp[i] - qof(pid[i]));
-                        if (z > 0.0) {
-                            const double u = h3u(h3rng) * z;
-                            double cum = 0.0;
-                            int32_t pick = pid[pn - 1];
-                            for (int i = 0; i < pn; ++i) {
-                                const double r = std::max(0.0, (double) pp[i] - qof(pid[i]));
-                                if (r <= 0.0) continue;
-                                cum += r;
-                                pick = pid[i];
-                                if (u < cum) break;
-                            }
-                            outv[(size_t) a] = pick;
-                        }
-                        break;
-                    }
-                } else {
-                    while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-                }
-                ++win_rounds;
-                win_tokens += T;
-                win_accepted += a;
+                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -13097,16 +13055,8 @@ int main(int argc, char** argv) {
                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
-                    request_failed("verify commit failed: " + err);
-                    continue;
-                }
-                // the committed tokens join the cache's stream: exactly `nk` of the window - the accepted
-                // drafts through the emitted cut, never the unemitted proposals past it
-                pending_fix = e == a;
-                for (int i = 0; i < nk; ++i) consumed.push_back(window[(size_t) i]);
-                if (pending_fix) {
-                    pending_tok = outv[(size_t) a];
-                    pending_pos = p + a + 1;
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -13154,12 +13104,12 @@ int main(int argc, char** argv) {
                     dt_adapt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
                 }
                 if (!adapt_ok) {
-                    request_failed("an adaptive refill failed");
-                    continue;
+                    std::printf("ERR an adaptive refill failed\n");
+                    return 1;
                 }
                 if (!drafted) {
-                    request_failed("the MTP drafter failed: " + err);
-                    continue;
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
                 }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
@@ -13171,28 +13121,6 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
-            }
-            // plan v0.4 P8c: resolve the in-flight token.  The last window's proposal (normally the
-            // stop token) has no committed cell yet; one T=1 window processes it so the committed
-            // state covers the whole emitted stream - exactly the seam the next turn's suffix
-            // prefill continues from.  Without it the cache would be one token short of the
-            // stream the server caches (the original P8b defect: silent state divergence).  If it
-            // does not fit or fails, drop the cache - the next turn is a clean full prefill.
-            if (pending_fix) {
-                if (pending_pos + 1 > o.max_context) {
-                    live_ok = false;
-                } else if (!ver.run(1, &pending_tok, pending_pos, &drive_pool_multi, &drive, outv.data(), err) ||
-                           drive.d.failed) {
-                    std::fprintf(stderr, "strata serve: the end-of-turn fix-up failed (%s); the cache is dropped\n",
-                                 drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
-                    live_ok = false;
-                } else if (!ver.commit(1, err)) {
-                    std::fprintf(stderr, "strata serve: the end-of-turn fix-up commit failed (%s); the cache is dropped\n",
-                                 err.c_str());
-                    live_ok = false;
-                } else {
-                    consumed.push_back(pending_tok);
-                }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it

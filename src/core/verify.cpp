@@ -496,6 +496,7 @@ Verifier::~Verifier() {
         { std::lock_guard<std::mutex> lk(ex_m_); ex_stop_ = true; }
         ex_cv_.notify_all();
         ex_thr_.join();
+    }
 #if defined(STRATA_GPU_METAL)
     strata::metal_engine::window_destroy(metal_);
     metal_ = nullptr;
