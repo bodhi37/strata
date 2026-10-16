@@ -2253,6 +2253,32 @@ void moe_accum_batch(const float* Dm, const int32_t* slot, const float* w, float
         Dm, slot, w, reinterpret_cast<float4*>(bo), T, rb0, rb1, row_sd, first);
     check("moe_accum_batch");
 }
+namespace {
+__global__ void gather_q8mmq_tiled_kernel(const uint4* __restrict__ xqt, const int32_t* __restrict__ rows,
+                                          uint4* __restrict__ xq, int64_t nrows, int64_t nkb, int64_t v16, int64_t TS,
+                                          int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one uint4 of one destination block
+    const int64_t total = nrows * nkb * v16;
+    if (i >= total) return;
+    const int64_t w = i % v16, b = i / v16;          // b = kb * nrows + r
+    const int64_t kb = b / nrows, r = b % nrows;
+    const int64_t tok = rows[r];
+    const int64_t tile = tok / TS, local = tok - tile * TS;
+    const int64_t ts = T - tile * TS < TS ? T - tile * TS : TS;
+    const int64_t sb = tile * TS * nkb + kb * ts + local;
+    xq[b * v16 + w] = xqt[sb * v16 + w];
+}
+}  // namespace
+
+void gather_q8mmq_tiled(const void* xqt, const int32_t* rows, void* xq, int64_t nrows, int64_t nkb, int64_t block_bytes,
+                        int64_t TS, int64_t T, void* stream) {
+    if (nrows <= 0) return;
+    const int64_t v16 = block_bytes / 16, total = nrows * nkb * v16;
+    gather_q8mmq_tiled_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        (const uint4*) xqt, rows, (uint4*) xq, nrows, nkb, v16, TS, T);
+    check("gather_q8mmq_tiled");
+}
+
 void moe_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
     if (T <= 0) return;
     moe_finish4_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(

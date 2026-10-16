@@ -3662,6 +3662,7 @@ class Service:
             return
         self._gov_thread = threading.Thread(target=self._mem_governor, daemon=True)
         self._gov_thread.start()
+        print(f"[strata] memory governor on: floor {self.mem_floor_bytes >> 20} MiB of MemAvailable", flush=True)
 
     @staticmethod
     def mem_available_bytes() -> int:
@@ -3676,9 +3677,20 @@ class Service:
 
     def _mem_governor(self):
         reg_high = self.mem_floor_bytes + (2560 << 20)   # hysteresis: shed below the floor, regrow far above it
+        last = None
+
+        def note(why):   # one line per change of state, so the log says what the governor is doing
+            nonlocal last
+            if why != last:
+                last = why
+                print(f"[strata] memory governor: {why}", flush=True)
         while not self._gov_stop.wait(self.gov_period):
             eng = self.engine
-            if not eng.alive() or getattr(eng, "starting", False) or getattr(eng, "batch", 0):
+            if not eng.alive() or getattr(eng, "starting", False):
+                note("waiting for the engine")
+                continue
+            if getattr(eng, "batch", 0):
+                note(f"idle (a {eng.batch}-slot batched engine: not governed)")
                 continue
             avail = self.mem_available_bytes()
             if self.mem_floor_bytes <= avail < reg_high:
@@ -3686,7 +3698,9 @@ class Service:
             cmd = "REGROW 0" if avail >= reg_high else f"SHED {(self.mem_floor_bytes + (512 << 20)) - avail}"
             ctl = getattr(eng, "ctl", None)
             if ctl is None or not ctl.acquire(blocking=False):   # a request owns the engine: next gap
+                note("pending: " + cmd.split()[0] + (" (no control lock)" if ctl is None else " (a request owns the engine)"))
                 continue
+            note(cmd.split()[0] + " (MemAvailable " + ("above" if avail >= reg_high else "under") + " its threshold)")
             try:
                 with eng.wlock:
                     eng.proc.stdin.write(cmd + "\n")

@@ -767,6 +767,11 @@ struct Prefill::Impl {
     // bo) grows with the chunk - see tiled_layout()
     bool tiled = false;
     int64_t tile = 0, ecap = 0, steps_off = 0;
+    // unify P-CHUNK2: tile-sized mixed* (the per-tile q8_1 rows of the MoE input in xqt, chunk-wide); tile_t0 is the
+    // running tile's first token (run_tiles)
+    bool mixt = false;
+    uint8_t* xqt = nullptr;
+    int64_t tile_t0 = 0;
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
@@ -1104,6 +1109,13 @@ bool tiled_layout(size_t T, bool src) {
     return pf_tile_size() > 0 && (int64_t) T > pf_tile_size() && !fused_layout(T, src) && mmq_plan().any &&
            !mmq_plan().fallback && std::all_of(mmq_plan().layer.begin(), mmq_plan().layer.end(), [](char c) { return c != 0; });
 }
+bool pf_mixt() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_MIXT"); return e == nullptr || std::atoi(e) != 0; }();
+    return v;
+}
+size_t xqt_bytes(size_t T) {
+    return (size_t) T * (size_t) mmq::q8_kblocks(N) * mmq::q8_block_bytes() + 128 * mmq::q8_block_bytes();
+}
 size_t tiled_ecap(size_t T) { return std::min<size_t>(T * K, std::max<size_t>(T, (size_t) pf_ecap_min())); }
 // the tiled MoE set: the chunk's routing, shared output and gate; tile-sized router logits and shared scratch; E-row
 // expert batches
@@ -1306,12 +1318,15 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(TS * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(TS * LR, ok); m.lo16 = o.take<uint16_t>(TS * LR, ok);
     m.gated = o.take<float>(TS * D, ok); m.inj = o.take<float>(T * HC, ok);
-    m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
-    m.mixed_h = o.take<uint16_t>(T * N, ok);
+    m.mixt = m.tiled && pf_mixt();
+    const size_t TM = m.mixt ? TS : T;   // P-CHUNK2: the MoE half reads xqt, not the chunk's mixed rows
+    m.mixed = o.take<float>(TM * N, ok); m.mixed_bf = o.take<uint16_t>(TM * N, ok);
+    m.mixed_h = o.take<uint16_t>(TM * N, ok);
+    m.xqt = m.mixt ? o.take<uint8_t>(xqt_bytes(T), ok) : nullptr;
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
     if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(TS * D, ok); m.lo16_lo = o.take<uint16_t>(TS * LR, ok); }
-    if (bf16x2(m.f16_io)) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
+    if (bf16x2(m.f16_io)) m.mixed_bf_lo = o.take<uint16_t>(TM * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -1969,10 +1984,12 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         if (gr_unfused()) f(TS * D);
         f(T * HC);
         o.take<uint16_t>(TS * (D + (hc_pad() ? XN_PAD : 0)), ok); f(TS * LR); o.take<uint16_t>(TS * LR, ok);
-        f(TS * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+        const size_t TM = pf_mixt() ? TS : T;
+        f(TS * D); f(T * HC); f(TM * N); o.take<uint16_t>(TM * N, ok); o.take<uint16_t>(TM * N, ok);
+        if (pf_mixt()) o.take<uint8_t>(xqt_bytes(T), ok);
         const bool f16t = prompt_f16();
         if (bf16x2_hc(f16t)) { o.take<uint16_t>(TS * D, ok); o.take<uint16_t>(TS * LR, ok); }
-        if (bf16x2(f16t)) o.take<uint16_t>(T * N, ok);
+        if (bf16x2(f16t)) o.take<uint16_t>(TM * N, ok);
         o.take<int32_t>(T * strata::kernels::kStepCount, ok);
         strata::kernels::QsaShapes st = core::qsa_shapes(g);
         const int64_t capt = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, st);
@@ -3130,6 +3147,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     }   // part != kPartMoeBack
+                    if (m.mixt && part == kPartMoeFront) {
+                        // P-CHUNK2: this tile's MoE input as q8_1 MMQ rows (the type the layer's gate/up reads), kept for
+                        // the back part's batches, which gather them by token instead of quantizing the chunk's rows
+                        const strata::kernels::cpu::ExpertLayout& lyf = strata::kernels::cpu::expert_layout();
+                        const int gt = lyf.native ? lyf.fmt[(size_t) l].gu_type : 42;
+                        mmq::quantize(m.mixed, nullptr, m.xqt + (size_t) m.tile_t0 * (size_t) mmq::q8_kblocks(N) * mmq::q8_block_bytes(),
+                                      gt, N, N, T, m.cs, nullptr);
+                    }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
@@ -3634,9 +3659,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: the group bounds' upload failed";
                                 return false;
                             }
-                            if (!pl_brow0.empty())   // the first batch's activations (the next ones after each batch)
-                                mmq::quantize(m.mixed, m.src_dev + pl_brow0[0], m.Xq, mmq_gt, N, N, pl_brow1[0] - pl_brow0[0], m.cs,
-                                              m.Xscale);
+                            if (!pl_brow0.empty()) {   // the first batch's activations (the next ones after each batch)
+                                if (m.mixt)
+                                    gather_q8mmq_tiled(m.xqt, m.src_dev + pl_brow0[0], m.Xq, pl_brow1[0] - pl_brow0[0],
+                                                       mmq::q8_kblocks(N), (int64_t) mmq::q8_block_bytes(), m.tile, T, m.cs);
+                                else
+                                    mmq::quantize(m.mixed, m.src_dev + pl_brow0[0], m.Xq, mmq_gt, N, N, pl_brow1[0] - pl_brow0[0],
+                                                  m.cs, m.Xscale);
+                            }
                         } else if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                             mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
@@ -4121,9 +4151,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         pt.mark(kPfCombine, cs);
                                         moe_accum_batch(m.Dm, m.slot_dev, m.w, m.bo, T, (int32_t) rb0, (int32_t) rb1,
                                                         tail ? m.row_sd : nullptr, b == 0, m.cs);
-                                        if ((size_t) b + 1 < pl_brow0.size())
-                                            mmq::quantize(m.mixed, m.src_dev + pl_brow0[(size_t) b + 1], m.Xq, mmq_gt, N, N,
-                                                          pl_brow1[(size_t) b + 1] - pl_brow0[(size_t) b + 1], m.cs, m.Xscale);
+                                        if ((size_t) b + 1 < pl_brow0.size()) {
+                                            if (m.mixt)
+                                                gather_q8mmq_tiled(m.xqt, m.src_dev + pl_brow0[(size_t) b + 1], m.Xq,
+                                                                   pl_brow1[(size_t) b + 1] - pl_brow0[(size_t) b + 1],
+                                                                   mmq::q8_kblocks(N), (int64_t) mmq::q8_block_bytes(),
+                                                                   m.tile, T, m.cs);
+                                            else
+                                                mmq::quantize(m.mixed, m.src_dev + pl_brow0[(size_t) b + 1], m.Xq, mmq_gt, N, N,
+                                                              pl_brow1[(size_t) b + 1] - pl_brow0[(size_t) b + 1], m.cs, m.Xscale);
+                                        }
                                     }
                                     return true;
                                 }
@@ -4399,8 +4436,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         uint16_t* const mh0 = m.mixed_h; uint16_t* const mbl0 = m.mixed_bf_lo; float* const bo0 = m.bo;
                         float* const inj0 = m.inj; float* const grs0 = m.grs; int32_t* const st0 = m.steps_dev;
                         int32_t* const ids0 = m.ids; float* const w0 = m.w; float* const sh0 = m.shared; float* const sg0 = m.sg;
-                        m.R += t0 * D; m.mixed += t0 * N; m.mixed_bf += t0 * N; m.mixed_h += t0 * N;
-                        if (m.mixed_bf_lo) m.mixed_bf_lo += t0 * N;
+                        m.R += t0 * D;
+                        if (!m.mixt) {   // P-CHUNK2: tile-sized mixed* stay put
+                            m.mixed += t0 * N; m.mixed_bf += t0 * N; m.mixed_h += t0 * N;
+                            if (m.mixed_bf_lo) m.mixed_bf_lo += t0 * N;
+                        }
+                        m.tile_t0 = t0;
                         m.bo += t0 * N; m.inj += t0 * HC; m.grs += t0 * HC;
                         m.steps_dev += t0 * strata::kernels::kStepCount;
                         m.steps_off = t0 * strata::kernels::kStepCount;

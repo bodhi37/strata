@@ -253,6 +253,9 @@ size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) (cols / ggml_blck_size((ggml_type) t)) * ggml_type_size((ggml_type) t);
 }
 
+size_t q8_block_bytes() { return sizeof(block_q8_1_mmq); }
+int64_t q8_kblocks(int64_t cols) { return pad512(cols) / (4 * QK8_1); }
+
 size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }

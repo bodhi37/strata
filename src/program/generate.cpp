@@ -7623,7 +7623,10 @@ int main(int argc, char** argv) {
             };
             auto scan = [&](const PfPart* only) -> int64_t {
                 if (!o.prefill_auto) {   // an explicit --prefill is the operator's number, and a loan of it only has to fit
-                    for (int64_t c = o.prefill_chunk; c >= 256; c /= 2)
+                    // unify: above 8192 in 2048-token steps (the tiled layout's tile), not halves - a 32768 chunk
+                    // that does not fit becomes the largest that does, not 16384
+                    for (int64_t c = o.prefill_chunk; c >= 256;
+                         c = c > 8192 ? std::max<int64_t>(8192, (c - 1) / 2048 * 2048) : c / 2)
                         if (fits(c, false, only)) return c;
                     return 0;
                 }
@@ -7644,6 +7647,13 @@ int main(int argc, char** argv) {
                 if (c == 0 && cap < strata::prefill::Prefill::ring_default_slots()) c = probe(kRingMin);
                 return std::max(c, small);   // never a smaller chunk than 0.1.39's
             };
+            if (std::getenv("STRATA_PF_SIZES") != nullptr)   // unify: what each chunk would borrow, against the cache
+                for (const int64_t c : {8192, 16384, 24576, 32768, 49152, 65536})
+                    std::fprintf(stderr, "strata serve: PF_SIZES chunk %lld: needs %.2f GiB (no ring %.2f) = %lld of %lld slots "
+                                         "(must keep 128)\n", (long long) c,
+                                 strata::prefill::Prefill::bytes_needed(g, *pf_parts[0].ses, c, srcp != nullptr) / 1073741824.0,
+                                 strata::prefill::Prefill::bytes_needed_no_ring(g, *pf_parts[0].ses, c, srcp != nullptr) / 1073741824.0,
+                                 (long long) part_slots(pf_parts[0], c), (long long) pf_parts[0].cache->slots());
             const int64_t chunk = scan(nullptr);
             // #448: a small card in a layer split caps every stage's chunk (an RTX 3080's 512-slot cache held a
             // 32 GB card's split to 512 tokens: prompts 6.2x slower, decode the same).  Named when it bites, so the

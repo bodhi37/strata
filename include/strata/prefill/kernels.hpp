@@ -95,6 +95,12 @@ void moe_shared_into_bo(float* bo, const float* shared, const float* sg, int64_t
 void moe_accum_batch(const float* Dm, const int32_t* slot, const float* w, float* bo, int64_t T, int32_t rb0, int32_t rb1,
                      const float* row_sd, bool first, void* stream);
 void moe_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream);
+/// unify P-CHUNK2: the tiled layout's per-tile q8_1 MMQ rows (each tile quantized as its own `ts`-row matrix: block
+/// (kb, local) at tile_base + kb * ts + local) gathered by token into a batch's `nrows`-row matrix (block (kb, r) at
+/// kb * nrows + r).  The blocks are 16-byte multiples (block_q8_1_mmq: 144 bytes); a row's blocks depend on that row
+/// alone, so the result is the same bytes `quantize` writes from the rows themselves.
+void gather_q8mmq_tiled(const void* xqt, const int32_t* rows, void* xq, int64_t nrows, int64_t nkb, int64_t block_bytes,
+                        int64_t TS, int64_t T, void* stream);
 void moe_scatter_batch(const float* Dm, const int32_t* src, const float* w, float* bo, int64_t n_ent, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd = nullptr);
