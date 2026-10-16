@@ -53,7 +53,16 @@ build-vision-cuda12.bat
 /dist/
 *.done
 /third_party/*.zip
+llama.cpp/
+/model/
+/ple/
+/toolchain/
+/data/*.bin
+data/*.bin
+llama-pinned.tar.gz
+/tests/
 
+<<<<<<< HEAD
 # IDEs
 .vscode/
 .idea/
@@ -61,3 +70,10 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+=======
+# 2026-10-08 NVMe migration: superseded hillclimb configs (historical value only)
+/defunct/
+
+# 2026-10-09: local removal pile (never commit)
+/no/
+>>>>>>> fork-on-v018

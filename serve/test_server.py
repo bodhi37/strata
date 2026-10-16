@@ -1,4 +1,6 @@
-"""serve/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack).
+"""serve/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack), plus
+the resilience paths: every stream ends with a finish_reason (or an error event), a silent engine is aborted by
+the watchdog and replaced, and reasoning_effort reaches the chat template.
 
     python -m unittest serve.test_server -v
 """
@@ -137,7 +139,7 @@ class MaxTokens(unittest.TestCase):
                 self.assertEqual(self.engine.last_max_new, want)
                 self.assertEqual(ct, want)
 
-    def test_explicit_budget_over_the_context_is_rejected(self):
+    def test_explicit_budget_over_the_context_is_clamped(self):
         for api in ("openai", "anthropic"):
             with self.subTest(api=api):
                 s, b, _, _ = self.call(api, max_tokens=CTX)
@@ -161,6 +163,11 @@ class MaxTokens(unittest.TestCase):
             with self.subTest(api=api, room=0):     # nothing left: rejected, not truncated
                 text = "y" * (CTX - CTX_SLACK - overhead - over)
                 s, b, _, _ = self.call(api, text=text)
+                self.assertEqual(s, 400, b)
+                self.assertIn("no room to answer", b["error"]["message"])
+            with self.subTest(api=api, room=0, explicit=1):   # ...same 400 with an explicit budget
+                text = "y" * (CTX - CTX_SLACK - overhead - over)
+                s, b, _, _ = self.call(api, text=text, max_tokens=1)
                 self.assertEqual(s, 400, b)
                 self.assertIn("no room to answer", b["error"]["message"])
 

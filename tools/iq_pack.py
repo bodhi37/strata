@@ -509,6 +509,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
     ap.add_argument("--base", help="optional: a Q2_0 canonical pack whose dense.bin holds the shared float tensors")
+    ap.add_argument("--layer-experts-override", help="optional JSON from tools/append_expert_tensor.py: per-layer "
+                                     "absolute offsets + shard for layers whose experts straddle shards")
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-experts", action="store_true", help="rewrite the index only")
     ap.add_argument("--compat-bf16", action="store_true",
@@ -517,11 +519,20 @@ def main() -> int:
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
     a = ap.parse_args()
+<<<<<<< HEAD
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery: .absolute(), not
     # .resolve(), which would follow the link to the blob and lose the -0000N-of-0000M name.
     src = pathlib.Path(a.gguf).absolute()
+=======
+    override = {}
+    if a.layer_experts_override:
+        import json as _json
+        override = _json.loads(pathlib.Path(a.layer_experts_override).read_text())
+        print("layer-experts override: %s" % sorted(override))
+    src = pathlib.Path(a.gguf).resolve()
+>>>>>>> fork-on-v018
     base = pathlib.Path(a.base).resolve() if a.base else None
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -605,6 +616,7 @@ def main() -> int:
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
+<<<<<<< HEAD
     # ---- the experts.  native_experts.txt is written to a temporary name and renamed only when every layer is
     # in: a stop part-way (a layer split across shards, #171) left a partial native_experts.txt that the next setup
     # run took as a finished pack (#172).  It is the pack's completion marker, so it is published last.
@@ -612,6 +624,39 @@ def main() -> int:
     with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
         fo.write(text)
     tmp.replace(out / "native_experts.txt")
+=======
+    # ---- the experts
+    n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
+    layout, offset = [], 0
+    for l in range(n_layers):
+        ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
+        per = [t.expected_bytes() // N_EXPERT for t in ts]
+        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
+            print("layer %d: gate and up differ in type" % l)
+            return 1
+        blob = per[0] + per[1] + per[2]
+        layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
+        offset += blob * N_EXPERT
+    with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
+        fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
+                 "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
+                 % (N_EXPERT, offset, src.name))
+        for l, gt, dt, off, blob, ts in layout:
+            ws = [model.where[t.name] for t in ts]
+            ov = override.get(str(l))
+            if ov is not None:
+                # a straddling layer consolidated by tools/append_expert_tensor.py: absolute offsets
+                # in the ONE named shard; the three tensors' formats were checked above
+                line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, ov["gate"], ov["up"], ov["down"])
+                fo.write(line + ("" if ov["shard"] == src.name else " " + ov["shard"]) + "\n")
+                continue
+            if len({w[3] for w in ws}) != 1:
+                print("layer %d: its gate/up/down tensors are in different shards" % l)
+                return 1
+            gg, shard = ws[0][0], ws[0][3]
+            line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *[gg.data_start + t.offset for t in ts])
+            fo.write(line + ("" if shard == src else " " + shard.name) + "\n")
+>>>>>>> fork-on-v018
     if a.skip_experts or not a.experts_bin:
         if path.exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)

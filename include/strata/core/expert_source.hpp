@@ -27,18 +27,27 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <algorithm>
 #include <atomic>
-#include <cstdint>
-#include <cstddef>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <vector>
+#include <memory>
+#include <condition_variable>
+#include <mutex>
 
 namespace strata::kernels::cpu {
 struct ExpertLayout;
@@ -151,6 +160,37 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
 }  // namespace detail
 
 
+/// R20: a stateless allocator that hands out storage aligned to `kAlign` bytes.  O_DIRECT requires the BUFFER
+/// address to be aligned too, not just the file offset and length, so the read-ring slots have to come from
+/// somewhere that guarantees it - `std::vector<uint8_t>`'s allocator does not, which is why every decode miss
+/// used to be read into a bounce buffer and memcpy'd into place.  512 is the strictest alignment this needs to
+/// satisfy (the device's logical block size); the probe in `expert_source.cpp` only relaxes the offset/length
+/// test to it once a real direct read has succeeded, and a destination this aligned qualifies either way.
+template <class T>
+struct AlignedBuf {
+    static constexpr std::size_t kAlign = 512;
+    using value_type = T;
+
+    AlignedBuf() = default;
+    template <class U> AlignedBuf(const AlignedBuf<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        void* p = nullptr;
+        const std::size_t bytes = n * sizeof(T);
+        // posix_memalign wants the alignment to be a power-of-two multiple of sizeof(void*): 512 is.
+        if (bytes == 0) return nullptr;
+        if (posix_memalign(&p, kAlign, bytes) != 0) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept { std::free(p); }
+
+    template <class U> struct rebind { using other = AlignedBuf<U>; };
+};
+
+template <class A, class B>
+bool operator==(const AlignedBuf<A>&, const AlignedBuf<B>&) noexcept { return true; }
+template <class A, class B>
+bool operator!=(const AlignedBuf<A>&, const AlignedBuf<B>&) noexcept { return false; }
 
 /// Where one routed expert's bytes come from.
 ///
@@ -182,10 +222,54 @@ public:
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// D1: is this blob's bytes already in host RAM or VRAM (no drive read needed)?  Default: yes.
+    virtual bool host_resident(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
+    /// R5-fetch: read the whole blob for `(layer, expert)` into `dst` (which the caller sizes to at least
+    /// `blob_bytes(layer)`), by-passing the mapped pointer.  A file-backed arena answers with one sequential
+    /// `pread` (the drive's own throughput) or a memcpy when the hot tier holds the blob; a resident arena
+    /// memcpy's.  Returns the bytes read, or -1 when the source cannot (the caller then uses `blob()`).
+    virtual int64_t read_blob(int64_t layer, int64_t expert, void* dst) { (void) expert; (void) dst; (void) layer; return -1; }
+    /// R8: `read_blob` without the stats bookkeeping, so several staging readers can call it concurrently
+    /// (prefill's reader pool).  Same contract; -1 when the source cannot produce the blob this way.
+    virtual int64_t read_blob_raw(int64_t layer, int64_t expert, void* dst) {
+        (void) layer; (void) expert; (void) dst; return -1;
+    }
+    /// R8b: prefill admission hook (see `ArenaExpertSource::dc_stage_admit`).  A no-op for sources without
+    /// an adaptive tier.
+    virtual bool stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes) {
+        (void) layer; (void) expert; (void) bytes; return false;
+    }
+    /// **R7: SPLIT THE WAIT FROM THE READ SO IT CAN BE HIDDEN.**  `begin_layer` used to submit the layer's
+    /// whole-blob reads AND block until they landed, which put the drive's latency on the critical path in front
+    /// of the CPU's own drain - measured on the IQ3_XXS pack, 176 ms of a 272 ms window where the CPU had 57 ms
+    /// of work it could have been doing.  A source that prefetches now returns from `begin_layer` with the reads
+    /// IN FLIGHT, answers `ring_pending` for the entries that are still coming, and blocks in `wait_layer`.
+    /// Callers that cannot interleave anything (`expert_pool_dispatch`'s single-token path) simply call
+    /// `wait_layer` immediately, which is exactly the old behaviour.
+    virtual void wait_layer() {}
+    /// R27 LOOKAHEAD: layer `layer`'s routed-expert input for `n_tok` positions (`x_f`, n_tok x n_embd f32) is
+    /// handed over the moment the doorbell rings; a source with a host copy of the routers predicts layer
+    /// `layer + 1`'s experts from it and starts reading the non-resident ones a whole layer early.
+    /// E1 EARLY ISSUE: the routing of the NEXT pool call is already known (its doorbell rang while the host is
+    /// still on the current call); start its misses' reads now.  Thread-safe against begin/wait_layer.
+    virtual void early_issue(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
+    virtual void lookahead(int64_t layer, const float* x_f, int64_t n_tok, int64_t n_embd) {
+        (void) layer; (void) x_f; (void) n_tok; (void) n_embd;
+    }
+    /// True when `(layer, expert)`'s bytes are being read and are NOT yet valid.  A source with no prefetch
+    /// answers false for everything, so the split reduces to the old code path.
+    virtual bool ring_pending(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
+    /// **R7: ASK THE KERNEL TO START READING THIS LAYER'S EXPERTS NOW.**  Prefill stages one blob at a time
+    /// on the host thread, so - exactly like decode before the two-pass split - the drive sits at QD1 and a
+    /// 33k-token prompt measured 498 s for 330 GB of reads (0.67 GB/s, the drive's QD1 rate).  Prefill knows
+    /// the whole layer's expert set up front and processes it in file-offset order, so a WILLNEED over that
+    /// list turns the QD1 stream into near-sequential readahead at the drive's full rate and the staging
+    /// reads become page-cache hits.  A source without a file is a no-op.
+    virtual void prefetch(int64_t layer, const int32_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
@@ -304,6 +388,10 @@ private:
     uint64_t st_windows_ = 0;
     uint64_t st_vhit_[3] = {0, 0, 0}, st_vpred_[3] = {0, 0, 0}, st_pch_ = 0, st_pcov_[3] = {0, 0, 0};
     static constexpr int kVoteN = 16;
+    /// R9b: can this source feed the GPU's PCIe expert path at all?  The plan builder needs a cheap per-layer
+    /// gate that does not depend on one arbitrary expert being resident (the old test,
+    /// `device_alias(layer, 0) != nullptr`, flapped per layer with an LRU tier).
+    virtual bool pcie_ready() const { return device_alias(0, 0) != nullptr; }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -343,12 +431,22 @@ struct ExpertDispatch {
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
+    void (*on_begun)(void* ctx) = nullptr;   ///< E1: called right after begin_layer (the issuer may run)
+    void* on_begun_ctx = nullptr;
     int64_t n_expert = strata::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
     int64_t layers = 0;
     int64_t experts = 0;
     int64_t missing = 0;
+
+    /// R21: --gpu-share.  0..256: the fraction (in 256ths) of a layer's DISTINCT experts - RAM-tier
+    /// hits included, not just the VRAM-cache misses - routed to the GPU through the pinned arena's
+    /// device alias, so the window's expert reads split across the CPU pool's cores and the PCIe path
+    /// at the same time.  0 = the legacy policy (misses only, the last pcie_num/256 of them).
+    int gpu_share = 0;
+    int64_t pcie_residents = 0;
+    int64_t dropped = 0;          ///< D1: routed experts dropped because they would have been a drive read   ///< R21: RAM-tier blobs this run sent over PCIe (vs the miss ones).
 
     // ================================ R4: THE VRAM TIER, MEASURED BEFORE IT IS USED ================================
     //
@@ -464,10 +562,13 @@ struct ExpertDispatch {
     /// and the distinct experts behind them (neither copied nor computed)
     int64_t tail_skipped = 0;
     int64_t tail_experts = 0;
-    double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0, ms_wait = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// R5: cumulative routed counts per (layer, expert), never decayed - what `--dump-profile` ranks into a
+    /// STRP profile built from THIS model's actual routing on THIS machine.
+    std::vector<uint64_t> usage_total;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
@@ -933,6 +1034,162 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
+    /// R5-prefetch: called with a layer's routing ids before the pool drains.  For every requested blob that
+    /// the hot tier does not already hold, submit one whole-blob readahead (`posix_fadvise WILLNEED`) so the
+    /// pages stream in at the drive's sequential rate while the GPU runs this layer's hits - instead of the
+    /// pool faulting 4 KiB at a time from a cold drive inside the drain.
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// Blobs the prefetch has submitted since startup.
+    int64_t prefetched() const { return prefetched_; }
+    /// Small-RAM machines: back the native-pack arena with `<pack_dir>/experts-native.bin` (mmap, MAP_SHARED).
+    /// The first run materializes the blobs from the GGUF shards into the file; later runs page in lazily
+    /// and the kernel's page cache holds whatever fits.  No cudaHostRegister (the PCIe alias path is off).
+    void set_file_backing(bool on) { file_backing_ = on; }
+    /// **SMALL-RAM MACHINES: PIN THE HOT EXPERTS IN RAM.**  A file-backed arena cannot hold tens of GiB of
+    /// experts on a 30 GiB box, and the docs above say exactly why the mapped form is the A/B arm: file-backed
+    /// pages are the first thing the OS reclaims, so the expert stream keeps re-faulting from disk.  This gives
+    /// the tier the machine CAN afford: an anonymous arena holding the `ranked` profile's hottest blobs,
+    /// `mlock`ed so neither reclaim nor a prompt's full pass over the expert set can evict them.  Routing is
+    /// heavily skewed (`--expert-cache-per-layer` measures 21.4% hits in 8 slots/layer, 70.4% in 64), so the
+    /// top slice carries most of the traffic and the residual SSD reads are what is left.  Call after `open`.
+    void pin_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t bytes);
+    /// Bytes actually pinned by `pin_hot`, and how many blobs that is.
+    uint64_t hot_bytes() const { return hot_used_; }
+    int64_t hot_blobs() const { return hot_count_; }
+    /// R8: **MAKE THE TIER ADAPTIVE.**  The R5-R7 tier is a STATIC copy of the profile's top blobs, and a
+    /// static tier tuned on one trace domain collapses when the conversation moves: measured on a fresh
+    /// technical prompt after a tier built from the bench traces, only 33% of routed experts were resident
+    /// and decode fell to 0.2 tok/s (1.5 GB/token of NVMe reads).  With this on, the tier is an LRU whose
+    /// initial contents are the profile in rank order: a decode miss is admitted into the tier (the pread
+    /// ring lands DIRECTLY in the slot, no extra copy), the least-recently-used blob is evicted to make
+    /// room, and the static profile is just the starting LRU order.  R8b: prefill admits TOO (see
+    /// `dc_stage_admit`) - the original "prefill must not admit" rule was wrong for agentic sessions, where
+    /// the prompt's routed experts are precisely the working set every later turn and generation reuses.
+    void set_dynamic_tier(bool on) { dynamic_tier_ = on; }
+    bool dynamic_tier() const { return dynamic_tier_; }
+    /// R8 diagnostics for the serve stats line.
+    int64_t dc_admits() const { return dc_admits_; }
+    int64_t lru_slots() const { return lru_base_ > 0 ? dc_slots_ : 0; }
+    int64_t lru_hits() const { return lru_hits_; }
+    int64_t lru_hits_ = 0;   ///< X3: begin_layer skips served by an LRU slot
+    int64_t dc_evicts() const { return dc_evicts_; }
+    int64_t dc_fallbacks() const { return dc_fallbacks_; }
+    /// R8b: **PREFILL ADMISSIONS.**  A prompt's routing is decided layer by layer as prefill runs, and the
+    /// experts a prompt routes to are exactly the experts its generation will route to - so prefill's
+    /// staging reads are admitted to the LRU.  A multi-turn session then prefills from RAM after its first
+    /// turn and decode starts primed; measured, an unadmitted prompt sweeps ~20 GB of disk EVERY turn and
+    /// decode pays the same misses again.  `dc_stage_admit` copies the landed staging bytes into a fresh or
+    /// evicted LRU slot and commits it.  False when the tier cannot take it (no tier / no slot).
+    bool dc_stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes);
+    int64_t dc_stage_admits() const { return dc_stage_admits_; }
+    /// Whether the tier is doing anything: served / total `blob()` calls since startup.
+    int64_t hot_hits() const { return hot_hits_; }
+    int64_t hot_lookups() const { return hot_lookups_; }
+
+    /// R22: **THE PRESSURE GOVERNOR (the elastic tier).**  `pin_hot`'s tier is `mlock`ed and
+    /// `cudaHostRegister`ed - only reclaimable RAM frees itself; a hard-hosted session (24 GiB tier + KV pools
+    /// + everything else on ~30 GiB) reaches zero headroom, thrashes the swap and dies inside CUDA
+    /// (cublasCreate, 2026-10-04/05 twice).  `shed_pressure` returns WHOLE tier slices to the host: the
+    /// cold-end slices' slots leave the tier (`hot_slot_` cleared under the tier lock - every consumer gate
+    /// checks it, so the DMA/GPU path and the CPU pool stop using them), the slice's registration is undone
+    /// (registration PINS the pages - it must be unregistered before they can be reclaimed) and the pages are
+    /// dropped.  Decode on a shed slice pays a pread/miss instead of a DMA hit: slower but correct, and the
+    /// tier's former free space is what keeps the engine (and the machine) alive.  Returns the bytes granted.
+    uint64_t shed_pressure(uint64_t bytes_to_free);
+    /// Bytes the governor has already shed (diagnostics / the note line).
+    uint64_t hot_shed_bytes() const { return hot_shed_; }
+    /// Slots the shed freed (refillable by the LRU admissions when pressure passes).
+    int64_t shed_free_slots() const { return dc_free_.size(); }
+    /// R22b: **THE GOVERNOR'S REGROW.**  Re-register + re-mlock the most-recently-refill-gravity shed slice
+    /// (the arena's END slices refill first: the LIFO free list pops high slot ids), one per call, and only
+    /// when the host has MemAvailable >= slice + 1024 MiB of its own (the engine reads /proc/meminfo itself).
+    /// Returns the bytes regrown; 0 = refused (no headroom) or nothing to regrow.  The refilled slots' blobs
+    /// are re-admitted by ordinary LRU traffic afterwards; a regrown slice does not resurrect content.
+    uint64_t regrow_pressure(uint64_t bytes);
+
+    /// R7: **WHERE THE EXPERT BYTES ACTUALLY CAME FROM.**  The old pair above counts only the lookups that
+    /// reached the HOT-TIER CHECK, so a blob answered from the pread ring or straight out of the mapping was
+    /// invisible - which is how "100% hot tier" coexisted with a disk-bound run.  These counters are inclusive
+    /// over every blob the engine asked for, whichever path answered, and `disk_bytes` is the number that says
+    /// whether the SSD is the wall.
+    struct BlobStats {
+        int64_t requests = 0;   ///< every blob() call that needed bytes for a routed expert
+        int64_t hot = 0;        ///< answered from the pinned host tier (RAM, no I/O)
+        int64_t ring = 0;       ///< answered from the pread ring (already read into RAM this layer)
+        int64_t map = 0;        ///< fell through to the file mapping: a fault, page cache or disk
+        int64_t disk = 0;       ///< whole-blob reads issued to the drive (ring jobs + staging preads)
+        int64_t disk_bytes = 0; ///< bytes those reads moved
+        // R7: the scheduling side of the same story.  `calls`/`entries` say how often begin_layer runs and
+        // with how many ids; `hot_skips` says how many of those were already resident; `jobs` is what it
+        // actually asked the drive for.  jobs >> (entries - hot_skips) means the ring is re-fetching.
+        int64_t calls = 0, entries = 0, hot_skips = 0, already = 0;
+        /// R7 prefetch study: of this run's disk misses, how many were ALSO a miss in the previous verify
+        /// window.  That number is the entire case for prefetching: the per-layer read costs ~2.9 ms of exposed
+        /// drive latency (measured, 2.08 MB at QD1 = 740 MB/s), so a prediction that covers even half of the
+        /// next window's misses would remove half of a 140 ms per-window cost.
+        int64_t win_misses = 0, win_repeat = 0, win_prefetched = 0, win_prefetch_used = 0;
+    };
+    BlobStats take_blob_stats();   ///< read and reset, so the caller reports per request
+    /// R5-fetch: read the whole blob into `dst` - one sequential `pread` out of the file, or a memcpy when
+    /// the hot tier holds it.  -1 when this source cannot (a resident arena has no file to read).
+    int64_t read_blob(int64_t layer, int64_t expert, void* dst) override;
+    int64_t read_blob_raw(int64_t layer, int64_t expert, void* dst) override;   ///< R8: stats-free, reader-safe
+    void wait_layer() override;                          ///< R7: block until this layer's submitted reads land
+    void lookahead(int64_t layer, const float* x_f, int64_t n_tok, int64_t n_embd) override;
+    void early_issue(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// AD2: a RAM LRU slot for (layer, expert) - the destination of a GPU->host copy of a blob leaving the VRAM
+    /// cache - returned unpublished (*dst = its bytes); -2 when the blob is already RAM-resident, -1 when no slot.
+    int32_t adapt_reserve(int64_t layer, int64_t expert, uint8_t** dst);
+    /// AD2: the copy into a reserved slot has landed: the blob is a RAM-tier resident from now on.
+    void adapt_publish(int64_t layer, int64_t expert, int32_t slot);
+    /// AD3: expert `in`'s RAM slot now holds expert `out`'s bytes (a capacity-neutral VRAM<->RAM swap): relabel it.
+    bool adapt_relabel(int64_t layer, int64_t in, int64_t out);
+    uint8_t* ram_ptr(int64_t layer, int64_t expert) {
+        const int64_t idx = layer * n_expert_ + expert;
+        return (idx >= 0 && idx < (int64_t) hot_slot_.size() && hot_slot_[(size_t) idx] >= 0) ? hot_arena_ + hot_slot_[(size_t) idx] : nullptr;
+    }
+    bool ram_resident(int64_t layer, int64_t expert) const {
+        const int64_t idx = layer * n_expert_ + expert;
+        return idx >= 0 && idx < (int64_t) hot_slot_.size() && hot_slot_[(size_t) idx] >= 0;
+    }
+    /// R27: the VRAM cache's residency ([layer * n_expert + e] -> slot, < 0 = not resident).  Those experts are
+    /// computed on the GPU from VRAM; before this the ring ALSO read every routed one off the drive and the pool
+    /// waited for it.
+    /// X4: write the CURRENT residency bitmap (1 RAM, 2 VRAM) - called per request to see it drift
+    void dump_res(const char* p) const {
+        if (FILE* f = std::fopen(p, "wb")) {
+            for (int64_t i = 0; i < blobs_; ++i) {
+                const uint8_t v = (uint8_t) ((!hot_slot_.empty() && hot_slot_[(size_t) i] >= 0 ? 1 : 0) |
+                                             (vram_res_ != nullptr && vram_res_[i] >= 0 ? 2 : 0));
+                std::fwrite(&v, 1, 1, f);
+            }
+            std::fclose(f);
+        }
+    }
+    void set_vram_res(const int32_t* r) {
+        if (std::getenv("STRATA_NO_VRAMSKIP") == nullptr) vram_res_ = r;
+        // X4: STRATA_DUMP_RES=<file> writes one byte per (layer, expert): 1 RAM tier, 2 VRAM, 3 both, 0 neither
+        if (const char* p = std::getenv("STRATA_DUMP_RES")) {
+            if (FILE* f = std::fopen(p, "wb")) {
+                for (int64_t i = 0; i < blobs_; ++i) {
+                    const uint8_t v = (uint8_t) ((!hot_slot_.empty() && hot_slot_[(size_t) i] >= 0 ? 1 : 0) |
+                                                 (r != nullptr && r[i] >= 0 ? 2 : 0));
+                    std::fwrite(&v, 1, 1, f);
+                }
+                std::fclose(f);
+            }
+        }
+    }
+    /// R27: host copy of every layer's BF16 router ([n_expert][n_embd] per layer).  Turns the lookahead on.
+    void set_router_host(std::vector<uint16_t> w, int64_t n_layers, int64_t n_embd);
+    struct LaStats { int64_t predicted = 0, issued = 0, used = 0, used_landed = 0, late_spin_us = 0; };
+    LaStats take_la_stats() {
+        LaStats s = la_stats_; s.predicted = la_pred_.exchange(0); s.issued = la_issued_.exchange(0); la_stats_ = LaStats{};
+        if (ex_on_) { s.issued = ex_early_.exchange(0); s.used = ex_early_used_.exchange(0); s.used_landed = ex_early_landed_.exchange(0); }
+        return s;
+    }
+    bool ring_pending(int64_t layer, int64_t expert) const override;   ///< R7: is this blob still in flight?
+    void prefetch(int64_t layer, const int32_t* experts, int64_t n) override;   ///< R7: warm the page cache
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -943,6 +1200,13 @@ public:
     const uint8_t* blob_at(int64_t layer, int64_t expert) const;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
+    bool host_resident(int64_t layer, int64_t expert) const override {
+        if (layer < 0 || expert < 0 || expert >= n_expert_) return true;
+        const int64_t idx = layer * n_expert_ + expert;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) return true;
+        if (vram_res_ != nullptr && vram_res_[idx] >= 0) return true;
+        return file_map_ == nullptr;   // no file tier: everything is resident
+    }
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     /// Prefix pinning: the old rule (device_alias(layer, 0)); pin by need: at least one pinned range in the layer.
     bool pcie_layer(int64_t layer) const override;
@@ -962,6 +1226,7 @@ public:
     }
     /// Pin by need, after open(): the registered ranges (0 when the prefix rule, or nothing, is in force)
     size_t pin_ranges() const { return pin_start_.size(); }
+    bool pcie_ready() const override { return file_map_ != nullptr ? hot_dev_ok_ : !dev_slice_.empty(); }
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -1010,6 +1275,234 @@ private:
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
+    bool file_backing_ = false;
+    void* file_map_ = nullptr;       ///< the mmap of experts-native.bin (file_backing_ path)
+    uint64_t file_map_bytes_ = 0;
+    int file_fd_ = -1;
+    // R13: **O_DIRECT EXPERT READS.**  Every ring/staging/tier-fill read used to go through the page cache:
+    // the kernel allocated ~530 cache pages per 2.18 MB blob, copied disk->cache->user, and the reader then
+    // issued POSIX_FADV_DONTNEED to hand it all back (R8.2 measured ~39% of engine CPU inside kernel page
+    // management on that cycle).  A second O_RDONLY|O_DIRECT fd serves the same bytes straight into the
+    // destination buffer: no page-cache allocation, no DONTNEED, no double copy.  `file_fd_` stays for the
+    // mmap fallthrough and the (page-cache) WILLNEED prefetchers.  STRATA_NO_ODIRECT=1 is the A/B arm.
+    int direct_fd_ = -1;
+    bool direct_ok_ = false;
+    // R20: the alignment O_DIRECT actually enforces on THIS file, probed at open (512 on this NVMe/btrfs
+    // pair, not the 4096 the code used to assume).  Blob offsets are 1024-aligned, so with a 512 requirement
+    // every read lands directly in its destination and the 2.18 MB bounce memcpy disappears.
+    uint64_t direct_align_ = 4096;
+    uint8_t* hot_arena_ = nullptr;   ///< the anonymous pinned arena for the profile's hottest blobs
+    uint64_t hot_cap_ = 0, hot_used_ = 0;
+    int64_t hot_count_ = 0;
+    int64_t hot_hits_ = 0, hot_lookups_ = 0;
+    // ---- R8: the adaptive LRU tier.  The arena is carved into fixed slots of `dc_slot_bytes_` (the largest
+    // blob, 4 KiB-rounded; blob sizes are uniform within ~1% so the waste is negligible), which makes
+    // allocation, eviction and the LRU all O(1) array walks with no allocator and no fragmentation.  `blob()`
+    // stays keyed on `hot_slot_` (blob index -> byte offset); the slot id is that offset divided by
+    // `dc_slot_bytes_`, and the LRU is an intrusive list over slot ids.
+    bool dynamic_tier_ = true;
+    uint64_t dc_slot_bytes_ = 0;
+    /// X3: HYBRID TIER.  With a packed static tier plus `STRATA_LRU_GIB`, the LRU's fixed slots start at this
+    /// arena offset (after the packed blobs, slot-aligned).  0 = the slot-only layout, unchanged.
+    uint64_t lru_base_ = 0;
+    /// H1: EXACT-SIZE LRU SLOTS (`STRATA_LRU_EXACT`, hybrid tier only).  The fixed slot is the largest blob
+    /// (2.54 MiB) but this pack's layers run 1.51-2.33 MB, so a fixed-slot LRU wasted ~25% of its bytes.  Exact
+    /// mode carves one pool per blob-size class (equal slot count per layer), each slot its class's 4 KiB-rounded
+    /// size, so `slot_off` is a table and eviction stays within the class.  Empty `dc_off_` = fixed layout.
+    std::vector<uint64_t> dc_off_;             ///< per slot: absolute arena offset (exact mode), ascending
+    std::vector<uint8_t> dc_cls_;              ///< per slot: size class
+    std::vector<uint8_t> dc_cls_of_layer_;     ///< per layer: size class
+    std::vector<std::vector<int32_t>> dc_freec_;   ///< per class: free-slot stack (exact mode)
+    uint64_t slot_off(int64_t s) const {
+        return dc_off_.empty() ? lru_base_ + (uint64_t) s * dc_slot_bytes_ : dc_off_[(size_t) s];
+    }
+    int32_t slot_of_off(int64_t off) const {
+        if (off < 0 || (uint64_t) off < lru_base_ || dc_slot_bytes_ == 0) return -1;
+        if (dc_off_.empty()) return (int32_t) (((uint64_t) off - lru_base_) / dc_slot_bytes_);
+        auto it = std::upper_bound(dc_off_.begin(), dc_off_.end(), (uint64_t) off);
+        if (it == dc_off_.begin()) return -1;
+        --it;
+        return *it == (uint64_t) off ? (int32_t) (it - dc_off_.begin()) : -1;
+    }
+    bool dc_any_free() const {
+        if (!dc_free_.empty()) return true;
+        for (const auto& f : dc_freec_) if (!f.empty()) return true;
+        return false;
+    }
+    int64_t dc_slots_ = 0;
+    std::vector<int32_t> dc_prev_, dc_next_;   ///< per slot: LRU neighbours (-1 = none)
+    std::vector<int32_t> dc_idx_;              ///< per slot: blob index it holds, or -1 when free
+    std::vector<uint32_t> dc_epoch_;           ///< per slot: window epoch of the last touch/admit
+    std::vector<uint16_t> dc_count_;           ///< per slot: decayed hit count (frequency-aware eviction)
+    std::vector<int32_t> dc_free_;             ///< free-slot stack
+    int32_t dc_head_ = -1, dc_tail_ = -1;      ///< LRU: head = most recent
+    std::vector<int64_t> dc_admit_list_;       ///< this layer's pending admissions (blob idx), committed in wait_layer
+    int64_t dc_admits_ = 0, dc_evicts_ = 0, dc_fallbacks_ = 0;
+    int64_t dc_stage_admits_ = 0;              ///< R8b: prefill admissions
+    // ---- R22: the ELASTIC tier (the pressure governor).  `cudaHostRegister` pins pages (unswappable) and a
+    // tier whose whole 24 GiB is registered+mlocked is what an over-subscribed box dies on (2026-10-04/05:
+    // zram collapse, then cublasCreate).  Registration is in 2 GiB SLICES and `hot_reg_` tracks which slices
+    // still have a live registration; `shed_pressure` (called by the server's governor thread) picks whole
+    // slices from the arena's end (the coldest rank tail), unregisters + munlocks + drops their pages and
+    // puts their slots on the free list for the LRU admissions to refill when headroom returns.
+    std::vector<std::atomic<bool>> hot_reg_;    ///< per slice (~2 GiB = 12 slices per 24 GiB tier): the registration is live
+    uint64_t hot_slice_slots_ = 0;              ///< whole slots per slice, computed in pin_hot
+    uint64_t hot_shed_ = 0;                     ///< bytes handed back to the host so far
+    /// R8b: guards the LRU structures when prefill's READER threads touch them (decode's mutators are all
+    /// host-thread and never overlap prefill, but prefill touches run concurrently on the reader pool).
+    ///
+    /// R22 measured this lock as a possible prefill bottleneck and found it is NOT one - leave it alone.
+    /// Every staging read does hold the mutex across a whole-blob (2.18 MB) memcpy, and `rd-wait` is 83% of
+    /// MoE time, so narrowing the critical section looked like the obvious 2x.  It is not: a `shared_mutex`
+    /// (`read_blob_raw` shared, `dc_stage_admit` unique) measured 2.2x WORSE, because the reader publishes its
+    /// slot's `done` flag only AFTER `stage_admit`, which then waits for the exclusive side behind 16 readers
+    /// holding shared across their copies - writer starvation on the very flag the consumer blocks on.  And
+    /// moving just the memcpy out (touch kept under the lock, for the epoch stamp that prevents eviction) was
+    /// indistinguishable from baseline at n=6 (median 192 vs 197 tok/s, both min~110/max~300 - see REPORT).
+    std::mutex dc_mu_;
+    void dc_init(int64_t slot_bytes);
+    int32_t dc_alloc(int64_t idx);             ///< a free or evicted slot for blob `idx`, or -1
+    void dc_touch(int32_t slot);               ///< move to LRU head, stamp the window epoch
+    void dc_touch_locked(int32_t slot);
+    int32_t dc_alloc_locked(int64_t idx);
+    void dc_unlink(int32_t slot);
+    void dc_link_head(int32_t slot);
+    /// R7: inclusive source counters; see `BlobStats`.
+    BlobStats blob_stats_{};
+    bool hot_locked_ = false;
+    // ---- R9b: THE GPU's PCIe EXPERT PATH READS THE TIER.  Upstream's 95 tok/s comes from the GPU computing
+    // its share of every layer's experts (the default --pcie-frac 0.55) - but that path requires the blob's
+    // host memory to be REGISTERED (cudaHostRegister), and the mmap arena variant never registered anything,
+    // so `pinned()`/`device_alias()` were permanently false/null and decode ran 100% on the CPU pool
+    // (~330 ms/window serial, the measured wall).  Registering the mlocked LRU tier turns both back on:
+    // `fetch_dma` copies tier-resident blobs into VRAM staging at full PCIe rate beside the CPU's work, and
+    // the grouped kernel computes them on the GPU.  Tier residents are exactly the right 97%+ to offload.
+    bool hot_dev_ok_ = false;
+    const uint8_t* hot_dev_base_ = nullptr;
+    std::vector<int64_t> hot_slot_;  ///< per blob index: byte offset in hot_arena_, or -1 when not pinned
+    int64_t prefetched_ = 0;         ///< R5-prefetch: whole-blob WILLNEED submissions since startup
+    std::vector<uint8_t> pf_seen_;   ///< per-call dedupe scratch, sized n_expert_
+
+    // ---- R5-fetch: the pread ring + reader pool -------------------------------------------------------------
+    static constexpr int kRingSlots = 64;
+    /// R7: **CHUNKED READS - BUILT, MEASURED, REJECTED.**  The hypothesis was that one 2.08 MB random read
+    /// (2.8-2.9 ms at QD1) could be split into `kSplit` concurrent sub-reads to raise the queue depth, since
+    /// the engine only has 1-2 misses per layer.  Measured on the IQ3_XXS pack, 20 GiB hot tier, `--spec 4
+    /// --spec-min-p 0.8`: **kSplit 4 made it WORSE - 8.4 tok/s against 10.7 whole-blob, ring-wait 167 ms
+    /// against 113.**  The micro-benchmark already said why: 266 KiB reads at QD8 move only 682 MB/s while
+    /// 2.08 MiB reads at QD8 move 1000-1080 MB/s, so this drive's per-request overhead, not its queue depth,
+    /// dominates at small sizes.  Left at 1 (whole blob) and kept as the A/B arm so the next agent does not
+    /// re-derive it.
+    // R10: runtime-tunable (STRATA_RSPLIT, default 1).  R7 measured kSplit 4 (512 KiB) WORSE (8.4 vs 10.7
+    // tok/s) and left it at 1; kSplit 2 (two ~1.09 MiB halves, issued concurrently) was never tried and the
+    // drive's size/latency curve (2 MiB QD8 ~1.0-1.1 GB/s, 266 KiB ~0.68) puts it at the sweet spot.
+    static int kSplit() {
+        static const int v = [] { const char* e = std::getenv("STRATA_RSPLIT"); return e ? std::max(1, std::atoi(e)) : 1; }();
+        return v;
+    }
+    static constexpr uint64_t kChunk = 512 * 1024;
+    static constexpr int kMaxChunks = 16;                  // (max_blob + kChunk - 1) / kChunk, bounded
+    struct PfJob { uint8_t* dst; uint64_t off, len; };     ///< one sub-read of one blob
+    /// R20: the decode read ring.  Slot buffers are allocated on the O_DIRECT alignment so `direct_read_span`
+    /// can pread a missed blob STRAIGHT into its final home; with plain heap vectors every one of these reads
+    /// took the bounce buffer plus a whole-blob memcpy.
+    using RingBytes = std::vector<uint8_t, AlignedBuf<uint8_t>>;
+    std::vector<RingBytes> ring_;            ///< per slot: one whole blob (largest layer's bytes)
+    std::vector<int64_t> ring_of_;           ///< blob index -> ring slot for the CURRENT layer, else -1
+    std::vector<PfJob> pf_jobs_;
+    std::vector<std::thread> pf_workers_;
+    std::atomic<uint32_t> pf_epoch_{0}, pf_done_{0}, pf_head_{0}, pf_njobs_{0}, pf_parked_{0};
+    std::atomic<bool> pf_stop_{false};
+    // R5b: parked readers BLOCK on this condvar instead of spinning - ten threads spinning PAUSE on a
+    // 12-core part steal SMT issue slots from the twelve compute workers and measurably slow the drain.
+    std::mutex pf_mu_;
+    std::condition_variable pf_cv_;
+    int64_t ring_layer_ = -1;
+    bool pf_started_ = false;
+    /// R7: the submitted batch is in flight until `wait_layer` has confirmed every job done.
+    bool ring_waiting_ = false;
+    int pf_jobs_active_ = 0;
+    // ---- R7 prefetch study: is the previous verify window a good predictor of this one's misses?
+    // `miss_epoch_[blob]` is the window number in which that blob was last a miss, so a miss whose epoch is
+    // `window_epoch_ - 1` is a REPEAT.  `last_misses_` is the previous window's miss list, used both to score
+    // the predictor and (when `prefetch_predict_`) to warm the page cache for the window that is starting.
+    std::vector<uint32_t> miss_epoch_;
+    std::vector<int32_t> last_misses_, cur_misses_;
+    uint32_t window_epoch_ = 0;
+    bool prefetch_predict_ = true;
+    void pf_window_start();
+    void pf_record_miss(int64_t idx);
+    void pf_worker();              ///< R5-fetch: one of the four pread threads
+    int64_t direct_read_blob(int64_t layer, int64_t expert, uint8_t* dst);  ///< R13: one O_DIRECT blob read
+    bool direct_read_span(uint64_t off, uint64_t len, uint8_t* dst);        ///< R13: one O_DIRECT byte span
+
+    // ---- R27: cross-layer LOOKAHEAD prefetch.  The decode pool waited ~40 ms per window on per-layer QD1
+    // reads that could only start once that layer's router ran.  The predictor thread runs layer L+1's router
+    // on layer L's input (the residual moves little across one layer) and reads the predicted misses into
+    // `la_buf_` slots while layer L computes; `begin_layer(L+1)` claims them instead of issuing new reads.
+    const int32_t* vram_res_ = nullptr;
+    bool packed_ = false;              ///< R27: static tier packed by actual blob size (no slots)
+    static constexpr int kLaSlots = 128;
+    struct LaSlot { int64_t idx = -1; int64_t layer = -1; uint32_t win = 0; std::atomic<int> state{0}; };  // 0 free 1 inflight 2 landed 3 failed
+    std::vector<uint16_t> la_router_;          ///< [layer][n_expert][n_embd] BF16
+    int64_t la_n_embd_ = 0, la_layers_ = 0;
+    std::vector<RingBytes> la_buf_;
+    std::unique_ptr<LaSlot[]> la_slot_;
+    std::vector<int16_t> la_of_;               ///< blob idx -> LA slot, else -1 (guarded by la_mu_)
+    std::mutex la_mu_;
+    std::condition_variable la_cv_, la_io_cv_;
+    std::vector<std::thread> la_threads_;
+    bool la_started_ = false, la_stop_ = false;
+    int la_k_ = 10, la_rr_ = 0, la_depth_ = 1;
+    // predictor mailbox (guarded by la_mu_)
+    std::vector<float> la_x_;
+    int64_t la_req_layer_ = -1, la_req_ntok_ = 0;
+    bool la_req_ = false;
+    std::vector<int> la_io_q_;                 ///< slots to read (guarded by la_mu_)
+    // LA2: a USED lookahead blob is admitted to the LRU tier like a ring miss.  The host allocates the slot
+    // (wait_layer), a reader copies the bytes (state 4 = copying), the host publishes at the next begin_layer.
+    struct LaAdmit { int ls; int32_t dc; int64_t idx; };
+    std::vector<LaAdmit> la_admit_q_;          ///< copies to do (guarded by la_mu_)
+    std::vector<LaAdmit> la_publish_;          ///< copies done, to publish on the host (guarded by la_mu_)
+    int64_t la_admits_ = 0;
+    std::vector<int> la_cur_;                  ///< this layer's claimed slots (host thread only)
+    std::atomic<int64_t> la_cur_layer_{-1};
+    std::atomic<uint32_t> la_win_{0};
+    LaStats la_stats_{};
+    std::atomic<int64_t> la_pred_{0}, la_issued_{0};
+    void la_start();
+    void la_predictor();
+    void la_reader();
+
+    // ---- E1: EARLY ISSUE (STRATA_EARLY=1).  Reads become per-blob jobs on a FIFO served by reader threads, so
+    // the next pool call's misses can be put on the wire (by the verifier's issuer thread, the moment that call's
+    // doorbell rings) while the host still computes the current call.  Every read lands straight in its LRU slot;
+    // `wait_layer` waits for this call's jobs only and commits them.  Exact: the same blobs, read earlier.
+    struct EJob { uint8_t* dst = nullptr; uint64_t off = 0, len = 0; int64_t idx = -1; int32_t dc = -1; std::atomic<int> st{0}; std::atomic<int> left{0}; std::atomic<int> bad{0}; };
+    static constexpr int kEJobs = 1024;
+    static constexpr int64_t kExPend = 1 << 24;   ///< ring_of_ mark: read by an E1 job for the current call
+    bool ex_on_ = false, ex_started_ = false;
+    std::unique_ptr<EJob[]> ej_;
+    std::vector<int> ej_free_;                 ///< guarded by ex_mu_
+    std::vector<int16_t> ej_of_;               ///< blob idx -> job or -1 (writes guarded by ex_mu_)
+    std::mutex ex_mu_;
+    std::mutex ejq_mu_;
+    std::condition_variable ejq_cv_;
+    std::deque<int> ejq_;
+    bool ejq_stop_ = false;
+    std::vector<std::thread> ej_thr_;
+    std::vector<int> ex_cur_;                  ///< host: the jobs this call waits for
+    std::atomic<int64_t> ex_early_{0}, ex_early_used_{0}, ex_early_landed_{0};
+    static int ex_chunks() {
+        static const int v = [] { const char* e = std::getenv("STRATA_EARLY_CHUNKS"); return e ? std::max(1, std::min(8, std::atoi(e))) : 1; }();
+        return v;
+    }
+    void ex_start();
+    void ex_reader();
+    int ex_claim_locked(int64_t layer, int64_t e, bool* fresh);
+    void ex_drain_locked();
+    void ex_begin_layer(int64_t layer, const int32_t* ids, int64_t k);
+    void ex_wait_layer();
 };
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's

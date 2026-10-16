@@ -73,7 +73,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const
     gdn_conv_l2_body(blockIdx.x, blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
 }
 
-__global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
+__global__ void __launch_bounds__(1024) gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
                                        const int32_t* __restrict__ n_keep) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -542,7 +542,7 @@ __global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __res
     }
 }
 
-__global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
+__global__ void __launch_bounds__(1024) embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
                                             const float* __restrict__ offsets, const int32_t* __restrict__ tokens,
                                             int64_t n, int code_bits, int code_bias, int group_elems,
                                             unsigned long long row_codes, unsigned long long row_groups,
@@ -562,14 +562,14 @@ __global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, c
     out[(size_t) t * n + i] = __fadd_rn(product, of ? of[group] : 0.0f);
 }
 
-__global__ void broadcast_streams_kernel(const float* __restrict__ x, float* __restrict__ R, int64_t n, int hc) {
+__global__ void __launch_bounds__(1024) broadcast_streams_kernel(const float* __restrict__ x, float* __restrict__ R, int64_t n, int hc) {
     const int t = blockIdx.y;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * hc) return;
     R[(size_t) t * n * hc + i] = x[(size_t) t * n + i % n];
 }
 
-__global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
+__global__ void __launch_bounds__(1024) copy_indexed_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t stride,
                                     const int32_t* __restrict__ index, int64_t n) {
     const int idx = *index;
     if (idx < 0) return;
@@ -577,7 +577,7 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
         dst[i] = src[(size_t) idx * stride + i];
 }
 
-__global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+__global__ void __launch_bounds__(1024) fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                    uint4* __restrict__ dst, long long per) {
     const long long total = (long long) *n * per;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
@@ -587,12 +587,12 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
     }
 }
 
-__global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
+__global__ void __launch_bounds__(1024) rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
     const int k = threadIdx.x;
     if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
 }
 
-__global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
+__global__ void __launch_bounds__(1024) add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
                                              float* __restrict__ R, int64_t n, int hc) {
     const int t = blockIdx.y;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -600,7 +600,7 @@ __global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const 
     R[(size_t) t * n * hc + i] = h[(size_t) t * n * hc + i] + e[(size_t) t * n + i % n];
 }
 
-__global__ void ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_t* __restrict__ slot,
+__global__ void __launch_bounds__(1024) ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_t* __restrict__ slot,
                                   int32_t* __restrict__ dst, int32_t* __restrict__ count) {
     const int i = threadIdx.x;
     if (i < n) { slot[i] = ids[i]; dst[i] = i; }
@@ -609,7 +609,7 @@ __global__ void ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_
 
 // E = the widest element the row size divides into (16, 4 or 1 bytes): a Q6_K head row of 2560 values is 2100 bytes
 template<typename E>
-__global__ void gather_rows_kernel(const E* __restrict__ src, long long row_e, const int32_t* __restrict__ ids,
+__global__ void __launch_bounds__(1024) gather_rows_kernel(const E* __restrict__ src, long long row_e, const int32_t* __restrict__ ids,
                                    long long n, E* __restrict__ dst) {
     const long long total = n * row_e;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
@@ -618,12 +618,12 @@ __global__ void gather_rows_kernel(const E* __restrict__ src, long long row_e, c
     }
 }
 
-__global__ void map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, int n) {
+__global__ void __launch_bounds__(1024) map_ids_kernel(int32_t* ids, const int32_t* __restrict__ table, int n) {
     const int i = threadIdx.x;
     if (i < n) ids[i] = table[ids[i]];
 }
 
-__global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
+__global__ void __launch_bounds__(1024) row_top_prob_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
                                     float* __restrict__ probs) {
     __shared__ float part[32];
     const int t = blockIdx.x;
@@ -641,7 +641,7 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     }
 }
 
-__global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const int32_t* __restrict__ ids,
+__global__ void __launch_bounds__(1024) mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const int32_t* __restrict__ ids,
                                   const int32_t* __restrict__ row_dev, float* __restrict__ R_dst,
                                   int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p) {
     const int row = *row_dev;
@@ -657,7 +657,102 @@ __global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t strid
     }
 }
 
-__global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
+
+// H3: SAMPLED DRAFTS for speculative sampling.  One block per row: top-`kq` of the draft head's logits (kq
+// argmax rounds, ties to the lower index), q = softmax(top / temp) over those, one draw u[t] (staged by the host
+// in mapped memory, so a captured graph sees fresh randomness each launch).  temp <= 0 = greedy (draw ignored).
+// Writes the pick (draft-vocab index) to ids[t], the FULL-softmax probability of the top token (the chain gate's
+// confidence) to probs_top[t], and the candidates as full-vocab ids (via `dvocab`) with their q.
+__global__ void __launch_bounds__(1024) draft_sample_kernel(const float* __restrict__ logits, int n_vocab,
+        const int32_t* __restrict__ dvocab, const float* u, const float* temp_p, int kq, int32_t* ids,
+        float* probs_top, int32_t* cand_n, int32_t* cand_id, float* cand_q) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+    const float temp = *(volatile const float*) temp_p;
+    __shared__ int sel[32];
+    __shared__ float sell[32];
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int K = temp > 0.0f ? (kq < 32 ? kq : 32) : 1;
+    for (int i = 0; i < K; ++i) {
+        float bv = __int_as_float(0xff800000);
+        int best = n_vocab;
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            bool taken = false;
+            for (int j = 0; j < i; ++j) if (sel[j] == v) { taken = true; break; }
+            if (taken) continue;
+            const float x = l[v];
+            if (x > bv) { bv = x; best = v; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+        }
+        const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+        __syncthreads();
+        if (warp == 0) {
+            const int nw = (int) ((blockDim.x + 31) >> 5);
+            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+            int wi = lane < nw ? si[lane] : n_vocab;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+            }
+            if (lane == 0) { sel[i] = wi < n_vocab ? wi : 0; sell[i] = wv; }
+        }
+        __syncthreads();
+    }
+    // the full-softmax probability of the top token (temperature 1, as row_top_prob): the chain gate
+    __shared__ float part[32];
+    const float m = sell[0];
+    float acc = 0.0f;
+    for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) acc += __expf(l[v] - m);
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < (int) (blockDim.x >> 5); ++w) tot += part[w];
+        probs_top[t] = 1.0f / tot;
+        int pick = sel[0];
+        if (temp > 0.0f) {
+            const float it = 1.0f / temp;
+            double z = 0.0;
+            for (int i = 0; i < K; ++i) z += exp((double) ((sell[i] - m) * it));
+            const double uu = (double) ((volatile const float*) u)[t];
+            double cum = 0.0;
+            pick = sel[K - 1];
+            bool done = false;
+            for (int i = 0; i < K; ++i) {
+                const double q = exp((double) ((sell[i] - m) * it)) / z;
+                cand_id[t * 32 + i] = dvocab ? dvocab[sel[i]] : sel[i];
+                cand_q[t * 32 + i] = (float) q;
+                cum += q;
+                if (!done && uu < cum) { pick = sel[i]; done = true; }
+            }
+            cand_n[t] = K;
+        } else {
+            cand_n[t] = 0;
+        }
+        ids[t] = pick;
+    }
+}
+
+__global__ void copy_cand_kernel(const int32_t* cand_n, const int32_t* cand_id, const float* cand_q,
+                                 const int32_t* row_dev, int32_t* m_n, int32_t* m_id, float* m_q, int j) {
+    const int row = *row_dev;
+    const int i = threadIdx.x;
+    if (i == 0) ((volatile int32_t*) m_n)[j] = cand_n[row];
+    if (i < 32) {
+        ((volatile int32_t*) m_id)[j * 32 + i] = cand_id[row * 32 + i];
+        ((volatile float*) m_q)[j * 32 + i] = cand_q[row * 32 + i];
+    }
+}
+
+__global__ void __launch_bounds__(1024) dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
     const int i = threadIdx.x;
     if (i >= n) return;
     const int c = cells[i];
@@ -738,6 +833,21 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
     else
         gather_rows_kernel<<<48 * 8, 256, 0, s>>>(src, row_bytes, ids, n, dst);
     check("gather_rows");
+}
+
+
+void draft_sample(const float* logits, int n_rows, int n_vocab, const int32_t* dvocab, const float* u,
+                  const float* temp, int kq, int32_t* ids, float* probs_top, int32_t* cand_n, int32_t* cand_id,
+                  float* cand_q, void* stream) {
+    draft_sample_kernel<<<n_rows, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, dvocab, u, temp, kq, ids, probs_top,
+                                                                    cand_n, cand_id, cand_q);
+    check("draft_sample");
+}
+
+void copy_cand(const int32_t* cand_n, const int32_t* cand_id, const float* cand_q, const int32_t* row_dev,
+               int32_t* m_n, int32_t* m_id, float* m_q, int j, void* stream) {
+    copy_cand_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(cand_n, cand_id, cand_q, row_dev, m_n, m_id, m_q, j);
+    check("copy_cand");
 }
 
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {
@@ -950,7 +1060,7 @@ bool argmax_rows_wanted() {
 }
 
 namespace {
-__global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {
+__global__ void __launch_bounds__(1024) window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {
     const int q = blockIdx.y;
     int32_t* st = steps + q * 4;
     const int n_kv = st[1];
@@ -1117,7 +1227,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+__global__ void __launch_bounds__(1024) wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }

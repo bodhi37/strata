@@ -1,0 +1,67 @@
+{
+ "tag": "la1-short",
+ "cfg": "hill/cfg-la1.json",
+ "agg": 18.438158344887192,
+ "rows": [
+  {
+   "name": "code-py",
+   "rep": 0,
+   "gen": 256,
+   "ms": 10775,
+   "tps": 23.8,
+   "tpw": 3.02,
+   "acc": 55.9,
+   "disk_per_tok": 12.7,
+   "disk_gbs": 0.61,
+   "ringwait": 58.3,
+   "verwait": 5.4,
+   "pool": 92.1,
+   "mspw": 112.2
+  },
+  {
+   "name": "prose",
+   "rep": 0,
+   "gen": 256,
+   "ms": 15328,
+   "tps": 16.7,
+   "tpw": 1.33,
+   "acc": 16.4,
+   "disk_per_tok": 15.3,
+   "disk_gbs": 0.52,
+   "ringwait": 69.5,
+   "verwait": 10.2,
+   "pool": 49.9,
+   "mspw": 73.0
+  },
+  {
+   "name": "c-sql",
+   "rep": 0,
+   "gen": 256,
+   "ms": 15390,
+   "tps": 16.6,
+   "tpw": 3.66,
+   "acc": 63.5,
+   "disk_per_tok": 19.8,
+   "disk_gbs": 0.67,
+   "ringwait": 351.6,
+   "verwait": 2.8,
+   "pool": 180.1,
+   "mspw": 199.9
+  },
+  {
+   "name": "hist",
+   "rep": 0,
+   "gen": 256,
+   "ms": 14044,
+   "tps": 18.2,
+   "tpw": 2.07,
+   "acc": 41.8,
+   "disk_per_tok": 14.1,
+   "disk_gbs": 0.52,
+   "ringwait": 256.9,
+   "verwait": 8.2,
+   "pool": 77.5,
+   "mspw": 101.8
+  }
+ ]
+}

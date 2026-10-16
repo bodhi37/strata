@@ -24,6 +24,9 @@ public:
     /// The same with caller-owned device buffers (the prompt path borrowing expert-cache slots).
     bool init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                        std::string& err);
+    /// R22: the handle exists (init/init_external succeeded).  The handle is PERSISTENT for the object's
+    /// lifetime: it is created once, not per run - see prefill.cpp init().
+    bool ready() const { return handle_ != nullptr; }
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
     /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM (Turing with

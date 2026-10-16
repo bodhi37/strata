@@ -29,6 +29,10 @@
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include <atomic>
 #include <chrono>
@@ -65,6 +69,8 @@ class RemoteExpertOpt;
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                              int64_t layer);
+/// E1: the next pool call's routing is known (its doorbell rang): start its reads.  Runs on the issuer thread.
+using EarlyFn = void (*)(void* user, const int32_t* ids, int64_t n_tok, int64_t k, int64_t layer);
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
@@ -98,6 +104,12 @@ public:
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
+
+    /// Capture all T=1..max_t_ graphs now, while VRAM is maximal. Without this, lazy capture
+    /// defers OOM to deep positions (e.g. pos 67850 with 223 MiB free): the 7th graph fits at
+    /// startup with 600+ MiB free but fails late when a new T is first needed. Fail fast here
+    /// instead of mid-session; leaves performance unchanged (same graphs, just earlier).
+    bool prewarm(std::string& err);
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
@@ -175,6 +187,12 @@ public:
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+
+    /// H3: after a sampled run(): row t's final distribution (kept candidates, <= 64) when cand export is on.
+    void set_cand_export(bool on) { cand_export_ = on; }
+    int cand_n(int t) const { return h_cn_ ? ((volatile int32_t*) h_cn_)[t] : 0; }
+    const int32_t* cand_id(int t) const { return h_cid_ + (size_t) t * 64; }
+    const float* cand_p(int t) const { return h_cp_ + (size_t) t * 64; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -295,6 +313,8 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    const float* head_logits_dev() const { return head_logits_; }   ///< TF: [T][n_vocab] on the device
+    int64_t vocab() const { return n_vocab_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -309,7 +329,7 @@ public:
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
-    double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0, ms_launch = 0, ms_tail = 0;
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -473,6 +493,9 @@ private:
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
     void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
+    bool cand_export_ = false;                                     // H3
+    int32_t *h_cn_ = nullptr, *m_cn_ = nullptr, *h_cid_ = nullptr, *m_cid_ = nullptr;
+    float *h_cp_ = nullptr, *m_cp_ = nullptr;
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
@@ -482,6 +505,11 @@ private:
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
+    // B1: FLAG B IS PER GROUP ([0] group A, [8] group B).  One shared monotonic counter let a split window's group B
+    // raise it straight to k+2 when it had no DMA (fetch_dma's n == 0 path) while group A's copies to k+1 were still
+    // in flight on the copy stream, so post(l, A) computed its PCIe experts from stale staging: garbage expert
+    // outputs, NaN in the GDN state, and "!!!!" for the rest of the reply (half the bench prompts at --spec-split).
+    int cur_grp_ = 0;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
@@ -494,6 +522,23 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
+    // ---- E1: the early-issue thread.  While the host serves pool call k, it waits for call k+1's doorbell and
+    // hands that call's ids to `early_` so its misses are read during call k's compute.
+    EarlyFn early_ = nullptr;
+    void* early_user_ = nullptr;
+    std::thread ex_thr_;
+    std::mutex ex_m_;
+    std::condition_variable ex_cv_;
+    uint64_t ex_gen_ = 0;                         // guarded by ex_m_
+    bool ex_stop_ = false;                        // guarded by ex_m_
+    int ex_G_ = 1, ex_T_ = 0, ex_k_ = 0;
+    int64_t ex_steps_ = 0;
+    std::atomic<int64_t> ex_host_{-1}, ex_begun_{-1}, ex_rel_{-1};
+    std::atomic<uint64_t> ex_live_{0};            // the generation the host is running (0 = none)
+    void ex_loop();
+public:
+    void set_early(EarlyFn fn, void* user) { early_ = fn; early_user_ = user; }
+    static void ex_on_begun(void* ctx) { auto* v = (Verifier*) ctx; v->ex_begun_.store(v->ex_host_.load(std::memory_order_acquire), std::memory_order_release); }
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
@@ -515,7 +560,7 @@ private:
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
-    static constexpr int64_t kStagingBlobs = 16;
+    static constexpr int64_t kStagingBlobs = 48;                  // orca-port: 48 (upstream 16)
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts

@@ -1,0 +1,37 @@
+{
+ "tag": "res",
+ "cfg": "hill/cfg-res.json",
+ "agg": 14.955018109592244,
+ "rows": [
+  {
+   "name": "code-py",
+   "rep": 0,
+   "gen": 256,
+   "ms": 15234,
+   "tps": 16.8,
+   "tpw": 3.28,
+   "acc": 57.3,
+   "disk_per_tok": 73.9,
+   "disk_gbs": 2.54,
+   "ringwait": 101.4,
+   "verwait": 17.6,
+   "pool": 139.5,
+   "mspw": 169.3
+  },
+  {
+   "name": "code-rs",
+   "rep": 0,
+   "gen": 256,
+   "ms": 19002,
+   "tps": 13.5,
+   "tpw": 2.4,
+   "acc": 49.0,
+   "disk_per_tok": 94.6,
+   "disk_gbs": 2.57,
+   "ringwait": 178.2,
+   "verwait": 16.1,
+   "pool": 133.8,
+   "mspw": 159.7
+  }
+ ]
+}

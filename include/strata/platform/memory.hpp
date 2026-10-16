@@ -76,5 +76,8 @@ struct ProcIo {
     uint64_t read_bytes = 0, major_faults = 0;
 };
 ProcIo proc_io_sample();
+/// R22b: the host's MemAvailable in bytes (Linux /proc/meminfo; 0 when unreadable, e.g. Windows - callers
+/// must treat 0 as "unknown, never trust a regrow on it").
+uint64_t host_available_bytes();
 
 }  // namespace strata::platform

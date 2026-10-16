@@ -8,6 +8,9 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
+#include <pthread.h>
+#include <sched.h>
+#include <x86intrin.h>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -81,6 +84,7 @@ bool window_copy_logits(void* w, int t, float* host);
 #endif
 
 namespace strata::core {
+double g_call_wait_ms = 0;   // C1: the host's doorbell wait for the pool call it is about to serve
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -488,6 +492,10 @@ void Verifier::diag(std::FILE* f) const {
 
 
 Verifier::~Verifier() {
+    if (ex_thr_.joinable()) {
+        { std::lock_guard<std::mutex> lk(ex_m_); ex_stop_ = true; }
+        ex_cv_.notify_all();
+        ex_thr_.join();
 #if defined(STRATA_GPU_METAL)
     strata::metal_engine::window_destroy(metal_);
     metal_ = nullptr;
@@ -1641,8 +1649,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (device_plan_) wait_flag_ge_or(m_flagB_ + grp * 8, ring, skip_ + grp, cs);   // B1: per group
+            else wait_flag_ge(m_flagB_ + grp * 8, ring, cs);       // B1 (per group): the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -2012,6 +2020,20 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
+bool Verifier::prewarm(std::string& err) {
+    for (int T = 1; T <= max_t_; ++T) {
+        if (!capture(T, err)) {
+            std::fprintf(stderr,
+                         "strata verify: prewarm failed at T=%d/%d: %s "
+                         "(free VRAM with desktop on NVIDIA; move desktop clients to the AMD iGPU "
+                         "via DRI_PRIME=1 + Mesa EGL, keep nothing open on NVIDIA)\n",
+                         T, max_t_, err.c_str());
+            return false;
+        }
+    }
+    return capture_commit(err);
+}
+
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     using namespace strata::kernels;
@@ -2159,6 +2181,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    *(volatile uint32_t*) (h_flagB_ + 8) = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2273,6 +2296,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
         !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+    const Clock::time_point tl0 = Clock::now();   // orca-port: launch cost
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
     static const bool threaded_launch = [] {
@@ -2285,6 +2309,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #else
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
 #endif
+    ms_launch += ms_since(tl0);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -2298,6 +2323,25 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
+    // E1: wake the issuer for this window (split windows only: with one group the next call's doorbell
+    // cannot ring before the host has finished the current one)
+    struct ExEnd { Verifier* v; ~ExEnd() { v->ex_live_.store(0, std::memory_order_release); } } ex_end{this};
+    if (early_ != nullptr && G == 2) {
+        if (!ex_thr_.joinable()) ex_thr_ = std::thread([this] { ex_loop(); });
+        ex_host_.store(-1, std::memory_order_relaxed);
+        ex_begun_.store(-1, std::memory_order_relaxed);
+        ex_rel_.store(-1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(ex_m_);
+            ++ex_gen_;
+            ex_G_ = G;
+            ex_T_ = T;
+            ex_k_ = (int) ss.k;
+            ex_steps_ = (le_ - lb_) * G;
+            ex_live_.store(ex_gen_, std::memory_order_release);
+        }
+        ex_cv_.notify_all();
+    }
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     if (ar_on() && !test_stall) {
         if (do_ple) {
@@ -2358,6 +2402,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         const Clock::time_point b = Clock::now();
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+        g_call_wait_ms = std::chrono::duration<double, std::milli>(b - a).count();
         VDBG("layer %lld rang\n", (long long) l);
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
             (size_t) l < adapt_gate_->has.size() && adapt_gate_->has[(size_t) l] != 0 &&
@@ -2367,6 +2412,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        ex_host_.store(k, std::memory_order_release);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -2385,7 +2431,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag(h_flagB_ + grp * 8, want);
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
@@ -2399,6 +2445,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             ms_host += ms_since(tp);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
+        ex_rel_.store(k, std::memory_order_release);   // E1
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
@@ -2417,6 +2464,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
 #endif
     trace_ev("SYNC", -1, -1, 0);
+    const Clock::time_point tt0 = Clock::now();
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
@@ -2491,6 +2539,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
     }
+    ms_tail += ms_since(tt0);
     VDBG("window done\n");
     ++windows;
     progress_at("decode");
@@ -2499,6 +2548,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 }
 
 void Verifier::set_plan_slot(int grp) {
+    cur_grp_ = grp;
     const int64_t cap = sink_.cap;
     int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
     const int64_t i32 = 4 + (cap + 1) + cap + cap;
@@ -2538,7 +2588,8 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    uint32_t* const fb = v->h_flagB_ + v->cur_grp_ * 8;   // B1: per group - see the header
+    if (n <= 0) { raise_flag(fb, want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
@@ -2558,7 +2609,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
         }
     }
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
+    fs.flag = fb;
     fs.value = want;
     cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
 }
@@ -3636,4 +3687,63 @@ void Verifier::absorb_stats(Verifier& o) {
     o.prof_windows_ = 0;
 }
 
+}  // namespace strata::core
+
+namespace strata::core {
+// E1: the issuer.  For pool call s of the live window it waits until the host has BEGUN call s-1 (so call s-1's
+// hits are stamped and cannot be evicted for call s's misses) and call s's doorbell has rung, copies call s's
+// ids (stable until the host releases call s), and hands them over.  Calls the host has already reached are skipped.
+__attribute__((target("mwaitx"))) static inline void ex_park(const volatile void* line) {
+    // E1b: MONITORX/MWAITX - the SMT sibling sleeps until the doorbell's line is written (or ~20 us pass), so the
+    // issuer costs the pool worker it shares a core with almost nothing (a PAUSE spin measurably slowed the drain)
+    _mm_monitorx((void*) line, 0, 0);
+    _mm_mwaitx(2, 0, 20000);
+}
+
+void Verifier::ex_loop() {
+    if (const char* c = std::getenv("STRATA_EARLY_CPU")) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(std::atoi(c), &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+    static const bool use_mwaitx = std::getenv("STRATA_EARLY_SPIN") == nullptr;
+    uint64_t seen = 0;
+    int32_t ids[strata::kernels::kVerifyMaxT * 64];
+    for (;;) {
+        uint64_t gen;
+        int G, T, k;
+        int64_t steps;
+        {
+            std::unique_lock<std::mutex> lk(ex_m_);
+            ex_cv_.wait(lk, [&] { return ex_stop_ || ex_gen_ != seen; });
+            if (ex_stop_) return;
+            seen = gen = ex_gen_;
+            G = ex_G_; T = ex_T_; k = ex_k_; steps = ex_steps_;
+        }
+        if (G != 2 || k <= 0 || k > 64) continue;
+        const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {(T + 1) / 2, T};
+        volatile uint32_t* const seq = h_seq_;
+        for (int64_t s = 1; s < steps; ++s) {
+            bool go = false, dead = false;
+            for (;;) {
+                if (ex_live_.load(std::memory_order_acquire) != gen) { dead = true; break; }
+                if (ex_host_.load(std::memory_order_acquire) >= s) break;
+                if (ex_begun_.load(std::memory_order_acquire) >= s - 1 && *seq >= (uint32_t) (s + 1)) { go = true; break; }
+                if (use_mwaitx) ex_park(seq);
+                else _mm_pause();
+            }
+            if (dead) break;
+            if (!go) continue;
+            const int grp = (int) (s % G);
+            const int64_t l = s / G;
+            const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+            if (n <= 0) continue;
+            std::memcpy(ids, h_ids_ + (size_t) tb * (size_t) k, (size_t) n * (size_t) k * sizeof(int32_t));
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (ex_rel_.load(std::memory_order_acquire) >= s) continue;   // released: the rows may be newer
+            early_(early_user_, ids, n, k, l);
+        }
+    }
+}
 }  // namespace strata::core

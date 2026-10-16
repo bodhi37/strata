@@ -5,6 +5,9 @@
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
+#include <chrono>
+#include <cstdio>
+#include <thread>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -143,7 +146,18 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
-        cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
+        // R21 (orca-port): the pin can fail with cudaErrorDevicesUnavailable right after a hard engine kill - the driver
+        // needs seconds to release the previous context.  Retry with backoff before the VRAM fallback below.
+        cudaError_t host_err = cudaSuccess;
+        for (int attempt = 0;; ++attempt) {
+            host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
+            if (host_err == cudaSuccess || host_err != cudaErrorDevicesUnavailable || attempt >= 5) break;
+            cudaGetLastError();
+            host_ = nullptr;
+            std::fprintf(stderr, "strata generate: embedding pin failed (%s); retrying in 5 s (%d/5)\n",
+                         cudaGetErrorString(host_err), attempt + 1);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
         if (host_err != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM

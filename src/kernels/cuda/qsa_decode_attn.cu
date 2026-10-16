@@ -40,7 +40,7 @@ __device__ __forceinline__ float warp_max(float v) {
 // Per-format bodies; `load8` below is the KV_MODE dispatcher. value=false is the K side, true the V side.
 __device__ __forceinline__ void load8_f16(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     const uint16_t* base = (value ? p.v_pool : p.k_pool) + row * HD + d0;
-    const uint4 raw = *reinterpret_cast<const uint4*>(base);
+    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(base));
     const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -150,13 +150,13 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
     for (int i = t; i < G * HD; i += THREADS) {
         const int d = i % HD;
         const int sd = QUERY_SWIZZLE ? (d ^ ((d >> 3) & 4)) : d;
-        sq[i / HD][sd] = q[(size_t) (kvh * G) * HD + i];
+        sq[i / HD][sd] = __ldg(&q[(size_t) (kvh * G) * HD + i]);
     }
     if (t < CHUNK) {
         long long r = -1;
         if (t < n_here) {
-            const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
+            const int cell = __ldg(&ids[c0 + t]);
+            const long long page = (long long) __ldg(&p.page_table[cell / page_size]);
             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
@@ -259,7 +259,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         if (srow[c] < 0) continue;   // masked above, weight 0
         float v;
         if constexpr (KV_MODE == 0) {
-            v = __half2float(__ushort_as_half(p.v_pool[srow[c] * HD + t]));
+            v = __half2float(__ushort_as_half(__ldg(&p.v_pool[srow[c] * HD + t])));
         } else if constexpr (KV_MODE == 1) {
             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
             v = (float) p.v_q[srow[c] * HD + t] * sc;
@@ -402,8 +402,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     if (t < CHUNK) {
         long long r = -1;
         if (t < n_here) {
-            const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
+            const int cell = __ldg(&ids[c0 + t]);
+            const long long page = (long long) __ldg(&p.page_table[cell / page_size]);
             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
@@ -533,15 +533,15 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     const int kvh = h / G, hl = h % G;
     const int d = threadIdx.x;
     float M = -FLT_MAX;
-    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
+    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, __ldg(&part_m[(kvh * n_chunks + c) * G + hl]));
     float L = 0.0f, acc = 0.0f;
     for (int c = 0; c < n_chunks; ++c) {
         const int slot = kvh * n_chunks + c;
-        const float m = part_m[slot * G + hl];
+        const float m = __ldg(&part_m[slot * G + hl]);
         if (m == -FLT_MAX) continue;
         const float w = __expf(m - M);
-        L = fmaf(part_l[slot * G + hl], w, L);
-        acc = fmaf(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
+        L = fmaf(__ldg(&part_l[slot * G + hl]), w, L);
+        acc = fmaf(__ldg(&part_acc[((size_t) slot * G + hl) * HD + d]), w, acc);
     }
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }

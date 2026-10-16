@@ -117,7 +117,7 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
     }
 }
 template <bool TAB>
-__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+__global__ void __launch_bounds__(1024) append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,

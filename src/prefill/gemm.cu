@@ -8,6 +8,7 @@
 #ifdef STRATA_USE_HIP
 #include "wmma_gemm.h"
 #endif
+#include "strata/platform/memory.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -47,8 +48,11 @@
 #if defined(__HIPCC__)
 #include <hip/hip_fp16.h>
 #endif
+#include <chrono>
+#include <thread>
 
-namespace strata::prefill {
+namespace strata {
+namespace prefill {
 namespace {
 #if defined(__HIPCC__)
 // Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place.
@@ -345,6 +349,32 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 }
 #endif
 
+// R21: cublasCreate can fail transiently when the context is under VRAM pressure (long sessions with
+// per-request prefill allocs) or right after a driver hiccup.  A failure here used to take the whole
+// engine down; reclaim, wait, and retry before giving up.
+// R22: this now runs exactly ONCE per process (Prefill::init, at engine setup) - the per-request creation
+// that put this under pressure is gone.  The diagnostic matters: CUBLAS_STATUS_ALLOC_FAILED under host
+// thrash (the hot tier + KV pools + zram: check MemAvailable) or a drained VRAM ledger (check the device).
+static void free_mem_note() {
+    size_t fb = 0, tb = 0;
+    cudaMemGetInfo(&fb, &tb);
+    const uint64_t host_av = strata::platform::host_available_bytes();
+    std::fprintf(stderr, "prefill gemm: free VRAM %zu MiB of %zu MiB, MemAvailable %lld MiB\n",
+                 fb >> 20, tb >> 20, host_av == 0 ? -1l : (long long) (host_av >> 20));
+}
+
+bool create_handle(cublasHandle_t* h) {
+    for (int attempt = 0;; ++attempt) {
+        if (cublasCreate(h) == CUBLAS_STATUS_SUCCESS) return true;
+        (void) cudaGetLastError();
+        (void) cudaFree(0);
+        if (attempt >= 3) return false;
+        std::fprintf(stderr, "prefill gemm: cublasCreate failed; reclaiming and retrying (%d/3)\n", attempt + 1);
+        free_mem_note();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+
 }  // namespace
 
 bool prompt_f16() {
@@ -394,10 +424,7 @@ Gemm::~Gemm() {
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                          std::string& err) {
     cublasHandle_t h = nullptr;
-    if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
-        err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
-        return false;
-    }
+    if (!create_handle(&h)) { err = "prefill gemm: cublasCreate failed"; return false; }
     handle_ = h;
     stream_ = stream;
     external_ = true;
@@ -430,10 +457,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     // #240: every failure names the call and the real status, so "no VRAM" can be told from a broken install
     cublasHandle_t h = nullptr;
-    if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
-        err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
-        return false;
-    }
+    if (!create_handle(&h)) { err = "prefill gemm: cublasCreate failed"; return false; }
     handle_ = h;
     stream_ = stream;
     note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
@@ -952,4 +976,5 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 
-}  // namespace strata::prefill
+}  // namespace prefill
+}  // namespace strata

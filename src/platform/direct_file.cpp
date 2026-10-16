@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -62,6 +64,7 @@ struct Pending {
 /// thread does one blocking pread, so the thread count is the queue depth).
 int io_threads(int dflt) {
     const char* v = std::getenv("STRATA_IO_THREADS");
+    if (!v) v = std::getenv("STRATA_DIRECT_THREADS");   // orca-port A1 name
     const int n = v ? std::atoi(v) : dflt;
     return std::clamp(n, 1, 64);
 }

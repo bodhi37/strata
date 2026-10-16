@@ -14,8 +14,13 @@ Images (optional, when the config has a "vision" entry): OpenAI image_url parts 
 data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
-Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
+Requests whose prompt plus max tokens exceed the engine's context are shortened to the room left (never a 400);
+only a prompt that leaves no room at all is rejected with 400 - the prompt itself is never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
+An engine that stops producing output (no PP while reading, no T while decoding) is a stalled request, not a slow
+one: after STRATA_WATCHDOG_S seconds of silence (default 180, 0 disables) the request fails with a finish_reason
+instead of a bare EOF, and the engine is replaced in the background.  Every stream ends with a finish_reason (or an
+Anthropic error event), so clients always see an ordinary provider error rather than a protocol-level stream break.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
 `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
@@ -972,6 +977,8 @@ class StrataEngine:
                     continue
                 except (IndexError, ValueError):
                     pass
+            if line.startswith(("SHEDN ", "REGN ")):   # orca-port R22: the governor's acks, never a request's line
+                continue
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -1906,6 +1913,7 @@ class StrataEngine:
                         beat = time.monotonic()
                         yield None                        # polling cancellation does not add HTTP heartbeats
                     continue
+                last_output = time.time()
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -1944,7 +1952,13 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    msg = line[4:].strip()
+                    if is_engine_infra_error(msg):
+                        # an ENGINE fault (allocation/CUDA/prefill-path class, see is_engine_infra_error): this
+                        # request is terminal; without a replacement the next request would sit inside the same
+                        # wedged engine until the watchdog fires (5 min of silence per pi retry).
+                        self.start_restart(f"engine infra fault: {msg[:80]}")
+                    raise ValueError(msg)
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -2786,8 +2800,14 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
 
 
 def child_env(cfg: dict) -> dict:
-    """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    """The engine's environment: the config's own `env` dict (the STRATA_* A/B knobs) applied on top of the
+    server's, then the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
+    compiled it) first on the library search path.
+
+    Without the `env` merge every knob a config carries (STRATA_STATIC_TIER, STRATA_PREFILL_ADMIT,
+    STRATA_NO_ODIRECT, STRATA_PREFILL_TILE, STRATA_RSPLIT, STRATA_PARK_SPIN_US ...) was silently dropped -
+    the engine saw only whatever the tmux server happened to be launched with, so two configs that
+    differ in that block ran identically and the A/B was never actually performed."""
     env = dict(os.environ)
     if hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
@@ -3070,6 +3090,19 @@ class Service:
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        # orca-port R22: the memory governor.  The engine's hot tier (--hot-ram-gib) is mlocked - pinned for good - and
+        # on a 30 GB box a deep session (tier + KV pools + desktop) converges to zero headroom: the swap storm then kills
+        # allocations inside CUDA.  This thread watches /proc/meminfo's MemAvailable and, BETWEEN requests (it takes the
+        # control lines without waiting), sends `SHED <bytes>` so the hot tier shrinks to keep the floor, and
+        # `REGROW 0` (one slice per call) when MemAvailable is 2.5 GiB above it.  STRATA_MEM_FLOOR_MIB (default 1536;
+        # 0 disables) is the floor; engines without a hot tier answer with nothing shed.
+        try:
+            self.mem_floor_bytes = int(os.environ.get("STRATA_MEM_FLOOR_MIB", "") or 1536) << 20
+        except ValueError:
+            self.mem_floor_bytes = 1536 << 20
+        self.gov_period = 2.0
+        self._gov_stop = threading.Event()
+        self._gov_thread = None
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
@@ -3104,6 +3137,65 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # R22: the memory governor.  The engine's hot tier is mlocked and cudaHostRegistered - pinned forever -
+        # and on a 30 GB box a deep long-horizon session (tier + KV pools + desktop) converges to zero
+        # headroom: the swap storm then kills allocations inside CUDA ("prefill gemm: cublasCreate failed",
+        # 2026-10-04/05) and the 300 s watchdog replaces an otherwise-healthy engine.  This thread watches
+        # /proc/meminfo's MemAvailable and, BETWEEN requests (the engine runs one GEN at a time and reads stdin
+        # only there), sends `SHED <bytes>` so the hot tier SHRINKS to keep the floor: whole rank-tail slices of
+        # the tier are unregistered/unlocked/dropped; their blobs serve from preads (slower, correct) until the
+        # LRU refills the freed slots; and REGROW <bytes> (one shed slice per call) when MemAvailable is
+        # comfortably above the floor.  STRATA_MEM_FLOOR_MIB (default 1536; 0 disables) is the floor.
+        try:
+            self.mem_floor_bytes = int(os.environ.get("STRATA_MEM_FLOOR_MIB", "") or 1536) << 20
+        except ValueError:
+            self.mem_floor_bytes = 1536 << 20
+        self.gov_period = 2.0              # the governor's sampling cadence (tests shorten it)
+        self._gov_stop = threading.Event()
+
+    def start_governor(self):
+        """The memory-governor thread for a resident StrataEngine (see __init__) - started by the server
+        bootstrap beside start_telemetry."""
+        if self.mem_floor_bytes <= 0 or getattr(self, "_gov_thread", None) is not None or \
+                not hasattr(self.engine, "proc"):
+            return
+        self._gov_thread = threading.Thread(target=self._mem_governor, daemon=True)
+        self._gov_thread.start()
+
+    @staticmethod
+    def mem_available_bytes():
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        return 1 << 60
+
+    def _mem_governor(self):
+        # R22b: regrows only when MemAvailable is 2.5 GiB above the floor (hysteresis: shed below the floor,
+        # regrow far above it, so a tier can never grow back into the pressure that made it shed).
+        reg_high = self.mem_floor_bytes + (2560 << 20)
+        while not self._gov_stop.wait(self.gov_period):
+            eng = self.engine
+            if not eng._ready.is_set():          # restarting: nothing coursecorrect yet
+                continue
+            if getattr(eng, "_in_request", False):   # a request owns the engine: shed lands on its next gap
+                continue
+            avail = self.mem_available_bytes()
+            if avail >= reg_high:
+                try:
+                    eng.proc.stdin.write("REGROW 0\n")     # one slice per call; the engine prechecks too
+                    eng.proc.stdin.flush()
+                except (OSError, BrokenPipeError):
+                    return
+                continue
+            if avail >= self.mem_floor_bytes:
+                continue
+            want = (self.mem_floor_bytes + (512 << 20)) - avail
+            try:
+                eng.proc.stdin.write(f"SHED {want}\n")
+                eng.proc.stdin.flush()
+            except (OSError, BrokenPipeError):
+                return
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3561,6 +3653,48 @@ class Service:
                 else:
                     req["output_config"] = {"effort": effort}
         return req
+
+    def start_governor(self):
+        """orca-port R22: the memory-governor thread (see __init__); only for an engine started with --hot-ram-gib."""
+        eng = self.engine
+        if self.mem_floor_bytes <= 0 or self._gov_thread is not None or not sys.platform.startswith("linux") or \
+                "--hot-ram-gib" not in (getattr(eng, "spawn", (None, []))[1] or []):
+            return
+        self._gov_thread = threading.Thread(target=self._mem_governor, daemon=True)
+        self._gov_thread.start()
+
+    @staticmethod
+    def mem_available_bytes() -> int:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return 1 << 60
+
+    def _mem_governor(self):
+        reg_high = self.mem_floor_bytes + (2560 << 20)   # hysteresis: shed below the floor, regrow far above it
+        while not self._gov_stop.wait(self.gov_period):
+            eng = self.engine
+            if not eng.alive() or getattr(eng, "starting", False) or getattr(eng, "batch", 0):
+                continue
+            avail = self.mem_available_bytes()
+            if self.mem_floor_bytes <= avail < reg_high:
+                continue
+            cmd = "REGROW 0" if avail >= reg_high else f"SHED {(self.mem_floor_bytes + (512 << 20)) - avail}"
+            ctl = getattr(eng, "ctl", None)
+            if ctl is None or not ctl.acquire(blocking=False):   # a request owns the engine: next gap
+                continue
+            try:
+                with eng.wlock:
+                    eng.proc.stdin.write(cmd + "\n")
+                    eng.proc.stdin.flush()
+            except (OSError, ValueError, AttributeError):
+                pass
+            finally:
+                ctl.release()
 
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
@@ -4507,6 +4641,7 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            setattr(self.engine, "_in_request", False)   # R22: the governor may shed between requests
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
@@ -5843,7 +5978,12 @@ def make_handler(svc: Service):
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                try:
+                    return self._json(200, openai_collect(chunks))
+                except Exception as e:
+                    print(f"[strata] request failed: {e!r}", flush=True)
+                    return self._json(500, {"error": {"type": "server_error",
+                                                      "message": "server error: " + str(e) + " (transient; retrying is safe)"}})
             self._sse()
             try:
                 for c in chunks:
@@ -6066,7 +6206,12 @@ def make_handler(svc: Service):
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                try:
+                    return self._json(200, anthropic_collect(events))
+                except Exception as e:
+                    print(f"[strata] request failed: {e!r}", flush=True)
+                    return self._json(500, {"type": "error", "error": {"type": "server_error",
+                                                                       "message": "server error: " + str(e) + " (transient; retrying is safe)"}})
             self._sse()
             try:
                 for item in events:
@@ -6360,6 +6505,8 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
+    svc.start_governor()
+    svc.start_governor()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()

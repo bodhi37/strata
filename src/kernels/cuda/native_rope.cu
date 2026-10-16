@@ -43,7 +43,7 @@ bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
 template <bool TAB>
-__global__ void apply(const float* x, float* out, int rows, int width,
+__global__ void __launch_bounds__(1024) apply(const float* x, float* out, int rows, int width,
                       int n_rot, float theta_scale, float freq_scale, float corr_low, float corr_high,
                       float ext_factor, float mscale, const int* positions, const int32_t* mtab, RopeTab rt) {
     const int row = blockIdx.y;

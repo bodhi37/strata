@@ -50,7 +50,7 @@ __device__ __forceinline__ float norm_sum(float value, float* sums) {
 }
 __device__ __forceinline__ float sigmoid(float value) { return 1.0f / (1.0f + expf(-value)); }
 
-__global__ void conv_silu(float* __restrict__ history, const float* __restrict__ input,
+__global__ void __launch_bounds__(1024) conv_silu(float* __restrict__ history, const float* __restrict__ input,
                            const float* __restrict__ weights, float* __restrict__ raw_output,
                            float* __restrict__ silu_output, int channels) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -67,7 +67,7 @@ __global__ void conv_silu(float* __restrict__ history, const float* __restrict__
     for (int tap = 0; tap < 3; ++tap) history[c * 3 + tap] = values[tap + 1];
 }
 
-__global__ void l2_norm(float* input, float epsilon, float scale_after) {
+__global__ void __launch_bounds__(1024) l2_norm(float* input, float epsilon, float scale_after) {
     const int col = threadIdx.x;
     input += size_t(blockIdx.x) * S;
     const float value = col < S ? input[col] : 0.0f;
@@ -83,11 +83,11 @@ __global__ void l2_norm(float* input, float epsilon, float scale_after) {
     }
 }
 
-__global__ void beta_sigmoid(float* beta, int count) {
+__global__ void __launch_bounds__(1024) beta_sigmoid(float* beta, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) beta[i] = sigmoid(beta[i]);
 }
-__global__ void gate_softplus(const float* __restrict__ alpha, const float* __restrict__ dt,
+__global__ void __launch_bounds__(1024) gate_softplus(const float* __restrict__ alpha, const float* __restrict__ dt,
                                const float* __restrict__ ssm_a, float* __restrict__ gate, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
@@ -96,7 +96,7 @@ __global__ void gate_softplus(const float* __restrict__ alpha, const float* __re
     gate[i] = softplus * ssm_a[i];
 }
 
-__global__ void out_norm(const float* __restrict__ input, const float* __restrict__ z,
+__global__ void __launch_bounds__(1024) out_norm(const float* __restrict__ input, const float* __restrict__ z,
                           const float* __restrict__ gamma, float* __restrict__ output, float epsilon) {
     const int col = threadIdx.x;
     const size_t offset = size_t(blockIdx.x) * S;

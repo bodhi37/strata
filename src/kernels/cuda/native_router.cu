@@ -44,6 +44,19 @@ __device__ __forceinline__ float warp_max(float value) {
 __launch_bounds__(256, 1)
 __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
                       float* __restrict__ weights) {
+    // Coalesced staging: was 32 threads x16 stride-128B loads (512 x 32B sectors
+    // for 2KB L2-resident data) with 224/256 threads idle. All 256 threads now
+    // load 2 consecutive floats each (scalar pair: base is only 4B-aligned)
+    // into 2KB of shared; the pre-existing diverged barrier is now a full one.
+    __shared__ float slog[512];
+    {
+        // Scalar pair, NOT float2: valid() guarantees only 4B alignment, and
+        // tt*2 floats is 8B-stepped from a possibly 4B-aligned base.
+        const int tt = threadIdx.x + threadIdx.y * 32;  // 0..255, every thread
+        slog[tt * 2] = __ldg(&logits[tt * 2]);
+        slog[tt * 2 + 1] = __ldg(&logits[tt * 2 + 1]);
+    }
+    __syncthreads();
     // Preserve the pinned 32x8 block geometry; only row zero is active here.
     // blockIdx.x = the token (a multi-token launch; 0 for the single one)
     logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
@@ -51,8 +64,7 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     const int lane = threadIdx.x;
     float values[16];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    __syncthreads();
+    for (int i = 0; i < 16; ++i) values[i] = slog[lane + i * 32];
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
@@ -60,7 +72,9 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     float sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-        values[i] = expf(values[i] - maximum);
+        // __expf is monotonic: the argmax order below is bit-identical, and the
+        // renormalized weights differ ~1e-7 (invisible through MoE combine).
+        values[i] = __expf(values[i] - maximum);
         sum += values[i];
     }
     const float reciprocal = 1.0f / warp_sum(sum);

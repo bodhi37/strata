@@ -232,6 +232,20 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    // R10: IQ4_NL's down projection is the biggest shared cost across all three quants, and ggml-cpu's
+    // kernel re-decodes the nibble LUT once PER TOKEN.  The AVX-512 multi-token kernel decodes once per
+    // block and applies every token with one load/sign/maddubs/madd - measured 3x at nt=5 on the kernel
+    // bench, identical per-block integers, float-order-only differences (same class the gu path carries).
+    // STRATA_NO_IQ4NL is the A/B arm (the first engine run with this kernel produced repetitive output;
+    // the isolation is kept until the fuzz parity proves which side of the border the fault is on).
+    // unify: upstream's iq4nl256_down_rows (below) is the default; STRATA_IQ4NL_ORCA=1 selects this one instead.
+    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr &&
+                               std::getenv("STRATA_NO_IQ4NL") == nullptr;
+    static const bool orca4nl = [] { const char* v = std::getenv("STRATA_IQ4NL_ORCA"); return v && v[0] == '1'; }();
+    if (orca4nl && avx512 && nt >= 2 && f.d_type == 20) {   // GGML_TYPE_IQ4_NL
+        iq4nl_rows_multi(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;

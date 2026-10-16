@@ -1,3 +1,42 @@
+> [!NOTE]
+> This branch (`orca-port`) is frozen and outdated — use `main` for the latest.
+
+## `orca-port`: what this fork changes
+
+Goal: serve the model on boxes that cannot hold it in RAM, via a VRAM + hot-RAM + NVMe expert tier, plus Orca support and `serve/` hardening.
+
+### Expert serving (`src/core/expert_source.cpp`, `include/strata/core/expert_source.hpp`, `src/program/generate.cpp`, `src/core/expert_cache.cpp`)
+- **Three tiers.** VRAM slice (non-redundant, past the hot tier) + mlocked hot RAM + NVMe via `pread` ring and parked reader pool. Startup helper: `run-engine-mlock.sh`.
+- **Routing profiles from traces.** `--dump-profile` / `--dump-counts` + `tools/make_profile_from_counts.py`; `--expert-cache -2` as the no-cache baseline.
+- **VRAM fill fixes.** Per-layer slot bases in `open_sized`; fill scans past per-layer quotas and verifies the first-admitted pair.
+- **Read-amplification fix (6.4x).** Hot-tier guard on the ring-full fallback (2.4 → 6.1 tok/s on IQ3_XXS); whole-blob `pread` + `DONTNEED` + `MADV_HUGEPAGE` in `pin_hot`; two-pass dispatch (`begin_layer` / `wait_layer`) so resident experts compute while reads fly. Remaining wall is SSD QD1 latency (~2.8 ms × 48 layers), not bandwidth.
+- **Adaptive LRU hot tier.** Seeded in profile rank order; zero-copy admit on decode miss; frequency-aware eviction; phase attribution.
+- **`O_DIRECT` reads.** Twin `O_DIRECT` fds with thread-local aligned bounce buffers; avoids the per-read page-cache alloc/copy cycle (~39% CPU before). Buffered fallback preserved; `STRATA_NO_ODIRECT=1` disables it. Also surfaces `cudaErrorString` on `NativeEmbed` pin failure.
+- **Elastic tier under memory pressure.** `cudaHostRegister` pins pages, so a 24 GiB tier plus KV pools could force swap and kill `cublasCreate`. Fix: register in ~2 GiB slices; `shed_pressure()` unregisters cold slices, `regrow_pressure()` adds one back when `MemAvailable` recovers. Server polls every 2 s (`STRATA_MEM_FLOOR_MIB=1536`) and sheds only between requests.
+
+### Prefill (`src/prefill/prefill.cpp`, `src/prefill/kernels.cu`)
+
+- **Tiling, not bigger chunks.** Chunk decoupled from scratch VRAM (chunk 16384, tile 768); buffers allocated per run and freed after, so decode is never starved. Warm 11k prefill 50 → 694 tok/s.
+- **Fixed two correctness bugs.** Out-of-bounds write when chunk > tile (degenerate `!!!` output); GEMM state (`cuBLAS` handle, scratch) now created once in `init` instead of per prompt.
+
+### CPU / CUDA kernels (`src/kernels/cpu/iq_avx512.cpp`, `src/kernels/cpu/expert.cpp`, `src/kernels/cuda/native_moe.cu`, `src/kernels/cuda/sampler.cu`)
+
+- **AVX-512 `IQ4_NL` multi-token kernel** (~3x per-token ggml at `nt=5`); fixed a sign bug (`vpsignb` dropped weight signs, caught by `iq4nl_fuzz`).
+- **Orca `IQ4_XS` decode-once kernel** (`row_dot_iq4xs`, `gu_rows_iq4xs`); fuzz-clean vs ggml AVX2, parity at activation-noise level. Uses a static host tier with prefill-admit off (LRU churn halved throughput in testing); `--expert-cache-per-layer` and `--dump-counts` supported.
+- **`native_moe` combine + sampler.** Shared-memory weight broadcast, `fmaf`, `LDG.128` path; sampler caches unique token counts (bit-identical, much faster on long histories).
+
+### Orca support (`tools/`, `strata-orca-*.json`, `src/program/generate.cpp`)
+
+- **OOM-safe tools.** `make_native_head.py` and `probe_gguf.py` stream tens-of-GB shards instead of loading them; `repair_heretic_pack.py` converts `IQ4_XS` / `IQ4_NL` to BF16.
+- **Endpoint example.** `strata-orca-iq4xs.json`: port 8104, 24 GiB hot tier, 1500-slot cache, 16k prefill, spec-4, `q4_0` KV, 128k ctx.
+
+### `serve/` hardening (`serve/server.py`, `srv.sh`, `serve/test_server.py`)
+
+- **No spurious 400s.** Over-budget `max_tokens` is clamped to room left; engine faults return a `finish_reason` (retryable or overflow), never a bare EOF.
+- **Long-request tolerant.** 300 s watchdog; failover waits with heartbeats instead of failing fast; stale-output guard replaces a desynced engine; infra faults auto-replace the engine in the background.
+- **Covered by 61 contract tests** (23 + 20 + 18).
+
+---
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)

@@ -1236,6 +1236,14 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
 #endif
 }
 
+namespace {
+// orca-port S1: STRATA_RADIX_SAMPLER=1 routes sampled (non-Gumbel) rows to sampler_radix.cu's radix top-k kernel
+bool radix_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RADIX_SAMPLER"); return v && v[0] == '1'; }();
+    return on;
+}
+}  // namespace
+
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p_in, int* out, void* stream) {
     SamplerParams p = p_in;
@@ -1261,6 +1269,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+    } else if (radix_env() && !p.gumbel) {
+        sample_tokens_radix(logits, n_tokens, n_vocab, history, history_len, p, out, stream);
     } else if (sampled_path() == SampledPath::Old) {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.

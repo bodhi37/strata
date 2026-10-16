@@ -353,6 +353,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/quantize_act.cu
                           src/kernels/cuda/rope.cu
                           src/kernels/cuda/sampler.cu
+                          src/kernels/cuda/sampler_radix.cu
                           src/kernels/cuda/s2_gemv_q8.cu
     src/kernels/cuda/s2_expert_grouped.cu
                           src/kernels/cuda/shared_expert.cu

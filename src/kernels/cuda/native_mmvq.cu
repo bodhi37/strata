@@ -273,7 +273,7 @@ __global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -339,7 +339,7 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -359,8 +359,8 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
 // Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
     const auto* x = static_cast<const uint16_t*>(ptr);
-    int value = x[2 * i32] << 0;
-    value |= x[2 * i32 + 1] << 16;
+    int value = __ldg(&x[2 * i32]) << 0;
+    value |= __ldg(&x[2 * i32 + 1]) << 16;
     return value;
 }
 
@@ -427,7 +427,7 @@ __global__ void native_q3_k_mmvq_kernel(const Q3KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -520,7 +520,7 @@ __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -617,7 +617,7 @@ __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -690,7 +690,7 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -801,7 +801,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];

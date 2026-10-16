@@ -15,22 +15,24 @@ constexpr int THREADS = 256;
 
 /// One thread per output row, walking it contiguously.  Kept as the naive reference the split version is
 /// checked against, and used directly for the shapes where the output width is already large.
-__global__ void bf16_gemv_naive_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-                                       float* __restrict__ y, long long n_in, long long n_out) {
+__global__ void __launch_bounds__(256)
+bf16_gemv_naive_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                       float* __restrict__ y, long long n_in, long long n_out) {
     const long long o = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= n_out) return;
     const uint16_t* row = w + o * n_in;
     float acc = 0.0f;
     for (long long i = 0; i < n_in; ++i)
-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+        acc += f32_from_bf16(__ldg(&x[i])) * f32_from_bf16(__ldg(&row[i]));
     y[o] = acc;
 }
 
 /// One WARP per output row, lanes striding the reduction axis.  For a fixed `i` consecutive lanes touch
 /// consecutive addresses in this layout, so the load is coalesced - the property that took `gr_read` from
 /// 262 ms/token to 8.9.
-__global__ void bf16_gemv_warp_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-                                      float* __restrict__ y, long long n_in, long long n_out) {
+__global__ void __launch_bounds__(256)
+bf16_gemv_warp_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                      float* __restrict__ y, long long n_in, long long n_out) {
     const int warps_per_block = (int) (blockDim.x >> 5);
     const long long o = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
     if (o >= n_out) return;
@@ -38,15 +40,16 @@ __global__ void bf16_gemv_warp_kernel(const uint16_t* __restrict__ x, const uint
     const uint16_t* row = w + o * n_in;
     float acc = 0.0f;
     for (long long i = lane; i < n_in; i += 32)
-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+        acc += f32_from_bf16(__ldg(&x[i])) * f32_from_bf16(__ldg(&row[i]));
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
     if (lane == 0) y[o] = acc;
 }
 
 /// TPR lanes cooperate on ONE row's reduction: `threads_per_row` threads each take a strided slice and the
 /// block reduces through shared memory.  Used when the output width is too small to fill the machine.
-__global__ void bf16_gemv_split_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-                                       float* __restrict__ y, long long n_in, long long n_out, int tpr) {
+__global__ void __launch_bounds__(1024)
+bf16_gemv_split_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                       float* __restrict__ y, long long n_in, long long n_out, int tpr) {
     extern __shared__ float scratch[];
     const long long o = blockIdx.x;
     if (o >= n_out) return;
@@ -54,7 +57,7 @@ __global__ void bf16_gemv_split_kernel(const uint16_t* __restrict__ x, const uin
     const uint16_t* row = w + o * n_in;
     float acc = 0.0f;
     for (long long i = t; i < n_in; i += tpr)
-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
+        acc += f32_from_bf16(__ldg(&x[i])) * f32_from_bf16(__ldg(&row[i]));
     // block reduction; `tpr` is at most a few hundred, so a tree in shared is enough
     scratch[t] = acc;
     __syncthreads();

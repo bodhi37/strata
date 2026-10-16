@@ -583,11 +583,33 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
     // "slots", so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    // R4.2g bases (same as open()): without these every layer admits from slot 0 and the
+    // layers overwrite each other (verify_slot fails at byte 0 on sized/native packs).
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;
         layer_slot_range(l, lo, hi);
         layer_next_[(size_t) l] = (int32_t) lo;
     }
+    return true;
+}
+
+bool ExpertCache::open_layered(const std::vector<int64_t>& count, const std::vector<int64_t>& bytes,
+                               int64_t n_layers, int64_t n_expert, std::string& err) {
+    if ((int64_t) count.size() != n_layers || (int64_t) bytes.size() != n_layers) {
+        err = "ExpertCache::open_layered: one count and one size per layer";
+        return false;
+    }
+    std::vector<int64_t> sb;
+    std::vector<int64_t> lo((size_t) n_layers), hi((size_t) n_layers);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        lo[(size_t) l] = (int64_t) sb.size();
+        for (int64_t i = 0; i < count[(size_t) l]; ++i) sb.push_back(bytes[(size_t) l]);
+        hi[(size_t) l] = (int64_t) sb.size();
+    }
+    if (!open_sized(sb, n_layers, n_expert, err)) return false;
+    layer_lo_ = std::move(lo);
+    layer_hi_ = std::move(hi);
+    for (int64_t l = 0; l < n_layers; ++l) layer_next_[(size_t) l] = (int32_t) layer_lo_[(size_t) l];
     return true;
 }
 
@@ -597,6 +619,8 @@ void ExpertCache::close() {
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
 #endif
+    layer_lo_.clear();
+    layer_hi_.clear();
     off_.clear();
     if (!segs_.empty()) {
         release_segmented();
@@ -625,6 +649,11 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     lo = 0;
     hi = 0;
     if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!layer_lo_.empty()) {
+        lo = layer_lo_[(size_t) layer];
+        hi = layer_hi_[(size_t) layer];
+        return;
+    }
     const int64_t q = slots_ / n_layers_;
     lo = layer * q;
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;

@@ -108,6 +108,9 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
 template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-bit sign index + 4-bit scale)
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
+    // R10 note: a vpgatherdd variant of this decode was tried and REVERTED - neutral at nt<=3 and 15% SLOWER
+    // at nt=5 (register pressure against the five token accumulators).  Zen 5's gather does not beat 16
+    // scalar L1 lookups here.  Measured dead end; do not retry without a profiler saying otherwise.
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const uint8_t* q = b + 2 + 16 * j;
         // E-2: one gather of the 16 grid words (the scalar lookups assembled with set_epi32 cost ~30 uops)
@@ -242,8 +245,158 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 }  // namespace
 
+// ---- R10: multi-token IQ4_NL rows (the down projection of every native pack on this box) ----
+//
+// ggml-cpu's AVX2 kernel re-runs the nibble LUT for EVERY token: measured on this machine, one expert's
+// down projection costs 87 us at nt=2 and 212 us at nt=5 - the decode is re-done per token, which is the
+// whole difference.  Here one 32-value block decodes ONCE into |g| and sign(g), and every token costs one
+// load, one vpsignb, one maddubs, one madd.  The per-block integer sums are exact (the same values ggml
+// computes), so the only difference from ggml's kernel is the order of the float additions - the same
+// class of difference the AVX-512 gate/up kernels already carry (measured rel ~1e-7, see native_expert_parity).
+void iq4nl_rows_multi(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
+                      int r0, int r1) {
+    const int nb = n / 32;                 // block_q8_0 / block_iq4_nl: 32 values per block
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    const __m128i lut16 = _mm_loadu_si128((const __m128i*) (const void*) kvalues_iq4nl);
+    const __m256i lut = _mm256_broadcastsi128_si256(lut16);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* wrow = w + (size_t) r * row_bytes;
+        __m256 accv[8];
+        for (int t = 0; t < nt; ++t) accv[t] = _mm256_setzero_ps();
+        for (int ib = 0; ib < nb; ++ib) {
+            const uint8_t* wb = wrow + (size_t) ib * 18;   // block_iq4_nl: fp16 d + 16 packed nibbles
+            const __m128i q4 = _mm_loadu_si128((const __m128i*) (const void*) (wb + 2));
+            const __m128i lo = _mm_and_si128(q4, m4);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(q4, 4), m4);
+            const __m256i g = _mm256_shuffle_epi8(lut, _mm256_set_m128i(hi, lo));   // 32 int8 magnitudes
+            // R10 FIX: vpsignb(a,b) = a*sign(b), so sign(g,g) is |g|, NOT the sign vector - the first version
+            // precomputed "gs = sign(g,g)" and then sy = sign(yv, gs) reduced to yv (sign of |g| is +1 or 0),
+            // i.e. THE WEIGHT SIGNS WERE NEVER APPLIED (sum |w|*y instead of sum w*y; caught by
+            // scratch/iq4nl_fuzz.cpp after the engine produced repetitive output - the vs-float parity at
+            // 1.3e-2 could not see it under the activation noise).  The correct form needs no precomputed
+            // sign vector at all: ggml's own mul_add_epi8 is maddubs(|x|, y*sign(x)).
+            const __m256i ax = _mm256_abs_epi8(g);
+            const float dx = h2f(u16(wb));
+            for (int t = 0; t < nt; ++t) {
+                const uint8_t* yb = (const uint8_t*) hq[t] + (size_t) ib * 34;   // block_q8_0: fp16 d + qs[32]
+                const __m256i yv = _mm256_loadu_si256((const __m256i*) (const void*) (yb + 2));
+                const __m256i sy = _mm256_sign_epi8(yv, g);                      // y * sign(g)
+                const __m256i p16 = _mm256_maddubs_epi16(ax, sy);
+                const __m256i p32 = _mm256_madd_epi16(p16, ones);
+                const float dy = h2f(u16(yb));
+                accv[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * dy), _mm256_cvtepi32_ps(p32), accv[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            const __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(accv[t]), _mm256_extractf128_ps(accv[t], 1));
+            const __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            out[t][r] = _mm_cvtss_f32(_mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1)));
+        }
+    }
+}
+
+
+// ---- IQ4_XS gate/up rows (Orca: gu type 23, Q8_K activations) ----
+//
+// block_iq4_xs: fp16 d + u16 scales_h + u8 scales_l[4] + u8 qs[128] = 136 B per 256 values
+// (ggml-common.h).  8 sub-blocks of 32 values; sub-block ib's 6-bit scale is
+//   nib = (scales_l[ib/2] >> (4*(ib&1))) & 0xF, high = (scales_h >> (4*(ib/2) + 2*(ib&1))) & 0x3,
+//   ls = (nib | (high << 4)) - 32
+// the same integers ggml_vec_dot_iq4_xs_q8_K's AVX2 path computes.  ggml re-runs the nibble
+// LUT per token; here each sub-block decodes ONCE into int8 grid values and every token costs
+// one load, one sign, one maddubs, one madd - the same decode-once structure as
+// iq4nl_rows_multi above.  Per-block integer sums are exact; only float addition order
+// differs from ggml.
+template <int NT>
+inline void row_dot_iq4xs(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    const __m128i lut16 = _mm_loadu_si128((const __m128i*) (const void*) kvalues_iq4nl);
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 136;
+        const float dx = h2f(u16(blk));
+        const uint16_t sh = u16(blk + 2);
+        const uint8_t* sl = blk + 4;
+        const uint8_t* qs = blk + 8;
+        __m256i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ++ib) {
+            const __m128i q16 = _mm_loadu_si128((const __m128i*) (const void*) (qs + 16 * ib));
+            const __m128i lo = _mm_and_si128(q16, m4);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(q16, 4), m4);
+            const __m128i glo = _mm_shuffle_epi8(lut16, lo);
+            const __m128i ghi = _mm_shuffle_epi8(lut16, hi);
+            const __m256i g =
+                _mm256_inserti128_si256(_mm256_castsi128_si256(glo), ghi, 1);
+            const __m256i ax = _mm256_abs_epi8(g);
+            const int p = ib >> 1, s = ib & 1;
+            const int nib = (sl[p] >> (4 * s)) & 0xF;
+            const int hb = (sh >> (4 * p + 2 * s)) & 0x3;
+            const __m256i vls = _mm256_set1_epi16((short) ((nib | (hb << 4)) - 32));
+            for (int t = 0; t < NT; ++t) {
+                const __m256i yv =
+                    _mm256_loadu_si256((const __m256i*) (const void*) (y[t][i].qs + 32 * ib));
+                const __m256i sy = _mm256_sign_epi8(yv, g);
+                const __m256i p16 = _mm256_maddubs_epi16(ax, sy);
+                acci[t] = _mm256_add_epi32(acci[t], _mm256_madd_epi16(p16, vls));
+            }
+        }
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d),
+                                      _mm256_cvtepi32_ps(acci[t]), accf[t]);
+    }
+    for (int t = 0; t < NT; ++t) {
+        const __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(accf[t]), _mm256_extractf128_ps(accf[t], 1));
+        const __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        res[t] = _mm_cvtss_f32(_mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1)));
+    }
+}
+
+template <int NT>
+void gu_rows_iq4xs(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                   float* const* ff, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / 256;
+    float g[NT], u[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot_iq4xs<NT>(blob + (size_t) r * gu_row, nb, y, g);
+        row_dot_iq4xs<NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+    }
+}
+
+void iq4xs_gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                      float* const* ff, int r0, int r1) {
+    switch (nt) {
+        case 1: gu_rows_iq4xs<1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 2: gu_rows_iq4xs<2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 3: gu_rows_iq4xs<3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 4: gu_rows_iq4xs<4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 5: gu_rows_iq4xs<5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 6: gu_rows_iq4xs<6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 7: gu_rows_iq4xs<7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 8: gu_rows_iq4xs<8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            iq4xs_gu_rows_nt(k, blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1);
+        }
+    }
+}
+
+
+bool iq512_supported(int type) noexcept {
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
+}
+
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
+    if (type == 23) {   // IQ4_XS (Orca gu): decode-once multi-token kernel above, Q8_K activations
+        iq4xs_gu_rows_nt(nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        return;
+    }
     switch (type) {
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
