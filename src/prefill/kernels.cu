@@ -1645,6 +1645,44 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
 }
 
+// unify (orca-port P-CHUNK): the MoE combine in entry batches, so Dm (and GU, H, Xq) hold one batch's rows instead
+// of the chunk's T*K.  Rows [rb0, rb1) of the layer's entry order are in Dm (batch-local).  Every token continues its
+// fmaf chain over those of its K slots that fall in the batch, in k order, from bo (from 0 in the first batch); the
+// finish adds the shared expert as moe_combine_kernel does.  With one batch this is moe_combine4_kernel's arithmetic,
+// bit for bit; with several, only the order of the k terms differs (batch order, then k) - deterministic.
+__global__ void moe_accum_batch4_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                        const float* __restrict__ w, float4* __restrict__ bo, int64_t T, int32_t rb0,
+                                        int32_t rb1, const float* __restrict__ row_sd, bool first) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // float4 index
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
+    float4 s = first ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : bo[i];
+    bool any = false;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        if (r < rb0 || r >= rb1) continue;
+        any = true;
+        const float ww = w[t * 10 + k];
+        float4 v = *reinterpret_cast<const float4*>(Dm + (int64_t) (r - rb0) * N + d);
+        if (row_sd) {
+            const float sd = row_sd[r - rb0];
+            v = make_float4(v.x * sd, v.y * sd, v.z * sd, v.w * sd);
+        }
+        s.x = fmaf(ww, v.x, s.x); s.y = fmaf(ww, v.y, s.y); s.z = fmaf(ww, v.z, s.z); s.w = fmaf(ww, v.w, s.w);
+    }
+    if (first || any) bo[i] = s;
+}
+__global__ void moe_finish4_kernel(const float4* __restrict__ shared, const float* __restrict__ sg, float4* __restrict__ bo,
+                                   int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4);
+    const float g = sigm(sg[t]);
+    const float4 s = bo[i], sh = shared[i];
+    bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
+}
+
 // ---------------------------------------------------------------- QSA helpers
 __global__ void __launch_bounds__(1024) rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
@@ -2207,6 +2245,19 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 #endif
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
     check("moe_combine");
+}
+void moe_accum_batch(const float* Dm, const int32_t* slot, const float* w, float* bo, int64_t T, int32_t rb0, int32_t rb1,
+                     const float* row_sd, bool first, void* stream) {
+    if (T <= 0) return;
+    moe_accum_batch4_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+        Dm, slot, w, reinterpret_cast<float4*>(bo), T, rb0, rb1, row_sd, first);
+    check("moe_accum_batch");
+}
+void moe_finish(const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_finish4_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T);
+    check("moe_finish");
 }
 void moe_shared_into_bo(float* bo, const float* shared, const float* sg, int64_t t0, int64_t T, void* stream) {
     if (T <= 0) return;

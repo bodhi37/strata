@@ -762,6 +762,11 @@ struct Prefill::Impl {
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
+    // unify P-CHUNK (orca-port's tiled prompt path on upstream's): the layout tiles the per-layer scratch to `tile` tokens
+    // and runs the MoE in entry batches of `ecap` rows, so only the chunk's real state (R, the mixed rows, the routing,
+    // bo) grows with the chunk - see tiled_layout()
+    bool tiled = false;
+    int64_t tile = 0, ecap = 0, steps_off = 0;
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
@@ -1079,6 +1084,49 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 }
 }
 
+// unify P-CHUNK: STRATA_PF_TILE (default 2048 tokens, a multiple of the indexer's 4-cell block; 0 = off) tiles the
+// attention halves and the hyper-connection scratch; the MoE half runs over the whole chunk in entry batches of
+// max(STRATA_PF_ECAP (default 16384), chunk) rows.  Only on the single-GPU MMQ path (no FP16 fallback layer, not the
+// fused layout); everything else keeps upstream's layout.
+int64_t pf_tile_size() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_TILE");
+        const long long x = e ? std::atoll(e) : 2048;
+        return x <= 0 ? (int64_t) 0 : std::max<int64_t>(256, (int64_t) x / 64 * 64);
+    }();
+    return v;
+}
+int64_t pf_ecap_min() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_ECAP"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 16384; }();
+    return v;
+}
+bool tiled_layout(size_t T, bool src) {
+    return pf_tile_size() > 0 && (int64_t) T > pf_tile_size() && !fused_layout(T, src) && mmq_plan().any &&
+           !mmq_plan().fallback && std::all_of(mmq_plan().layer.begin(), mmq_plan().layer.end(), [](char c) { return c != 0; });
+}
+size_t tiled_ecap(size_t T) { return std::min<size_t>(T * K, std::max<size_t>(T, (size_t) pf_ecap_min())); }
+// the tiled MoE set: the chunk's routing, shared output and gate; tile-sized router logits and shared scratch; E-row
+// expert batches
+uint64_t moe_set_bytes_tiled(size_t T, size_t TS, size_t E, int64_t n_expert) {
+    Alloc a; a.count_only = true; bool ok = true;
+    a.take<float>(TS * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
+    a.take<int32_t>(T * K, ok);
+    a.take<float>(E * 1280, ok);                 // GU
+    a.take<float>(E * N, ok);                    // Dm
+    a.take<float>(TS * 640, ok); a.take<float>(TS * 640, ok); a.take<uint16_t>(TS * 640, ok);
+    a.take<float>(T * N, ok); a.take<float>(T, ok);
+    a.take<uint8_t>(mmq::q8_bytes((int64_t) E, N), ok);
+    a.take<float>(E * 640, ok);
+    a.take<uint8_t>(mmq::q8_bytes((int64_t) E, 640), ok);
+    a.take<float>(E, ok); a.take<float>(E, ok); a.take<float>(MMQ_GROUP * 4, ok);
+    a.take<float>(E, ok);
+    return a.used;
+}
+// the bounds table: per group, MMQ_GROUP + 1 batch-relative gate/up bounds and as many group-relative down bounds
+// (the untiled layout: n + 1 absolute and ng * (MMQ_GROUP + 1) relative)
+size_t bounds_ints(int64_t n_expert, bool tiled) {
+    return tiled ? (size_t) (2 * n_expert * (MMQ_GROUP + 1) + 2) : (size_t) (2 * (n_expert + n_expert / MMQ_GROUP + 2));
+}
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
@@ -1245,16 +1293,24 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
+    // unify P-CHUNK: the tiled layout (see tiled_layout): TS sizes the hyper-connection and attention scratch, E the
+    // MoE's expert batches; the rest is the chunk's
+    m.tiled = tiled_layout(T, m.src != nullptr);
+    const size_t TS = m.tiled ? (size_t) pf_tile_size() : T;
+    const size_t E = m.tiled ? tiled_ecap(T) : T * K;
+    m.tile = (int64_t) TS;
+    m.ecap = (int64_t) E;
+    m.steps_off = 0;
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
-    m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
+    m.xn = gr_unfused() ? o.take<float>(TS * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
     m.grs = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    m.xn16 = o.take<uint16_t>(TS * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(TS * LR, ok); m.lo16 = o.take<uint16_t>(TS * LR, ok);
+    m.gated = o.take<float>(TS * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
-    if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
+    if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(TS * D, ok); m.lo16_lo = o.take<uint16_t>(TS * LR, ok); }
     if (bf16x2(m.f16_io)) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
@@ -1265,26 +1321,43 @@ bool Prefill::carve(size_t T, void* alloc) {
         const bool fz = fused_layout(T, m.src != nullptr);
         m.fused_bufs = fz;
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
-        const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
+        const uint64_t region = std::max({gdn_set_bytes(TS), qsa_set_bytes(TS, m.cap, m.max_blocks, m.sel_batch,
+                                                                            m.attn_batch, s),
+                                          m.tiled ? moe_set_bytes_tiled(T, TS, E, m.g->n_expert)
+                                                  : moe_set_bytes(T, m.g->n_expert, fz)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
-        m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
-        m.gate = a.take<float>(T * HV, ok); m.beta = a.take<float>(T * HV, ok); m.hbuf = a.take<float>(T * C, ok);
-        m.y = a.take<float>(T * ZV, ok); m.y_h = a.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
+        m.qkv = a.take<float>(TS * C, ok); m.z = a.take<float>(TS * ZV, ok); m.ab = a.take<float>(TS * 2 * HV, ok);
+        m.gate = a.take<float>(TS * HV, ok); m.beta = a.take<float>(TS * HV, ok); m.hbuf = a.take<float>(TS * C, ok);
+        m.y = a.take<float>(TS * ZV, ok); m.y_h = a.take<uint16_t>(TS * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
         Alloc b;
         b.base = base; b.cap = region; b.owned = &m.owned;
-        m.Kc = b.take<float>(T * 512, ok); m.Vc = b.take<float>(T * 512, ok); m.Qf = b.take<float>(T * 12288, ok);
-        m.q = b.take<float>(T * ZV, ok); m.idx_raw = b.take<float>(T * 128, ok); m.q_idx = b.take<float>(T * 512, ok);
-        m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
-        m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
+        m.Kc = b.take<float>(TS * 512, ok); m.Vc = b.take<float>(TS * 512, ok); m.Qf = b.take<float>(TS * 12288, ok);
+        m.q = b.take<float>(TS * ZV, ok); m.idx_raw = b.take<float>(TS * 128, ok); m.q_idx = b.take<float>(TS * 512, ok);
+        m.attn = b.take<float>(TS * ZV, ok); m.attn_h = b.take<uint16_t>(TS * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
+        m.sel_ids = b.take<int32_t>(TS * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
+        if (m.tiled) {   // moe_set_bytes_tiled's order
+            m.logits = c.take<float>(TS * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
+            m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
+            m.Xs = nullptr; m.Hh = nullptr;
+            m.GU = c.take<float>(E * 1280, ok);
+            m.Dm = c.take<float>(E * N, ok);
+            m.sgate = c.take<float>(TS * 640, ok); m.sup = c.take<float>(TS * 640, ok); m.sh_h = c.take<uint16_t>(TS * 640, ok);
+            m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
+            m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) E, N), ok);
+            m.H = c.take<float>(E * 640, ok);
+            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) E, 640), ok);
+            m.Xscale = c.take<float>(E, ok); m.Hscale = c.take<float>(E, ok);
+            m.grp_tail = c.take<float>(MMQ_GROUP * 4, ok);
+            m.row_sd = c.take<float>(E, ok);
+        } else {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
@@ -1302,13 +1375,14 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.grp_tail = c.take<float>(MMQ_GROUP * 4, ok);
             m.row_sd = c.take<float>(T * K, ok);
         }
+        }
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.ids_identity = o.take<int32_t>(E, ok);
+        m.bounds_dev = o.take<int32_t>(bounds_ints(m.g->n_expert, m.tiled), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
@@ -1880,6 +1954,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
                                     bool owned_pages, bool src) {
     // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
     const size_t T = (size_t) chunk;
+    // unify P-CHUNK: the tiled layout's counts (carve's)
+    const bool tiled = tiled_layout(T, src);
+    const size_t TS = tiled ? (size_t) pf_tile_size() : T, E = tiled ? tiled_ecap(T) : T * K;
     bool ok = true;
     Alloc o;
     o.count_only = true;
@@ -1887,6 +1964,38 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
+    if (tiled) {   // carve, buffer for buffer
+        f(T * N); f(T * D);
+        if (gr_unfused()) f(TS * D);
+        f(T * HC);
+        o.take<uint16_t>(TS * (D + (hc_pad() ? XN_PAD : 0)), ok); f(TS * LR); o.take<uint16_t>(TS * LR, ok);
+        f(TS * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+        const bool f16t = prompt_f16();
+        if (bf16x2_hc(f16t)) { o.take<uint16_t>(TS * D, ok); o.take<uint16_t>(TS * LR, ok); }
+        if (bf16x2(f16t)) o.take<uint16_t>(T * N, ok);
+        o.take<int32_t>(T * strata::kernels::kStepCount, ok);
+        strata::kernels::QsaShapes st = core::qsa_shapes(g);
+        const int64_t capt = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, st);
+        const int64_t mbt = ss.qsa_states[ss.qsa_primary()].max_cells / st.idx_block + 2;
+        o.take<uint8_t>((size_t) std::max({gdn_set_bytes(TS), qsa_set_bytes(TS, capt, mbt, 256, 32, st),
+                                           moe_set_bytes_tiled(T, TS, E, g.n_expert)}), ok);
+        for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+        const MmqPlan& mp = mmq_plan();
+        o.take<int32_t>(E, ok);
+        o.take<int32_t>(bounds_ints(g.n_expert, true), ok);
+        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        if (owned_pages) {
+            if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);
+        } else {
+            for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+        }
+        f(T * N);
+        f((size_t) strata::kernels::NG_HC_DIM);
+        strata::kernels::KvHostPools stage;
+        take_stage(o, ss, st, stage, ok);
+        return o.used + (8u << 20);
+    }
     // `carve`'s order, buffer for buffer: emb, R, xn, grs, xn16, lo, lo16, gated, inj, mixed, mixed_bf, mixed_h,
     // bo aliases emb. This counted `xn` unconditionally (carve takes it only under STRATA_GR_UNFUSED) and never counted
     // `grs`.  Net over-count T*(D-HC)*4 bytes: 42 MB at a 1024-token chunk, 252 MB (48 Q8_0 slots) at 6144 - the
@@ -2125,6 +2234,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const bool single_chunk = hand_in_ == nullptr ? n <= m.T : single_chunk_;
     const bool helped = single_chunk && bind_stage_helper(n);
     if (helped) std::swap(m.pp, m.help_pp);
+    if (m.tiled && (m.pp != nullptr || next_ != nullptr || hand_in_ != nullptr || helped)) {
+        err = "prefill: the tiled prompt layout (STRATA_PF_TILE) runs on one GPU only - STRATA_PF_TILE=0 for a split or a peer";
+        return false;
+    }
     struct HelpScope {
         Impl& m;
         bool on;
@@ -2143,7 +2256,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
-    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.tiled ? m.ecap : m.T * K, m.cs);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -2596,7 +2709,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 stats_.ms_ple += ms_since(tp);
             }
-            for (int half = 0; half < 2; ++half) {
+            // unify P-CHUNK: one half's work as a function of the token range it runs on.  Untiled: the whole chunk,
+            // every part.  Tiled (m.tiled): the driver below runs the attention half tile by tile, the MoE half's read
+            // + router + shared expert tile by tile, its experts once over the chunk (entry batches), its write tile by
+            // tile - on views of the chunk's buffers (TileView), so this code runs unchanged on a tile.
+            enum { kPartAll = 0, kPartAttnTile, kPartMoeFront, kPartMoeBack, kPartMoeWrite };
+            auto half_body = [&](const int half, const int64_t T, const int64_t p0, const int part) -> bool {
+                const bool tile_mode = part != kPartAll;
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -2606,7 +2725,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!wn || !wd || !wu || !wi) return false;
                 // STRATA_HC_Q8 without a bf16 copy: this path's GEMMs read bf16, so the matrices are dequantized per half
                 core::WeightRef wd_q8, wu_q8;
-                if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
+                const bool hc_read_part = part == kPartAll || part == kPartAttnTile || part == kPartMoeFront;
+                if (hc_read_part && !wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
                     wd_q8 = *wd; wu_q8 = *wu;
                     wd_q8.data = core::NativeDense::hc_bf16_view(*wd, m.cs, 0, 0);
                     wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
@@ -2617,6 +2737,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
                                             !m.xn16_lo ? D + XN_PAD : D;
+                if (hc_read_part) {
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx);
                 normed = false;
@@ -2678,6 +2799,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     core::NativeDense::hc_bf16_release(m.cs, 0, 0);
                     core::NativeDense::hc_bf16_release(m.cs, 1, 0);
                 }
+                }   // hc_read_part
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
@@ -2813,7 +2935,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
-                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                        const int64_t active = (int64_t) m.steps_host[(size_t) m.steps_off + (size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
                         // STRATA_SELECT_OLD=1: the warp kernel
@@ -2942,6 +3064,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsu = need(v, "ffn_up_shexp.weight", err),
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
+                    if (part != kPartMoeWrite) {   // unify P-CHUNK: the write-only part skips the whole MoE body
+                    if (part != kPartMoeBack) {    // the router (and the research hooks): the read's parts
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
@@ -3005,6 +3129,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
+                    }   // part != kPartMoeBack
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
@@ -3018,8 +3143,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
-                    if (!defer_shared && !shared_expert()) return false;
+                    const bool defer_shared = !tile_mode && !stream_all && stream_ahead_enabled();
+                    if (part != kPartMoeBack && !defer_shared && !shared_expert()) return false;
+                    if (part != kPartMoeFront) {   // unify P-CHUNK: the experts (the back part: the whole chunk)
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3134,7 +3260,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
                         }
-                        bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                        bool cpu_maybe = pool_hold.held && !stream_all && !m.tiled && m.src != nullptr && !m.cpu_dead &&
                                          lay.native && !m.pp && !lay.fmt.empty();
                         // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                         // nothing left (0.1.41 report: tight RAM, chats failing).  A buffer that cannot be had ends the share
@@ -3452,7 +3578,66 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         pt.mark(kPfGather, cs);
-                        if (use_mmq) {
+                        // unify P-CHUNK: the tiled layout's expert batches (rows [brow0, brow1) of the entry order, at most
+                        // m.ecap) and groups (at most MMQ_GROUP experts, never across a batch)
+                        std::vector<int32_t> pl_g;
+                        std::vector<size_t> pl_gfirst, pl_gend;
+                        std::vector<int> pl_gbatch;
+                        std::vector<int64_t> pl_brow0, pl_brow1;
+                        std::vector<char> pl_blast;   // per group: the last of its batch
+                        if (use_mmq && m.tiled) {
+                            const size_t n = order.size();
+                            pl_g.assign(n, 0);
+                            int64_t brows = 0, b0 = n > 0 ? m.off[(size_t) order[0]] : 0;
+                            size_t gsz = 0;
+                            for (size_t j = 0; j < n; ++j) {
+                                const int64_t c = m.cnt[(size_t) order[j]];
+                                const bool new_batch = j == 0 || brows + c > m.ecap;
+                                if (new_batch) {
+                                    if (j > 0) { pl_brow1.push_back(b0 + brows); pl_blast.back() = 1; }
+                                    b0 = m.off[(size_t) order[j]];
+                                    pl_brow0.push_back(b0);
+                                    brows = 0;
+                                }
+                                if (new_batch || gsz == (size_t) MMQ_GROUP) {
+                                    if (!pl_gfirst.empty()) pl_gend.push_back(j);
+                                    pl_gfirst.push_back(j);
+                                    pl_gbatch.push_back((int) pl_brow0.size() - 1);
+                                    pl_blast.push_back(0);
+                                    gsz = 0;
+                                }
+                                pl_g[j] = (int32_t) pl_gfirst.size() - 1;
+                                ++gsz;
+                                brows += c;
+                            }
+                            if (n > 0) { pl_gend.push_back(n); pl_brow1.push_back(b0 + brows); pl_blast.back() = 1; }
+                        }
+                        if (use_mmq && m.tiled) {
+                            const size_t ng = pl_gfirst.size();
+                            constexpr size_t BG = MMQ_GROUP + 1;
+                            m.bounds_host.assign(2 * ng * BG, 0);
+                            for (size_t g = 0; g < ng; ++g) {
+                                const int64_t rb0 = pl_brow0[(size_t) pl_gbatch[g]];
+                                const size_t jf = pl_gfirst[g], je = pl_gend[g];
+                                const int64_t gend = m.off[(size_t) order[je - 1]] + m.cnt[(size_t) order[je - 1]];
+                                for (size_t i = 0; i < BG; ++i) {
+                                    const int64_t r = jf + i < je ? m.off[(size_t) order[jf + i]] : gend;
+                                    m.bounds_host[g * BG + i] = (int32_t) (r - rb0);                              // gate/up: the batch's
+                                    m.bounds_host[ng * BG + g * BG + i] = (int32_t) (r - m.off[(size_t) order[jf]]);  // down: the group's
+                                }
+                            }
+                            if (m.bounds_host.size() > bounds_ints(m.g->n_expert, true)) {
+                                err = "prefill: the tiled layout's group table overflows";
+                                return false;
+                            }
+                            if (m.up_ring.h2d(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4, m.cs) != cudaSuccess) {
+                                err = "prefill: the group bounds' upload failed";
+                                return false;
+                            }
+                            if (!pl_brow0.empty())   // the first batch's activations (the next ones after each batch)
+                                mmq::quantize(m.mixed, m.src_dev + pl_brow0[0], m.Xq, mmq_gt, N, N, pl_brow1[0] - pl_brow0[0], m.cs,
+                                              m.Xscale);
+                        } else if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                             mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
@@ -3872,9 +4057,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
-                                const size_t q = j % MMQ_GROUP;
+                                const size_t q = m.tiled ? j - pl_gfirst[(size_t) pl_g[j]] : j % MMQ_GROUP;
                                 // the group's last expert also zeroes the MMQ tail after its slot (see MMQ_TAIL)
-                                const bool last_of_group = q + 1 == MMQ_GROUP || j + 1 == order.size();
+                                const bool last_of_group = m.tiled ? j + 1 == pl_gend[(size_t) pl_g[j]]
+                                                                   : q + 1 == MMQ_GROUP || j + 1 == order.size();
                                 if (group_gather) {
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
@@ -3897,6 +4083,50 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                 }
                                 if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                if (m.tiled) {   // unify P-CHUNK: the group's products in its batch, then the batch's combine
+                                    if (!last_of_group) return true;
+                                    const size_t g = (size_t) pl_g[j], jf = pl_gfirst[g], ng = pl_gfirst.size();
+                                    const int b = pl_gbatch[g];
+                                    const int64_t rb0 = pl_brow0[(size_t) b], rb1 = pl_brow1[(size_t) b];
+                                    const int ngx = (int) (j - jf + 1);
+                                    const int64_t r0 = m.off[(size_t) order[jf]] - rb0;
+                                    const int64_t nr = m.off[(size_t) order[j]] + m.cnt[(size_t) order[j]] - m.off[(size_t) order[jf]];
+                                    int64_t maxr = 0;
+                                    for (size_t i = jf; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                    constexpr size_t BG = MMQ_GROUP + 1;
+                                    const bool tail = lay.native && lay.fmt[(size_t) l].tail_off;
+                                    pt.mark(kPfGemmGU, cs);
+                                    mmq::Product gu;
+                                    gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                                    gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + g * BG; gu.ids = m.ids_identity;
+                                    gu.total_rows = rb1 - rb0; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                    gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
+                                    m.mmq_ctx->run(gu, m.cs);
+                                    if (tail)
+                                        mmq::swiglu_scaled(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, m.bounds_dev + g * BG, ngx,
+                                                           m.grp_tail, r0, m.cs);
+                                    else
+                                        mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
+                                    mmq::Product dn;
+                                    dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                                    dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + ng * BG + g * BG;
+                                    dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                                    dn.ld_dst = N;
+                                    dn.y_scale = mmq::fp4_activations(mmq_dt) ? m.Hscale : nullptr;
+                                    m.mmq_ctx->run(dn, m.cs);
+                                    if (tail) mmq::down_row_scales(m.row_sd + r0, dn.bounds, ngx, m.grp_tail, nr, m.cs);
+                                    if (pl_blast[g]) {
+                                        pt.mark(kPfCombine, cs);
+                                        moe_accum_batch(m.Dm, m.slot_dev, m.w, m.bo, T, (int32_t) rb0, (int32_t) rb1,
+                                                        tail ? m.row_sd : nullptr, b == 0, m.cs);
+                                        if ((size_t) b + 1 < pl_brow0.size())
+                                            mmq::quantize(m.mixed, m.src_dev + pl_brow0[(size_t) b + 1], m.Xq, mmq_gt, N, N,
+                                                          pl_brow1[(size_t) b + 1] - pl_brow0[(size_t) b + 1], m.cs, m.Xscale);
+                                    }
+                                    return true;
+                                }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
                                 const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
@@ -4051,11 +4281,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
+                    else if (m.tiled)   // unify P-CHUNK: the batches combined their rows into bo; the shared expert now
+                        moe_finish(m.shared, m.sg, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
                                     use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
-                    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
+                    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg && !m.tiled) {
                         cudaStreamSynchronize(m.cs);
                         auto bad = [&](const float* d, int64_t n) {
                             std::vector<float> h((size_t) n);
@@ -4079,18 +4311,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          (long long) T);
                         }
                     }
+                    }   // part != kPartMoeFront
+                    }   // part != kPartMoeWrite
                 }
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)
+                if (part == kPartAll || part == kPartAttnTile || part == kPartMoeWrite) {
                 const int64_t nl = half == 0 ? l : l + 1;
                 const bool steered = half == 1 && strata::kernels::cvec().covers(l);
                 const float *cv_dir = nullptr, *cv_s = nullptr;
                 const int* cv_on = nullptr;
-                const bool cv_fused = steered && cvec_fuse() && !gr_unfused() && nl < LE && !(nl == 1 && ple_on) &&
+                const bool cv_fused = steered && !tile_mode && cvec_fuse() && !gr_unfused() && nl < LE && !(nl == 1 && ple_on) &&
                                       strata::kernels::cvec().n_embd == N && strata::kernels::cvec().hc == HC &&
                                       strata::kernels::cvec_tables(&cv_dir, &cv_s, &cv_on);
-                const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) && (!steered || cv_fused);
+                // (tiled: never - the next half reads its own tiles' norm, which a fused write could not leave for all of them)
+                const bool fuse = !tile_mode && !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) && (!steered || cv_fused);
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {
                     const core::LayerView vn(*m.wt, nl);
@@ -4143,6 +4379,44 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                }   // the write's parts
+                return true;
+            };
+            if (!m.tiled) {
+                for (int half = 0; half < 2; ++half)
+                    if (!half_body(half, T, p0, kPartAll)) return false;
+            } else {
+                // unify P-CHUNK: the tiles.  A view moves the chunk-wide buffers' pointers to the tile's rows (the
+                // tile-sized scratch stays where it is); the layer counters advance once per layer, not per tile.
+                const int64_t TS = m.tile;
+                auto run_tiles = [&](int half, int part) -> bool {
+                    const int64_t gi0 = gdn_index, qi0 = qsa_index;
+                    for (int64_t t0 = 0; t0 < T; t0 += TS) {
+                        const int64_t ts = std::min(TS, T - t0);
+                        gdn_index = gi0;
+                        qsa_index = qi0;
+                        float* const R0 = m.R; float* const mx0 = m.mixed; uint16_t* const mb0 = m.mixed_bf;
+                        uint16_t* const mh0 = m.mixed_h; uint16_t* const mbl0 = m.mixed_bf_lo; float* const bo0 = m.bo;
+                        float* const inj0 = m.inj; float* const grs0 = m.grs; int32_t* const st0 = m.steps_dev;
+                        int32_t* const ids0 = m.ids; float* const w0 = m.w; float* const sh0 = m.shared; float* const sg0 = m.sg;
+                        m.R += t0 * D; m.mixed += t0 * N; m.mixed_bf += t0 * N; m.mixed_h += t0 * N;
+                        if (m.mixed_bf_lo) m.mixed_bf_lo += t0 * N;
+                        m.bo += t0 * N; m.inj += t0 * HC; m.grs += t0 * HC;
+                        m.steps_dev += t0 * strata::kernels::kStepCount;
+                        m.steps_off = t0 * strata::kernels::kStepCount;
+                        m.ids += t0 * K; m.w += t0 * K; m.shared += t0 * N; m.sg += t0;
+                        const bool ok = half_body(half, ts, p0 + t0, part);
+                        m.R = R0; m.mixed = mx0; m.mixed_bf = mb0; m.mixed_h = mh0; m.mixed_bf_lo = mbl0; m.bo = bo0;
+                        m.inj = inj0; m.grs = grs0; m.steps_dev = st0; m.steps_off = 0;
+                        m.ids = ids0; m.w = w0; m.shared = sh0; m.sg = sg0;
+                        if (!ok) return false;
+                    }
+                    return true;
+                };
+                if (!run_tiles(0, kPartAttnTile)) return false;
+                if (!run_tiles(1, kPartMoeFront)) return false;
+                if (!half_body(1, T, p0, kPartMoeBack)) return false;
+                if (!run_tiles(1, kPartMoeWrite)) return false;
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
