@@ -33,11 +33,11 @@ void check(const char* what) {
 // ---------------------------------------------------------------- llama.cpp helpers (vecdotq.cuh)
 __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     const uint16_t* x16 = (const uint16_t*) x;
-    int x32 = __ldg(&x16[2 * i32 + 0]) << 0;
-    x32 |= __ldg(&x16[2 * i32 + 1]) << 16;
+    int x32 = x16[2 * i32 + 0] << 0;   // plain loads: also called on shared memory (staged grids, LDS activations),
+    x32 |= x16[2 * i32 + 1] << 16;     // where __ldg (ld.global.nc) faults with cudaErrorInvalidAddressSpace
     return x32;
 }
-__device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return __ldg(&((const int*) x)[i32]); }
+__device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
