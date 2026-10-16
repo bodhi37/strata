@@ -25,7 +25,6 @@ echo "[build] done $(date -Is): $(ls -l "$ROOT/engine/strata")"
 # R7: cap_ipc_lock lets pin_hot actually mlock the host tier; `cp` clears file xattrs, so re-apply.
 # R9: setcap needs root - the R8 attempt to do it without sudo silently failed and the 2026-09-27
 # 01:35 run started with "mlock FAILED - reclaimable", which collapses decode under memory pressure.
-# Password is the box's; this is a single-user dev box.
 if command -v setcap >/dev/null 2>&1; then
   if ! setcap cap_ipc_lock,cap_sys_nice+ep "$ROOT/engine/strata" 2>/dev/null; then
     sudo setcap cap_ipc_lock,cap_sys_nice+ep "$ROOT/engine/strata" \

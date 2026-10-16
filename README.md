@@ -1,41 +1,136 @@
 > [!NOTE]
-> This branch (`orca-port`) is frozen and outdated — use `main` for the latest.
+> This is my fork of [Strata](https://github.com/Niko1221/Strata). The `unify` branch is the current one: upstream
+> v0.1.44.1 with all of my `orca-port` work merged on top. `orca-port` is kept as it was, for reference.
+> Upstream's own README starts [further down](#strata-upstream).
 
-## `orca-port`: what this fork changes
+## What this fork is for
 
-Goal: serve the model on boxes that cannot hold it in RAM, via a VRAM + hot-RAM + NVMe expert tier, plus Orca support and `serve/` hardening.
+Upstream Strata assumes 64 GB of RAM. My box has 30 GB (Ryzen 9 9900X, DDR5-6200, RTX 4070 Super 12 GB, one NVMe
+drive), and the IQ3_S experts alone are 50 GB. So most of this work is about running the model when it doesn't fit:
+keeping the right experts in VRAM and RAM, reading the rest from disk fast enough, and hiding as much of that as
+possible behind GPU work.
 
-### Expert serving (`src/core/expert_source.cpp`, `include/strata/core/expert_source.hpp`, `src/program/generate.cpp`, `src/core/expert_cache.cpp`)
-- **Three tiers.** VRAM slice (non-redundant, past the hot tier) + mlocked hot RAM + NVMe via `pread` ring and parked reader pool. Startup helper: `run-engine-mlock.sh`.
-- **Routing profiles from traces.** `--dump-profile` / `--dump-counts` + `tools/make_profile_from_counts.py`; `--expert-cache -2` as the no-cache baseline.
-- **VRAM fill fixes.** Per-layer slot bases in `open_sized`; fill scans past per-layer quotas and verifies the first-admitted pair.
-- **Read-amplification fix (6.4x).** Hot-tier guard on the ring-full fallback (2.4 → 6.1 tok/s on IQ3_XXS); whole-blob `pread` + `DONTNEED` + `MADV_HUGEPAGE` in `pin_hot`; two-pass dispatch (`begin_layer` / `wait_layer`) so resident experts compute while reads fly. Remaining wall is SSD QD1 latency (~2.8 ms × 48 layers), not bandwidth.
-- **Adaptive LRU hot tier.** Seeded in profile rank order; zero-copy admit on decode miss; frequency-aware eviction; phase attribution.
-- **`O_DIRECT` reads.** Twin `O_DIRECT` fds with thread-local aligned bounce buffers; avoids the per-read page-cache alloc/copy cycle (~39% CPU before). Buffered fallback preserved; `STRATA_NO_ODIRECT=1` disables it. Also surfaces `cudaErrorString` on `NativeEmbed` pin failure.
-- **Elastic tier under memory pressure.** `cudaHostRegister` pins pages, so a 24 GiB tier plus KV pools could force swap and kill `cublasCreate`. Fix: register in ~2 GiB slices; `shed_pressure()` unregisters cold slices, `regrow_pressure()` adds one back when `MemAvailable` recovers. Server polls every 2 s (`STRATA_MEM_FLOOR_MIB=1536`) and sheds only between requests.
+One rule for all of it: the output has to match the stock IQ3_S quant. No dropping experts, no requantizing cold ones
+to save bandwidth. I tried a couple of lossy shortcuts along the way (dropping low-rank misses was worth +5 to +30%)
+and threw them out because the quality hit wasn't worth it.
 
-### Prefill (`src/prefill/prefill.cpp`, `src/prefill/kernels.cu`)
+## Where it ended up
 
-- **Tiling, not bigger chunks.** Chunk decoupled from scratch VRAM (chunk 16384, tile 768); buffers allocated per run and freed after, so decode is never starved. Warm 11k prefill 50 → 694 tok/s.
-- **Fixed two correctness bugs.** Out-of-bounds write when chunk > tile (degenerate `!!!` output); GEMM state (`cuBLAS` handle, scratch) now created once in `init` instead of per prompt.
+All numbers are from my box, sampling at temperature 1.0 on 20 held-out prompts (`hill/xb.py --big`). Greedy decoding
+gives flattering numbers on this setup, so I only use it to check that outputs are identical.
 
-### CPU / CUDA kernels (`src/kernels/cpu/iq_avx512.cpp`, `src/kernels/cpu/expert.cpp`, `src/kernels/cuda/native_moe.cu`, `src/kernels/cuda/sampler.cu`)
+| | decode tok/s | cold prefill tok/s | prefix hit, 65K context |
+| --- | ---: | ---: | ---: |
+| `orca-port` (Oct 16) | 43.2 | ~775 | 13.2K tok/s effective |
+| `unify` | **48.4** | **1350-1450** | **18.8K tok/s effective** |
 
-- **AVX-512 `IQ4_NL` multi-token kernel** (~3x per-token ggml at `nt=5`); fixed a sign bug (`vpsignb` dropped weight signs, caught by `iq4nl_fuzz`).
-- **Orca `IQ4_XS` decode-once kernel** (`row_dot_iq4xs`, `gu_rows_iq4xs`); fuzz-clean vs ggml AVX2, parity at activation-noise level. Uses a static host tier with prefill-admit off (LRU churn halved throughput in testing); `--expert-cache-per-layer` and `--dump-counts` supported.
-- **`native_moe` combine + sampler.** Shared-memory weight broadcast, `fmaf`, `LDG.128` path; sampler caches unique token counts (bit-identical, much faster on long histories).
+Both rows come from the same session, back to back. Decode on `orca-port` went from 24.5 to 43.5 tok/s over the last
+two days of tuning before the merge (more on that below).
 
-### Orca support (`tools/`, `strata-orca-*.json`, `src/program/generate.cpp`)
+## How `unify` was put together
 
-- **OOM-safe tools.** `make_native_head.py` and `probe_gguf.py` stream tens-of-GB shards instead of loading them; `repair_heretic_pack.py` converts `IQ4_XS` / `IQ4_NL` to BF16.
-- **Endpoint example.** `strata-orca-iq4xs.json`: port 8104, 24 GiB hot tier, 1500-slot cache, 16k prefill, spec-4, `q4_0` KV, 128k ctx.
+`orca-port` forked from upstream v0.1.8, and by v0.1.44.1 upstream had made big changes to the prompt
+path, the arena and the server. Rebasing 40-odd commits across all that wasn't realistic, so I re-parented a snapshot of `orca-port` onto
+v0.1.8 and did one three-way merge against v0.1.44.1, then fixed what didn't build. After that I ported my prefill and
+pool work onto upstream's newer code instead of keeping my old versions of those files.
 
-### `serve/` hardening (`serve/server.py`, `srv.sh`, `serve/test_server.py`)
+What changed on top of the merge:
 
-- **No spurious 400s.** Over-budget `max_tokens` is clamped to room left; engine faults return a `finish_reason` (retryable or overflow), never a bare EOF.
-- **Long-request tolerant.** 300 s watchdog; failover waits with heartbeats instead of failing fast; stale-output guard replaces a desynced engine; infra faults auto-replace the engine in the background.
-- **Covered by 61 contract tests** (23 + 20 + 18).
+- **Fused CPU expert pool.** Gate/up and down used to run as two phases with a barrier and a host-side quantize in
+  between. Now each expert has its own ready stamp and the last gate/up worker quantizes H, so down starts as soon as
+  its expert is ready. `STRATA_POOL_FUSE=0` gives the old behaviour.
+- **Tiled prefill on upstream's prompt path.** Attention and MoE run in 2048-token tiles inside a 32K chunk
+  (`STRATA_PF_TILE`), with per-tile q8_1 rows for the MMQ matmuls. Results are bitwise equal to running the chunk
+  whole. This roughly doubled cold prefill.
+- **Prompt cache fix.** Upstream always pinned the first checkpoint as the root, even when it was just a periodic one.
+  With `--prompt-cache 2` that meant a long conversation lost its turn checkpoint and re-read everything after 32K.
+  Fixing it is where the 13.2K to 18.8K jump on prefix hits comes from. `STRATA_CKPT_PIN_FIRST=1` restores upstream's
+  behaviour.
+- **O_DIRECT for the prompt stager** and parallel refill of lent arena slots.
+- Telemetry: per-request pool stats (GB per window, GB/s, experts per call), a per-call trace
+  (`STRATA_CALL_TRACE`, `hill/ctan.py`), prefill chunk budgets (`STRATA_PF_SIZES=1`).
 
+## The `orca-port` work (all carried into `unify`)
+
+### Expert tiering for a small-RAM box
+
+- Three tiers: a VRAM slice, an mlocked hot set in RAM, and NVMe reads through a `pread` ring with a parked reader
+  pool. The VRAM slice takes the next part of the routing profile after the hot tier, so the two never hold the same
+  expert.
+- Routing profiles built from real traces (`--dump-profile`, `--dump-counts`, `tools/make_profile_from_counts.py`).
+- Fixed a 6.4x read amplification. The ring-full fallback was re-reading experts that were already in the hot tier;
+  guarding that, plus reading whole blobs and dropping them from the page cache, took IQ3_XXS from 2.4 to 6.1 tok/s.
+  Dispatch is now two-pass, so resident experts compute while disk reads are in flight.
+- An adaptive LRU tier, later made exact-size (`STRATA_LRU_EXACT`) so slots match blob sizes instead of wasting
+  space, with VRAM slots laid out per layer. Together with a 24 GiB LRU this moved decode from 24.5 to ~31 tok/s.
+- `O_DIRECT` reads through a second fd with aligned bounce buffers. The page cache was costing ~39% CPU on reads.
+  `STRATA_NO_ODIRECT=1` turns it off.
+- Memory pressure handling: the tier is pinned with `cudaHostRegister` in 2 GiB slices, and the server unpins cold
+  slices between requests when `MemAvailable` gets low, then adds them back when it recovers. Before this, a large
+  tier plus KV could push the box into swap and kill `cublasCreate`.
+- `STRATA_ADAPT3`: VRAM/RAM adapt swaps that trade places in-place instead of costing capacity.
+
+### Decode
+
+- **Async PLE reads.** On Linux, `DirectFile` was a plain synchronous `pread`, so the n-gram embedding rows were read
+  one at a time while the GPU sat idle for ~6.6 ms per window. Moving them onto a thread pool: 30.2 to 34.1 tok/s.
+- **Early issue** (`STRATA_EARLY`): a pinned thread starts the next call's disk reads before the current one finishes.
+- **Radix sampler** for temperature sampling, which was costing ~2 ms per window.
+- **Split verify windows fixed.** `--spec-split` was corrupting output (runs of `!!!!` after a few hundred tokens on
+  about half the prompts, greedy included) because two groups shared one DMA flag. Every number I'd measured with it
+  before that fix was wrong, which is why the bench tool now counts degenerate outputs.
+- Verify graphs for every window size are prewarmed at startup, with a T=1 retry if a window runs out of memory late.
+
+### Prefill
+
+- Decoupled the prefill chunk from scratch VRAM using tiles, and allocate the buffers per run so decode is never
+  starved for memory. Warm 11K prefill went from 50 to 694 tok/s on `orca-port`.
+- Fixed an out-of-bounds write in the mixed tile buffer when chunk > tile (it showed up as degenerate `!!!` output),
+  and moved the cuBLAS handle and scratch into `init` instead of creating them per prompt.
+
+### Kernels
+
+- AVX-512 multi-token `IQ4_NL` kernel, about 3x ggml's per-token path at 5 tokens. The first version had a sign bug
+  (`vpsignb(g, g)` is `|g|`, not the sign), which a fuzz test caught after the model started repeating itself.
+- `IQ4_XS` decode-once CPU kernel for Orca, fuzzed against ggml's AVX2 version.
+- `native_moe` combine and the sampler: shared-memory weight broadcast, wide loads, unique-token counts cached
+  (same output, much faster on long histories).
+
+### Orca support
+
+- `tools/make_native_head.py` and `tools/probe_gguf.py` stream the shards instead of loading tens of GB into RAM.
+  `tools/repair_heretic_pack.py` can dequantize `IQ4_XS` and `IQ4_NL` to BF16.
+- `strata-orca-iq4xs.json` is a working endpoint config.
+
+### Server
+
+- Over-budget `max_tokens` is clamped to the room left instead of returning a 400.
+- Engine faults come back as a `finish_reason` (retryable or overflow) rather than a dropped connection.
+- 300 s watchdog; requests wait for a restarting engine instead of failing; stale engine output can't leak into the
+  next request.
+- 61 contract tests in `serve/`.
+
+## Things that didn't work
+
+Written down so nobody (me included) tries them again: transparent huge pages for the tier, different prefetch
+distances, router lookahead (52% recall, 21% precision, a net loss), ghost/LFU tier admission, per-layer LRU
+allocation, speculative sampling of MTP drafts (better acceptance but each extra window row costs ~13.6 ms of fresh
+experts), and rewriting the IQ4_NL kernel on the default path. The CPU pool is already DRAM-bound at ~55-58 GB/s.
+
+Where the time goes now: about 550 MB of expert reads from RAM per accepted token, ~27% of host time waiting on the
+disk ring, and the SSD tops out around 135K random 4K IOPS. On the GPU side, kernels plus ~5 ms of host work per window
+would cap decode somewhere around 90-100 tok/s even with free CPU.
+
+## Running it
+
+The config I use is `hill/cfg-unify-best.json` (paths are for my machine). Build with `build-engine.sh`; the engine
+needs `cap_ipc_lock` so it can mlock the tier, and the script asks for sudo to set it. `hill/srv-uni.sh CFG PORT`
+starts the server. Bench tools are in `hill/`: `xb.py` (decode), `pb.py` (prefill), `dlt.py` (prefix hits),
+`pfcheck.py` and `gcmp.py` for checking that a change doesn't alter the output. Expect hardcoded paths in there.
+
+---
+
+<a id="strata-upstream"></a>
 ---
 <h1 align="center">Strata</h1>
 
