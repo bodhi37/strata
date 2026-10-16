@@ -1227,6 +1227,11 @@ public:
     /// Pin by need, after open(): the registered ranges (0 when the prefix rule, or nothing, is in force)
     size_t pin_ranges() const { return pin_start_.size(); }
     bool pcie_ready() const override { return file_map_ != nullptr ? hot_dev_ok_ : !dev_slice_.empty(); }
+    /// unify: the prompt path's stager and the lent-slot refills read a file-backed arena's disk-resident blobs through
+    /// these (O_DIRECT, neighbouring blobs merged into one preadv) instead of faulting the mapping 4 KiB at a time.
+    bool transient(int64_t layer, int64_t expert) const override;
+    bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.

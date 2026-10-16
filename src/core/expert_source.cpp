@@ -56,6 +56,7 @@
 #include <mach/mach.h>   // host_statistics64: the available memory
 #endif
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -4448,6 +4449,73 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
         err = std::string("native experts from the GGUF: ") + e.what();
         return false;
     }
+}
+
+// unify: the prompt path's stager (and the lent-slot refills) on a file-backed arena.  A tier resident is pinned and
+// DMA'd straight from the tier (pinned() above), so the stager only asks here for the disk-resident blobs; those are
+// "transient" (the source copies them itself) so it never faults the mapping.  copy_blobs merges neighbouring
+// experts of one layer - the stager claims runs in file order - into one O_DIRECT preadv straight into its pinned
+// buffers (no bounce, no copy); anything unaligned or a failed read falls back per blob.
+bool ArenaExpertSource::transient(int64_t layer, int64_t expert) const {
+    if (file_map_ == nullptr || !direct_ok_ || direct_fd_ < 0) return false;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return false;
+    return hot_slot_.empty() || hot_slot_[(size_t) idx] < 0;
+}
+
+bool ArenaExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (dst == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    const int64_t idx = layer * n_expert_ + expert;
+    if (file_map_ != nullptr && !hot_slot_.empty() && idx < blobs_ && hot_slot_[(size_t) idx] >= 0) {
+        std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
+        return true;
+    }
+    if (file_map_ != nullptr && direct_read_span(lay.blob_offset(layer, expert), len, dst)) return true;
+    return ExpertSource::copy_blob(layer, expert, dst);
+}
+
+bool ArenaExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    if (file_map_ == nullptr || !direct_ok_ || direct_fd_ < 0) return ExpertSource::copy_blobs(layers, experts, dst, n);
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t A = direct_align_;
+    size_t i = 0;
+    while (i < n) {
+        const int64_t l = layers[i];
+        const uint64_t len = lay.blob_bytes(l), off0 = lay.blob_offset(l, experts[i]);
+        const bool al = ((off0 | len) & (A - 1)) == 0;
+        size_t j = i + 1;   // a run: the same layer, the next expert in the file, every buffer aligned
+        auto dst_ok = [&](size_t k) { return transient(layers[k], experts[k]) && ((uintptr_t) dst[k] & (A - 1)) == 0; };
+        if (al && dst_ok(i))
+            while (j < n && j - i < 16 && layers[j] == l && experts[j] == experts[j - 1] + 1 && dst_ok(j)) ++j;
+        if (al && dst_ok(i) && j - i > 1) {
+            struct iovec iov[16];
+            for (size_t k = i; k < j; ++k) iov[k - i] = {dst[k], (size_t) len};
+            const size_t want = (size_t) len * (j - i);
+            size_t got = 0;
+            while (got < want) {   // a short read resumes in the iovec it stopped in
+                size_t skip = got, v = 0;
+                while (skip >= iov[v].iov_len) skip -= iov[v++].iov_len;
+                struct iovec rest[16];
+                size_t nv = 0;
+                for (size_t k = v; k < j - i; ++k) rest[nv++] = iov[k];
+                rest[0].iov_base = (uint8_t*) rest[0].iov_base + skip;
+                rest[0].iov_len -= skip;
+                const ssize_t r = ::preadv(direct_fd_, rest, (int) nv, (off_t) (off0 + got));
+                if (r <= 0) break;
+                got += (size_t) r;
+            }
+            if (got == want) { i = j; continue; }
+            for (size_t k = i; k < j; ++k)   // the batch failed: each on its own
+                if (!copy_blob(layers[k], experts[k], dst[k])) return false;
+            i = j;
+            continue;
+        }
+        if (!copy_blob(layers[i], experts[i], dst[i])) return false;
+        ++i;
+    }
+    return true;
 }
 
 // Plan v0.3 P6: the arena from the model's GGUF shards.  Each layer's gate, up and down tensors hold the 512

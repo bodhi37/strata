@@ -11736,7 +11736,75 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                // unify: a file-backed arena's disk-resident blobs (transient) are read O_DIRECT in file order by four
+                // threads, neighbours merged (copy_blobs), into pinned buffers and uploaded on each thread's own stream
+                // - cudaMemcpyAsync from the mapping would fault it 4 KiB at a time through the driver's staging
+                std::vector<std::pair<int32_t, int32_t>> bulk;
+                for (const auto& [i, slot] : p.lent)
+                    if (srcp->transient(i / g.n_expert, i % g.n_expert)) bulk.emplace_back(i, slot);
+                if (!bulk.empty()) {
+                    std::sort(bulk.begin(), bulk.end());
+                    constexpr int kThr = 4, kRun = 4;
+                    struct RefillPool {
+                        uint8_t* buf[kThr][2][kRun] = {};
+                        cudaStream_t st[kThr] = {};
+                        cudaEvent_t ev[kThr][2] = {};
+                        bool ok = false;
+                    };
+                    static RefillPool rp;
+                    const size_t mb = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+                    if (!rp.ok) {
+                        rp.ok = true;
+                        for (int t = 0; t < kThr && rp.ok; ++t) {
+                            rp.ok = cudaStreamCreateWithFlags(&rp.st[t], cudaStreamNonBlocking) == cudaSuccess;
+                            for (int h = 0; h < 2 && rp.ok; ++h) {
+                                rp.ok = cudaEventCreateWithFlags(&rp.ev[t][h], cudaEventDisableTiming) == cudaSuccess;
+                                for (int k = 0; k < kRun && rp.ok; ++k)
+                                    rp.ok = cudaHostAlloc((void**) &rp.buf[t][h][k], mb, cudaHostAllocDefault) == cudaSuccess;
+                            }
+                        }
+                        if (!rp.ok) cudaGetLastError();
+                    }
+                    if (rp.ok) {
+                        std::atomic<size_t> next{0};
+                        std::atomic<bool> fail{false};
+                        auto work = [&](int t) {
+                            const strata::core::OnDevice on_t(p.dev);
+                            int h = 0;
+                            for (;;) {
+                                const size_t r0 = next.fetch_add(kRun);
+                                if (r0 >= bulk.size() || fail.load()) break;
+                                const size_t r1 = std::min(bulk.size(), r0 + kRun);
+                                cudaEventSynchronize(rp.ev[t][h]);   // this half's previous uploads have landed
+                                int32_t ls[kRun], es[kRun];
+                                uint8_t* ds[kRun];
+                                for (size_t r = r0; r < r1; ++r) {
+                                    ls[r - r0] = bulk[r].first / (int32_t) g.n_expert;
+                                    es[r - r0] = bulk[r].first % (int32_t) g.n_expert;
+                                    ds[r - r0] = rp.buf[t][h][r - r0];
+                                }
+                                if (!srcp->copy_blobs(ls, es, ds, r1 - r0)) { fail = true; break; }
+                                for (size_t r = r0; r < r1; ++r) {
+                                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(ls[r - r0]);
+                                    if (cudaMemcpyAsync(p.cache->device_slot(bulk[r].second), ds[r - r0], nb,
+                                                        cudaMemcpyHostToDevice, rp.st[t]) != cudaSuccess) { fail = true; break; }
+                                }
+                                cudaEventRecord(rp.ev[t][h], rp.st[t]);
+                                h ^= 1;
+                            }
+                            cudaStreamSynchronize(rp.st[t]);
+                        };
+                        std::vector<std::thread> th;
+                        for (int t = 0; t < kThr; ++t) th.emplace_back(work, t);
+                        for (auto& x : th) x.join();
+                        if (fail.load()) { e = "the lent slots' refill could not read or upload a blob"; return false; }
+                        for (const auto& [i, slot] : bulk) host_res[(size_t) i] = slot;
+                    } else {
+                        bulk.clear();   // no pinned pool: everything goes the mapped way below
+                    }
+                }
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    if (!bulk.empty() && srcp->transient(i / g.n_expert, i % g.n_expert)) continue;   // (done above)
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
@@ -13039,6 +13107,9 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                ++win_rounds;                  // orca-port telemetry (the per-request mtp:/phases/win lines)
+                win_tokens += T;
+                win_accepted += a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -13096,6 +13167,7 @@ int main(int argc, char** argv) {
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
+                    mtp_ms += msd(tw2, tw3);
                 }
                 pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
                 if (adapt_thr.joinable()) {
