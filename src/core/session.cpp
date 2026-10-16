@@ -70,6 +70,13 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
     n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
+    if (std::getenv("STRATA_TRACE") != nullptr)
+        std::fprintf(stderr, "strata trace: session %lld cells: gdn bufs %.0f MiB, gdn state %.0f, qsa states %.0f, qsa bufs %.0f, "
+                             "moe bufs %.0f, block bufs %.0f, ple hist %.0f MiB\n", (long long) max_cells,
+                     gdn_buffers_bytes(g) / 1048576.0, (double) gdn_n * gdn_state_floats(g) * 4 / 1048576.0,
+                     g.n_qsa_layers() > 0 ? (qsa_state_bytes(g, max_cells, true) + (double) (q_n - 1) * qsa_state_bytes(g, max_cells, false)) / 1048576.0 : 0.0,
+                     qsa_buffers_bytes(g, max_cells) / 1048576.0, moe_buffers_bytes(g, k) / 1048576.0,
+                     block_buffers_bytes(g) / 1048576.0, ple_hist_bytes() / 1048576.0);
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
