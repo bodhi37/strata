@@ -39,7 +39,7 @@ __device__ float warp_sum(float x) {
         x += __shfl_xor_sync(0xffffffffu, x, offset);
     return x;
 }
-__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+__global__ void __launch_bounds__(1024) append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,

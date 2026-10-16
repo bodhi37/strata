@@ -23,6 +23,9 @@ public:
     /// The same with caller-owned device buffers (the prompt path borrowing expert-cache slots).
     bool init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                        std::string& err);
+    /// R22: the handle exists (init/init_external succeeded).  The handle is PERSISTENT for the object's
+    /// lifetime: it is created once, not per run - see prefill.cpp init().
+    bool ready() const { return handle_ != nullptr; }
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,

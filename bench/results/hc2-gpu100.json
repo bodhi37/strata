@@ -1,0 +1,73 @@
+{
+ "tag": "gpu100",
+ "cfg": "hill/cfg-gpu100.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 11.475142240524292,
+     "prefill_tok_s": 366.53140430334486,
+     "decode_tok_s": 19.157477401643344,
+     "wall_s": 21.44513964653015,
+     "sample": "The"
+    },
+    {
+     "i": 1,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.4031825065612793,
+     "prefill_tok_s": 10432.000227075165,
+     "decode_tok_s": 19.101579386647057,
+     "wall_s": 10.402355670928955,
+     "sample": "The"
+    },
+    {
+     "i": 2,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.3568873405456543,
+     "prefill_tok_s": 11785.231702445197,
+     "decode_tok_s": 18.720342461904117,
+     "wall_s": 10.559692144393921,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 19.101579386647057,
+   "decode_min": 18.720342461904117,
+   "decode_max": 19.157477401643344,
+   "prefill_med": 10432.000227075165,
+   "telemetry": {
+    "mtp_windows": 89,
+    "tok_per_win": 2.4,
+    "accept_pct": 48.1,
+    "ms_per_win": 115.3,
+    "req_per_tok": 468.8,
+    "hot": 82335,
+    "ring": 7652,
+    "disk_blobs": 7663,
+    "disk_gb": 15.59,
+    "disk_gbs": 1.52,
+    "ver_wait": 45.9,
+    "ver_pool": 62.1,
+    "ver_host": 2.4,
+    "commit": 0.7,
+    "plan": 4.6,
+    "actq": 0.3,
+    "jobs": 57.1,
+    "run": 0.5,
+    "ringwait": 150.0,
+    "drain": 13.4,
+    "gu": 9.6,
+    "down": 3.8,
+    "gen_ms": 10259,
+    "gen_tok": 192,
+    "gen_tps": 18.7,
+    "ring_per_tok": 39.854166666666664,
+    "miss_blobs_per_tok": 39.911458333333336
+   }
+  }
+ }
+}

@@ -23,4 +23,8 @@ LockResult lock_resident(void* p, uint64_t bytes);
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 
+/// R22b: the host's MemAvailable in bytes (Linux /proc/meminfo; 0 when unreadable, e.g. Windows - callers
+/// must treat 0 as "unknown, never trust a regrow on it").
+uint64_t host_available_bytes();
+
 }  // namespace strata::platform

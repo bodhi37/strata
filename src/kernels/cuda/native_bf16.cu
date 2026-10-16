@@ -41,7 +41,7 @@ __device__ __forceinline__ float mmvf_warp_sum(float value) {
 }
 
 template <int BLOCK_SIZE>
-__global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+__global__ void __launch_bounds__(1024) bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                                     float* __restrict__ y, int n_in) {
     const int t = threadIdx.x;
     const uint16_t* row = w + (size_t) blockIdx.x * n_in;

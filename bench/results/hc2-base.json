@@ -1,0 +1,53 @@
+{
+ "tag": "base",
+ "cfg": "strata-sc117-iq3s-final.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.5536785125732422,
+     "prefill_tok_s": 7596.466007778509,
+     "decode_tok_s": 19.140078994224183,
+     "wall_s": 10.53273868560791,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 19.140078994224183,
+   "decode_min": 19.140078994224183,
+   "decode_max": 19.140078994224183,
+   "prefill_med": 7596.466007778509,
+   "telemetry": {
+    "mtp_windows": 154,
+    "tok_per_win": 1.26,
+    "accept_pct": 16.0,
+    "ms_per_win": 73.4,
+    "req_per_tok": 336.5,
+    "hot": 57381,
+    "ring": 4857,
+    "disk_blobs": 9260,
+    "disk_gb": 18.77,
+    "disk_gbs": 1.66,
+    "ver_wait": 16.3,
+    "ver_pool": 48.5,
+    "ver_host": 2.8,
+    "commit": 0.7,
+    "plan": 2.5,
+    "actq": 0.2,
+    "jobs": 45.8,
+    "run": 8.4,
+    "ringwait": 6452.6,
+    "drain": 2047.5,
+    "gu": 1367.5,
+    "down": 668.7,
+    "gen_ms": 11304,
+    "gen_tok": 185,
+    "gen_tps": 16.4,
+    "ring_per_tok": 26.254054054054055,
+    "miss_blobs_per_tok": 50.054054054054056
+   }
+  }
+ }
+}

@@ -38,7 +38,7 @@ bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
     auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
     return x <= y ? y - x < an : x - y < bn;
 }
-__global__ void apply(const float* x, float* out, int rows, int width,
+__global__ void __launch_bounds__(1024) apply(const float* x, float* out, int rows, int width,
                       int n_rot, float theta_scale, const int* positions, const int32_t* mtab) {
     const int row = blockIdx.y;
     const int pair = blockIdx.x * blockDim.x + threadIdx.x;

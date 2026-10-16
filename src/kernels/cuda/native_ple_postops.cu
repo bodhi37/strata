@@ -37,7 +37,7 @@ __device__ float warp_sum(float x) {
     for (int offset = 16; offset; offset >>= 1) x += __shfl_xor_sync(0xffffffffu, x, offset);
     return x;
 }
-__global__ void gate_kernel(const float* key, const float* query, float* gate, float scale) {
+__global__ void __launch_bounds__(1024) gate_kernel(const float* key, const float* query, float* gate, float scale) {
     // SUM_ROWS selects 512 threads for four rows on the target GPU. Preserve
     // its eight partial lanes and materialized MUL rounding (never a dot FMA).
     float sums[8] = {};
@@ -64,11 +64,11 @@ __global__ void gate_kernel(const float* key, const float* query, float* gate, f
         gate[blockIdx.x] = 1.0f / (1.0f + expf(-__fmul_rn(sign, mag)));
     }
 }
-__global__ void broadcast_kernel(const float* value, const float* gate, float* gated) {
+__global__ void __launch_bounds__(1024) broadcast_kernel(const float* value, const float* gate, float* gated) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) gated[i] = __fmul_rn(value[i % N], gate[i / N]);
 }
-__global__ void conv_residual_kernel(const float* history, const float* normalized,
+__global__ void __launch_bounds__(1024) conv_residual_kernel(const float* history, const float* normalized,
                                     const uint16_t* weights, const float* hidden,
                                     const float* gated, float* conv, float* result) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;

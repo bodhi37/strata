@@ -1,11 +1,11 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <immintrin.h>
 #include <thread>
 #include <vector>
 
@@ -182,6 +183,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
     d.src->begin_layer(d.layers, ids, k);
+    // R7: this path has nothing to interleave - one token, one batch - so it takes the old single-phase shape.
+    d.src->wait_layer();
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
     // so anything cached against it would be layer 0's activation reused 48 times.
@@ -269,8 +272,33 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
     const auto c0 = std::chrono::steady_clock::now();
+    // ---- D1: STRATA_DROP_RANK=R.  A routed expert at top-k rank >= R whose bytes are not in RAM or VRAM is
+    // DROPPED (its output row is zero, i.e. router weight 0, no renormalisation) instead of read from the drive.
+    // Lossy by design; the A/B arm for "the decode is drive-bound".  Ranks: the router emits ids best-first.
+    static const int drop_rank = [] { const char* e = std::getenv("STRATA_DROP_RANK"); return e ? std::atoi(e) : 0; }();
+    const int32_t* const ids_in = ids;
+    int32_t ids_drop[256];
+    uint8_t dropm[256];
+    bool any_drop = false;
+    if (drop_rank > 0 && drop_rank < k && n_tok * k <= 256) {
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int32_t e = ids[i];
+            dropm[i] = 0;
+            ids_drop[i] = e;
+            if ((i % k) < drop_rank || e < 0 || e >= d.n_expert) continue;
+            if (d.host_res != nullptr && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+            if (d.src->host_resident(d.layers, e)) continue;
+            dropm[i] = 1;
+            ids_drop[i] = -1;
+            any_drop = true;
+            ++d.dropped;
+        }
+        if (any_drop) ids = ids_drop;
+    }
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
+    d.src->lookahead(d.layers, x_f, n_tok, H);   // R27: predict + start reading layer+1's misses now
+    if (d.on_begun) d.on_begun(d.on_begun_ctx);
     pt("begun");
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
@@ -292,34 +320,55 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
+        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_ready();
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
-        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
+        // R21: --gpu-share.  A deterministic fraction of ALL distinct experts - RAM-tier hits included,
+        // not just VRAM-cache misses - is computed on the GPU, so the window's expert bytes stream from
+        // DRAM through the pool's cores AND through the PCIe path at the same time instead of
+        // serializing behind the pool.  The split is per (layer, expert), so a blob lands on the same
+        // side every window; correctness is unaffected either way (the combine adds the shares, and the
+        // float-order difference is the same class the VRAM-hit path already carries).
+        const bool share_gpu = d.gpu_share > 0;
         GpuPlanSink& P = *d.plan;
+        const int64_t fcap = P.pcie_mode == 1 ? 64 : P.staging_cap;   // zero-copy needs no staging
+        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
-        for (int q = 0; q < nd; ++q) {
+        for (int64_t q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                if (slot >= 0) {
-                    kd = 0;
-                    ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                 : (size_t) slot * (size_t) d.cache_blob));
-                } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
-                        const uint8_t* src = d.src->blob(d.layers, e);
-                        if (src != nullptr && d.src->pinned(d.layers, e)) {
-                            kd = 1;
-                            dma_src[fetches] = src;
-                            pcie_i0[fetches] = i0;
-                            ++fetches;
-                        }
+                bool gpu = false;
+                if (share_gpu) {
+                    uint32_t h = (uint32_t) e * 0x9E3779B1u;
+                    h ^= (uint32_t) d.layers * 0x85EBCA6Bu;
+                    h *= 0xC2B2AE35u;
+                    h ^= h >> 15;
+                    gpu = (h >> 24) < (uint32_t) d.gpu_share;
+                } else if (slot < 0) {
+                    gpu = miss_rank >= nmiss - m;
+                }
+                if (gpu && slot < 0 && fetches < fcap && fetches < 64) {   // R27: a VRAM resident is never re-fetched
+                    const uint8_t* src = d.src->blob(d.layers, e);
+                    if (src != nullptr && d.src->pinned(d.layers, e)) {
+                        kd = 1;
+                        dma_src[fetches] = src;
+                        pcie_i0[fetches] = i0;
+                        ++fetches;
+                        if (slot >= 0) ++d.pcie_residents;
                     }
-                    ++miss_rank;
+                }
+                if (kd != 1) {
+                    if (slot >= 0) {
+                        kd = 0;
+                        ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
+                                                                                     : (size_t) slot * (size_t) d.cache_blob));
+                    } else {
+                        ++miss_rank;
+                    }
                 }
             }
             for (int64_t i = i0; i < n; ++i)
@@ -375,64 +424,117 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     else
         for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
     const auto c2 = std::chrono::steady_clock::now();
-    int njobs = 0;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t j = 0; j < k; ++j) {
-            const int64_t i = t * k + j;
-            const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
-            if (e < 0 || e >= d.n_expert) {
-                d.failed = true;
-                d.fail = "a routed expert id is out of range";
-                d.fail_layer = d.layers;
-                d.fail_expert = e;
-                return;
-            }
-            if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
-                if (kind[i] == 0) ++d.cache_hits;
-                std::memset(row, 0, (size_t) H * sizeof(float));
-                continue;
-            }
-            ++d.cache_refused;
-            int16_t& jo = d.job_of[(size_t) e];
-            if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
+    // ---- R7: TWO PASSES, SO THE DRIVE'S LATENCY HIDES BEHIND THE CPU'S OWN WORK.
+    //
+    // The layer's routed experts split into two sets that need nothing from each other:
+    //
+    //   * the ones whose bytes are ALREADY available - the host hot tier, or the mapping - and
+    //   * the ones `begin_layer` has put on the wire and that are still landing.
+    //
+    // Measured with the one-pass form on the IQ3_XXS pack, a 20 GiB host tier and `--spec 4`: of a 272 ms
+    // window, **176 ms was `begin_layer`'s blocking wait** while the CPU had **57 ms** of resident-expert work
+    // queued behind it, and the GPU sat idle through both.  Running pass 1 first puts that 57 ms inside the
+    // wait instead of after it.  Entries are consistent about which pass they belong to because `ring_pending`
+    // is a property of `(layer, expert)`, so an expert's rows never straddle the two pool calls.
+    auto dispatch_pass = [&](int pass) {
+        int njobs = 0;
+        for (int64_t t = 0; t < n_tok; ++t)
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t i = t * k + j;
+                const int64_t e = ids[i];
+                float* row = out + (size_t) i * H;
+                if (any_drop && dropm[i]) {     // D1: dropped - contributes nothing
+                    if (pass == 0) std::memset(row, 0, (size_t) H * sizeof(float));
+                    continue;
+                }
+                if (pass == 0 && (e < 0 || e >= d.n_expert)) {
                     d.failed = true;
-                    d.fail = "the expert source could not produce a blob";
+                    d.fail = "a routed expert id is out of range";
                     d.fail_layer = d.layers;
                     d.fail_expert = e;
-                    ++d.missing;
-                    return;
+                    return false;
                 }
-                jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = b;
-                nj.nt = 0;
+                if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
+                    if (pass == 0) {
+                        if (kind[i] == 0) ++d.cache_hits;
+                        std::memset(row, 0, (size_t) H * sizeof(float));
+                    }
+                    continue;
+                }
+                if (d.src->ring_pending(d.layers, e) != (pass == 1)) continue;
+                ++d.cache_refused;
+                int16_t& jo = d.job_of[(size_t) e];
+                if (jo < 0) {
+                    const uint8_t* b = d.src->blob(d.layers, e);
+                    if (b == nullptr) {
+                        d.failed = true;
+                        d.fail = "the expert source could not produce a blob";
+                        d.fail_layer = d.layers;
+                        d.fail_expert = e;
+                        ++d.missing;
+                        return false;
+                    }
+                    jo = (int16_t) njobs++;
+                    ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                    nj.blob = b;
+                    nj.nt = 0;
+                }
+                ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+                jb.act[jb.nt] = &d.act_multi[(size_t) t];
+                jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+                jb.out[jb.nt] = row;
+                ++jb.nt;
+                ++d.multi_entries;
             }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
-            jb.out[jb.nt] = row;
-            ++jb.nt;
-            ++d.multi_entries;
+        if (njobs > 0) {
+            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+            else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
         }
+        return true;
+    };
+    if (!dispatch_pass(0)) return;
+    const auto c2b = std::chrono::steady_clock::now();
+    d.src->wait_layer();          // the reads submitted by `begin_layer` are awaited HERE, after the residents
+    const auto c2c = std::chrono::steady_clock::now();
+    if (!dispatch_pass(1)) return;
     const auto c3 = std::chrono::steady_clock::now();
-    pt("run", njobs);
-    if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-    else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    const auto c4 = std::chrono::steady_clock::now();
-    pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
-    d.ms_run += ms(c3, c4);
+    d.ms_run += ms(c2, c2b);            // pass 0: the resident experts, computed while the reads are in flight
+    {   // C1: STRATA_CALL_TRACE=<file>: per pool call f32 {layer, n_tok, wait, plan, actq, pass0, ringwait, pass1, cpu_jobs, misses}
+        static FILE* ct = [] { const char* p = std::getenv("STRATA_CALL_TRACE"); return p ? std::fopen(p, "wb") : nullptr; }();
+        if (ct != nullptr) {
+            extern double g_call_wait_ms;
+            int nj0 = 0, nm = 0;
+            for (int64_t i = 0; i < n; ++i) if (kind[i] < 0) ++nj0;
+            for (int64_t i = 0; i < n; ++i) { const int64_t e = ids[i]; if (e >= 0 && e < d.n_expert && d.src->ring_pending(d.layers, e)) ++nm; }
+            const float rec[10] = {(float) d.layers, (float) n_tok, (float) g_call_wait_ms, (float) ms(c0, c1), (float) ms(c1, c2),
+                                   (float) ms(c2, c2b), (float) ms(c2b, c2c), (float) ms(c2c, c3), (float) nj0, (float) nm};
+            std::fwrite(rec, sizeof rec, 1, ct);
+        }
+    }
+    d.ms_wait += ms(c2b, c2c);          // the part of the drive's latency the resident work did NOT cover
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
-    d.multi_misses += njobs;
+    d.multi_misses += d.cache_refused;
+    if (!d.usage_total.empty())
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (ids[i] >= 0 && ids[i] < d.n_expert) ++d.usage_total[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]];
+    {
+        // X1: STRATA_ROUTE_TRACE=<file> appends one record per (window, layer): i16 layer, i16 n_tok, i16 k,
+        // then n_tok*k i16 expert ids - the input to hill/sim.py's offline tier/cache simulator.
+        static FILE* rt = [] { const char* p = std::getenv("STRATA_ROUTE_TRACE"); return p ? std::fopen(p, "ab") : nullptr; }();
+        if (rt != nullptr) {
+            int16_t hdr[3] = {(int16_t) d.layers, (int16_t) n_tok, (int16_t) k};
+            std::fwrite(hdr, sizeof hdr, 1, rt);
+            for (int64_t i = 0; i < n_tok * k; ++i) { const int16_t e = (int16_t) ids_in[i]; std::fwrite(&e, 2, 1, rt); }
+            if (d.layers == 47) std::fflush(rt);
+        }
+    }
     ++d.layers;
     d.experts += n_tok * k;
 }
@@ -546,6 +648,110 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================
 
+// R13: O_DIRECT helpers.  A blob's file offset is 256-byte aligned but rarely 4 KiB, its length is not a
+// 4 KiB multiple, and the ring destinations are plain heap vectors - none of which O_DIRECT accepts.  Every
+// direct read therefore covers the blob with the enclosing 4 KiB-aligned span into a thread-local aligned
+// bounce buffer, and the exact blob bytes are memcpy'd out of it.  One extra 2.18 MB copy (~0.1 ms) against
+// the page-cache alloc/copy/DONTNEED cycle it removes.
+namespace {
+
+/// Full pread; a short read on a valid regular fd is EOF-level trouble, so it fails the read.
+bool pread_full(int fd, void* dst, size_t n, off_t off) {
+    uint8_t* p = (uint8_t*) dst;
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t r = ::pread(fd, p + done, n - done, off + (off_t) done);
+        if (r <= 0) return false;
+        done += (size_t) r;
+    }
+    return true;
+}
+
+/// One aligned bounce buffer per thread, grown to the largest blob (plus the 4 KiB head/tail over-read).
+uint8_t* tls_bounce(size_t bytes) {
+    struct Buf { void* p = nullptr; ~Buf() { std::free(p); } };
+    thread_local Buf buf;
+    thread_local size_t cap = 0;
+    if (cap < bytes) {
+        void* q = nullptr;
+        if (posix_memalign(&q, 4096, bytes) != 0) return nullptr;
+        std::free(buf.p);
+        buf.p = q;
+        cap = bytes;
+    }
+    return (uint8_t*) buf.p;
+}
+
+/// R20: what alignment does O_DIRECT *actually* require for this file?  The code assumed 4096.  Here the NVMe
+/// reports logical_block_size 512 and btrfs accepts 512-aligned direct reads, so that assumption was 8x
+/// stricter than necessary - and because a blob's stride is 2,176,000 = 2^10 x 2125 bytes, only 1 blob in 4
+/// sits on a 4 KiB boundary.  The other 75% paid a full-size bounce + memcpy on EVERY miss.
+///
+/// Probed rather than taken from sysfs: a real O_DIRECT pread at an offset that is a multiple of 512 but NOT
+/// of 1024 succeeds only if the whole stack (fs + block layer + device) truly permits 512.  That tests the
+/// exact operation we are about to rely on, which a sysfs value or a statx claim does not.  Anything
+/// unexpected keeps the old, always-safe 4096 behaviour, so this cannot break another filesystem.
+uint64_t probe_direct_alignment(int fd, uint64_t file_bytes) {
+    constexpr uint64_t kProbeLen = 512;
+    uint64_t off = 512;                        // 512-aligned, deliberately NOT 1024-aligned
+    if (file_bytes < off + kProbeLen) return 4096;
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, kProbeLen) != 0) return 4096;  // a 4096-aligned buffer is never the limiter
+    const ssize_t r = ::pread(fd, buf, (size_t) kProbeLen, (off_t) off);
+    std::free(buf);
+    if (r != (ssize_t) kProbeLen) return 4096;  // EINVAL or anything else: stay on the strict, safe path
+    return 512;
+}
+
+}  // namespace
+
+// R13: read the blob's bytes through `direct_fd_` into `dst`.  Returns the blob length, or -1 on any
+// failure (the caller falls back to the buffered pread, so a exotic filesystem cannot break the engine).
+int64_t ArenaExpertSource::direct_read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (!direct_ok_ || direct_fd_ < 0 || dst == nullptr) return -1;
+    if (layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return -1;
+    const uint64_t off = lay.blob_offset(layer, expert);
+    if (off + len > file_map_bytes_) return -1;
+    constexpr uint64_t A = 4096;
+    const uint64_t off_al = off & ~(A - 1);
+    const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
+    uint8_t* bounce = tls_bounce((size_t) span);
+    if (bounce == nullptr) return -1;
+    if (!pread_full(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return -1;
+    std::memcpy(dst, bounce + (off - off_al), (size_t) len);
+    return (int64_t) len;
+}
+
+// R13: read `len` bytes at file offset `off` (arbitrary alignment) through `direct_fd_` into `dst`.
+//
+// R20: the alignment used to be hard-coded 4096, which forced EVERY miss through a full-size bounce buffer
+// plus a 2.18 MB memcpy: a blob's stride is 2,176,000 = 2^10 x 2125 bytes, so only 1 blob in 4 starts on a
+// 4 KiB boundary.  The device's real requirement is its 512-byte logical block size (probed at open into
+// `direct_align_`), which every blob offset (1024-aligned) and every blob length (512-aligned) already
+// satisfies - so the read now lands directly in its destination and the copy is gone.  At ~260 misses/token
+// that was ~1.1 GB/s of read+write DRAM traffic stolen from the CPU expert kernels, which are themselves
+// bandwidth-bound, plus the CPU on 10-16 reader threads.
+bool ArenaExpertSource::direct_read_span(uint64_t off, uint64_t len, uint8_t* dst) {
+    if (!direct_ok_ || direct_fd_ < 0 || dst == nullptr || len == 0) return false;
+    if (off + len > file_map_bytes_) return false;
+    const uint64_t A = direct_align_;
+    const bool dst_al = ((reinterpret_cast<uintptr_t>(dst) & (uintptr_t)(A - 1)) == 0);
+    if (((off | len) & (A - 1)) == 0 && dst_al)
+        return pread_full(direct_fd_, dst, (size_t) len, (off_t) off);   // the no-copy path
+    // Something is genuinely unaligned for this device: cover the blob with the enclosing aligned span in the
+    // bounce buffer, exactly as R13 did.  Correct on every filesystem, just slower.
+    const uint64_t off_al = off & ~(A - 1);
+    const uint64_t span = ((off + len + A - 1) & ~(A - 1)) - off_al;
+    uint8_t* bounce = tls_bounce((size_t) span);
+    if (bounce == nullptr) return false;
+    if (!pread_full(direct_fd_, bounce, (size_t) span, (off_t) off_al)) return false;
+    std::memcpy(dst, bounce + (off - off_al), (size_t) len);
+    return true;
+}
+
 // Plan v0.3 P6: the arena from the model's shard 1.  Each layer's gate, up and down tensors hold the 512 experts
 // one after another; they are read in chunks and each expert's slice lands at its place in the blob
 // [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.
@@ -657,6 +863,89 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
+    // Small-RAM machines: a native pack's experts (tens of GiB) as a file-backed mmap arena.  The first run
+    // materializes `<pack_dir>/experts-native.bin` from the GGUF shards; later runs page in lazily and the
+    // kernel page cache holds whatever fits - the same contract as FileExpertSource's mmap of experts.bin,
+    // for a pack whose blobs are not the canonical Q2_0 size.
+    if (from_gguf && file_backing_) {
+#if defined(_WIN32)
+        err = "ArenaExpertSource: file-backed native experts need the POSIX mmap path";
+        return false;
+#else
+        const std::string fb = pack_dir + "/experts-native.bin";
+        const uint64_t cap = want + (uint64_t) blob;
+        bool preexisting = false;
+        {
+            std::ifstream f(fb, std::ios::binary | std::ios::ate);
+            // a run killed mid-materialization leaves the full-size but INCOMPLETE file (ftruncate up front),
+            // so trust it only with the completion marker written after the load finished
+            if (f) {
+                std::ifstream done(fb + ".done");
+                preexisting = ((uint64_t) f.tellg() == cap) && done.good();
+            }
+        }
+        file_fd_ = ::open(fb.c_str(), O_RDWR | O_CREAT, 0644);
+        if (file_fd_ < 0) { err = "ArenaExpertSource: cannot open " + fb; return false; }
+        // R13: the O_DIRECT twin fd.  If the filesystem refuses O_DIRECT (or STRATA_NO_ODIRECT=1), every
+        // read site falls back to the buffered pread path unchanged.
+        direct_ok_ = (std::getenv("STRATA_NO_ODIRECT") == nullptr);
+        if (direct_ok_) {
+            direct_fd_ = ::open(fb.c_str(), O_RDONLY | O_DIRECT);
+            if (direct_fd_ < 0) { direct_ok_ = false; }
+            else {
+                // R20: learn the alignment this file truly needs instead of assuming 4096.
+                struct stat sb;
+                const uint64_t fb_bytes = (::fstat(direct_fd_, &sb) == 0 && sb.st_size > 0)
+                                              ? (uint64_t) sb.st_size : file_map_bytes_;
+                direct_align_ = probe_direct_alignment(direct_fd_, fb_bytes);
+            }
+        } else {
+            direct_fd_ = -1;
+        }
+        if (!preexisting && ::ftruncate(file_fd_, (off_t) cap) != 0) {
+            ::close(file_fd_); file_fd_ = -1;
+            err = "ArenaExpertSource: cannot size " + fb;
+            return false;
+        }
+        void* m = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd_, 0);
+        if (m == MAP_FAILED) {
+            ::close(file_fd_); file_fd_ = -1;
+            err = "ArenaExpertSource: mmap of " + fb + " failed (" + std::to_string(cap) + " B)";
+            return false;
+        }
+        file_map_ = m;
+        file_map_bytes_ = cap;
+        base_ = (const uint8_t*) m;
+        arena_ = nullptr;
+        pinned_bytes_ = 0;
+        slice_bytes_ = 0;
+        dev_slice_.clear();
+        note_ = "file-backed mmap " + fb +
+                (preexisting ? " (pre-existing; lazy page-in)" : " (materializing from the GGUF shards)") +
+                (direct_ok_ ? "; O_DIRECT expert reads ON" : "; O_DIRECT expert reads off");
+        LoadStats st;
+        if (preexisting) {
+            st.bytes = want;
+            st.layers = (uint64_t) n_layers;
+        } else {
+            st = load_experts_gguf(gguf_, (uint8_t*) m, lay, threads);
+        }
+        if (st.bytes != want) {
+            close();
+            err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
+            return false;
+        }
+        blobs_ = n_layers * n_expert;
+        n_expert_ = n_expert;
+        reads_ = 0;
+        gib_per_s_ = st.gib_per_second();
+        if (!preexisting) {
+            std::ofstream m(fb + ".done");
+            m << "ok";
+        }
+        return true;
+#endif
+    }
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds);
     if (!a->valid()) {
         delete a;
@@ -697,6 +986,64 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
+    if (la_started_) {
+        { std::lock_guard<std::mutex> lk(la_mu_); la_stop_ = true; }
+        la_cv_.notify_all();
+        la_io_cv_.notify_all();
+        for (auto& t : la_threads_) t.join();
+        la_threads_.clear();
+        la_started_ = false;
+        la_stop_ = false;
+    }
+    if (pf_started_) {
+        pf_stop_.store(true, std::memory_order_release);
+        pf_epoch_.fetch_add(1, std::memory_order_release);
+        for (auto& t : pf_workers_) t.join();
+        pf_workers_.clear();
+        pf_started_ = false;
+        pf_stop_.store(false, std::memory_order_release);
+    }
+    ring_.clear();
+    ring_of_.clear();
+    ring_layer_ = -1;
+    if (hot_arena_ != nullptr) {
+#if !defined(_WIN32)
+        if (hot_locked_ && hot_cap_ > 0) ::munlock(hot_arena_, (size_t) hot_cap_);
+        ::munmap(hot_arena_, (size_t) hot_cap_);
+#endif
+        hot_arena_ = nullptr;
+        hot_cap_ = hot_used_ = 0;
+        hot_count_ = 0;
+        hot_locked_ = false;
+        hot_slot_.clear();
+        dc_slot_bytes_ = 0;
+        dc_slots_ = 0;
+        dc_head_ = dc_tail_ = -1;
+        dc_prev_.clear(); dc_next_.clear(); dc_idx_.clear(); dc_epoch_.clear();
+        dc_free_.clear(); dc_admit_list_.clear();
+        dc_off_.clear(); dc_cls_.clear(); dc_cls_of_layer_.clear(); dc_freec_.clear();
+        dc_admits_ = dc_evicts_ = dc_fallbacks_ = 0;
+    }
+    if (file_map_ != nullptr) {
+#if !defined(_WIN32)
+        if (file_map_bytes_ > 0) ::munmap(file_map_, file_map_bytes_);
+#endif
+        file_map_ = nullptr;
+        file_map_bytes_ = 0;
+    }
+    if (file_fd_ >= 0) {
+#if !defined(_WIN32)
+        ::close(file_fd_);
+#endif
+        file_fd_ = -1;
+    }
+    if (direct_fd_ >= 0) {
+#if !defined(_WIN32)
+        ::close(direct_fd_);
+#endif
+        direct_fd_ = -1;
+        direct_ok_ = false;
+    }
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -707,12 +1054,38 @@ void ArenaExpertSource::close() {
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if (base_ == nullptr || layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers ||
+        expert < 0 || expert >= n_expert_)
+        return false;
+    // R9b: a TIER-RESIDENT blob's host pointer is inside the cudaHostRegistered tier - safe for async DMA.
+    // The in-flight ring blobs are NOT (their bytes land in the tier only when `wait_layer` commits), and the
+    // file mapping never is.  `blob()` answers tier residents first, so this predicate agrees with the pointer
+    // `blob()` returns for exactly the blobs that can be staged to the GPU.
+    if (file_map_ != nullptr) {
+        // R22: a blob is DMA-able when its slot's SLICE still has a live registration (the governor may have
+        // shed the slice: unregistered pages are reclaimable, and a DMA over them would read zero-fill or
+        // garbage); hot_slot_ alone is no longer the whole truth.
+        if (hot_reg_.empty() || hot_slot_.empty()) return false;
+        const int64_t idx = layer * n_expert_ + expert;
+        if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] < 0) return false;
+        // the offset is slot_id * dc_slot_bytes_; the slice id is slot_id / hot_slice_slots_
+        return hot_reg_[(size_t) ((uint64_t) hot_slot_[(size_t) idx] / (hot_slice_slots_ * dc_slot_bytes_))].load(
+            std::memory_order_acquire);
+    }
     const auto& lay = strata::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    // R9b: the registered tier's device alias (pcie-mode direct/kernel).  Only the single-slice form is
+    // wired; multi-slice leaves `hot_dev_base_` null and DMA mode (the default for native packs) instead.
+    if (file_map_ != nullptr) {
+        if (!hot_dev_ok_ || hot_dev_base_ == nullptr || hot_slot_.empty()) return nullptr;
+        if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+        const int64_t idx = layer * n_expert_ + expert;
+        if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] < 0) return nullptr;
+        return hot_dev_base_ + hot_slot_[(size_t) idx];
+    }
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
@@ -721,15 +1094,1509 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
     return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
 }
 
+// ================================ THE PINNED HOT TIER (small-RAM machines) ================================
+//
+// See the header.  Two things make this pay rather than duplicate the mapping:
+//
+//   * the tier is ANONYMOUS and `mlock`ed, so it is not a reclaim candidate.  The header above says the mapped
+//     arena loses exactly that property ("file-backed pages are the ones the OS drops from the standby list"),
+//     and measured 42.8 GB/s reading anonymous memory against ~19 GB/s through the mapping;
+//   * each blob is copied with ONE whole-blob read out of the mapping.  A 2.6 MB blob touched a 4 KiB page at a
+//     time costs ~340 us per fault on this class of drive (~45x the drive's own 3.8 ms for the whole blob).
+//
+// The order is the PROFILE's, so the tier holds the highest-frequency blobs first and what still misses is the
+// tail of the distribution.  After each range is copied its file pages are released with POSIX_FADV_DONTNEED:
+// they will never be read from the file again (this tier serves them), and on a 30 GiB box the 10-14 GiB that
+// frees is what lets the COLD expert set stay cached for prefill's full pass over it.
+void ArenaExpertSource::pin_hot(const std::vector<std::pair<int32_t, int32_t>>& ranked, uint64_t bytes) {
+    if (base_ == nullptr || file_map_ == nullptr || bytes == 0 || ranked.empty() || blobs_ <= 0 || hot_arena_ != nullptr)
+        return;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (lay.n_expert <= 0 || lay.n_layers <= 0) return;
+    // R8: the tier is dynamic (LRU with profile-seeded contents) unless the A/B arm asks for the static form.
+    dynamic_tier_ = (std::getenv("STRATA_STATIC_TIER") == nullptr);
+#if !defined(_WIN32)
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << 26)
+#endif
+    // R7: **MADV_HUGEPAGE, AND READING STRAIGHT INTO THE TIER.**  Two changes from the R5 form, both measured
+    // on the reason the tier exists:
+    //
+    //   * TLB.  The whole point of this tier is that a decode step walks ~460 two-megabyte blobs at random.
+    //     Through 4 KiB pages that is ~550,000 TLB entries of working set per window; through 2 MiB pages it is
+    //     ~460.  `MAP_HUGETLB` cannot be used - this box has 0 reserved hugepages and reserving GiB of them
+    //     would fight the kernel for the same RAM - but THP is `always` here with `defer+madvise` defrag, so
+    //     `MADV_HUGEPAGE` on the anonymous range is what actually gets the 2 MiB pages.  The mapping is sized
+    //     UP to a 2 MiB multiple and the blob starts are 256-byte aligned, so no blob straddles a boundary
+    //     that matters.
+    //   * I/O.  The R5 form memcpy'd out of the file MAPPING, so filling a 12-20 GiB tier faulted 4 KiB at a
+    //     time and left 12-20 GiB of useless page cache behind.  It now `pread`s whole blobs into the tier
+    //     directly: one syscall per blob at the drive's own rate, and nothing is left in the page cache for
+    //     the kernel to evict the hot set in favour of.
+    //
+    // R8: the arena is carved into FIXED SLOTS of the largest blob (4 KiB-rounded).  Blob sizes are uniform
+    // across this pack's layers to ~1% (measured: 5,318 disk blobs / 11.57 GB = 2.176 MB average against a
+    // 2.18 MB max), so the per-slot waste is negligible, and fixed slots make admission, eviction and the LRU
+    // O(1) array walks - no allocator, no fragmentation, and a freed slot holds any layer's next blob.
+    const uint64_t slot = ((uint64_t) lay.max_blob + 4095u) / 4096u * 4096u;
+    const uint64_t cap = bytes / slot * slot;
+    if (cap == 0) { note_ += "; hot tier skipped (bytes below one slot)"; return; }
+    void* m = ::mmap(nullptr, (size_t) cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        note_ += "; hot tier NOT allocated (mmap of " + std::to_string(cap) + " B failed)";
+        return;
+    }
+    hot_arena_ = (uint8_t*) m;
+    hot_cap_ = cap;
+    const bool huge = (::madvise(m, (size_t) cap, MADV_HUGEPAGE) == 0);
+    dc_init((int64_t) slot);
+    hot_slot_.assign((size_t) blobs_, -1);
+    // R27: **PACK THE STATIC TIER BY ACTUAL BLOB SIZE.**  The fixed-slot comment above was measured on the
+    // IQ3_XXS pack; this IQ3_S pack's blobs run 1.51-2.66 MB (mean 2.05), so 2.66 MB slots wasted ~23% of the
+    // tier.  A static tier never admits or evicts, so blobs can sit back to back (4 KiB aligned for O_DIRECT).
+    packed_ = !dynamic_tier_ && std::getenv("STRATA_NO_PACK") == nullptr;
+    uint64_t pack_off = 0;
+    // X3: HYBRID TIER - the packed static tier takes the profile minus `STRATA_LRU_GIB`, and that much becomes
+    // fixed LRU slots after it.  The decode ring reads every miss straight into an LRU slot (zero-copy admit), so
+    // a blob missed in one window is a RAM hit in the next ones: measured offline (hill/sim.py, held-out prompts)
+    // a 2 GiB LRU halves the misses per token that the static profile alone leaves.
+    uint64_t lru_bytes = 0, cap_static = cap;
+    if (packed_) {
+        const char* lg = std::getenv("STRATA_LRU_GIB");
+        if (lg != nullptr && std::atof(lg) > 0.0) {
+            lru_bytes = (uint64_t) (std::atof(lg) * 1073741824.0) / slot * slot;
+            if (lru_bytes + slot >= cap) lru_bytes = 0;
+            cap_static = cap - lru_bytes - slot;   // one slot of slack for the slot-alignment of lru_base_
+        }
+    }
+    // the CUDA registration is per ~2 GiB SLICE (see R9b below); a DMA / mapped read must never span two
+    // registrations, so a packed blob that would cross a slice boundary starts at the next slice instead
+    uint64_t pack_slice = 0;
+    if (packed_) {
+        hot_slice_slots_ = (dc_slots_ + 11) / 12;
+        pack_slice = (uint64_t) hot_slice_slots_ * dc_slot_bytes_;
+    }
+    for (const auto& pr : ranked) {
+        if (!packed_ && hot_count_ >= dc_slots_) break;   // the arena is full of whole slots
+        const int32_t l = pr.first, e = pr.second;
+        if (l < 0 || e < 0 || l >= lay.n_layers || e >= lay.n_expert) continue;
+        const int64_t idx = (int64_t) l * n_expert_ + (int64_t) e;
+        if (idx < 0 || idx >= blobs_ || hot_slot_[(size_t) idx] >= 0) continue;
+        const uint64_t len = lay.blob_bytes(l);
+        const uint64_t off = lay.blob_offset(l, e);
+        if (len == 0 || off + len > file_map_bytes_ || len > dc_slot_bytes_) break;
+        const uint64_t plen = (len + 4095u) & ~(uint64_t) 4095u;
+        if (packed_ && pack_slice > 0 && pack_off / pack_slice != (pack_off + plen - 1) / pack_slice)
+            pack_off = (pack_off / pack_slice + 1) * pack_slice;
+        if (packed_ && pack_off + plen > cap_static) break;
+        uint8_t* dst = packed_ ? hot_arena_ + pack_off : hot_arena_ + (uint64_t) hot_count_ * dc_slot_bytes_;
+        bool ok = false;
+        bool used_direct = false;
+        if (file_fd_ >= 0) {
+            // R13: O_DIRECT first; the buffered fill (with its DONTNEED page-cache drop) is the fallback.
+            used_direct = direct_read_span(off, len, dst);
+            ok = used_direct;
+            if (!ok) {
+                uint64_t done = 0;
+                ok = true;
+                while (done < len) {
+                    const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (len - done), (off_t) (off + done));
+                    if (r <= 0) { ok = false; break; }
+                    done += (uint64_t) r;
+                }
+            }
+        } else {
+            std::memcpy(dst, base_ + off, (size_t) len);
+            ok = true;
+        }
+        if (!ok) break;
+        if (packed_) {
+            hot_slot_[(size_t) idx] = (int64_t) pack_off;
+            pack_off += plen;
+            ++hot_count_;
+            continue;
+        }
+        // R8: rank order IS the initial LRU order - rank 0 at the head (evicted last), the rank cutoff at
+        // the tail, so a domain shift evicts the coldest profile blobs first.
+        const int32_t s = (int32_t) hot_count_;
+        dc_idx_[(size_t) s] = (int32_t) idx;
+        dc_epoch_[(size_t) s] = 0;
+        // R8.1: the profile seeds the frequency dimension too.  64 halves to ~1 after six untouched windows,
+        // so on a genuinely different domain the cold profile blobs DO yield - but a one-shot miss flood
+        // (count 1) can never flush them within a single request.
+        dc_count_[(size_t) s] = 64;
+        dc_prev_[(size_t) s] = dc_tail_;
+        dc_next_[(size_t) s] = -1;
+        if (dc_tail_ >= 0) dc_next_[(size_t) dc_tail_] = s; else dc_head_ = s;
+        dc_tail_ = s;
+        hot_slot_[(size_t) idx] = (int64_t) ((uint64_t) s * dc_slot_bytes_);
+        ++hot_count_;
+        // **AND GIVE THE FILE PAGES BACK.**  A `pread` of a blob leaves that blob in the page cache, so filling
+        // a 20 GiB tier would otherwise leave 20 GiB of page cache behind - for pages this tier now serves from
+        // anonymous memory and will never read from the file again.  On a 30 GiB box that page cache is the
+        // difference between a hot tier that can be grown and one that cannot.  (R13: the O_DIRECT fill leaves
+        // no cache copy, so the fadvise only runs on the buffered fallback.)
+        if (file_fd_ >= 0 && !used_direct) ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
+    }
+    if (!packed_)
+        for (int64_t s = hot_count_; s < dc_slots_; ++s) dc_free_.push_back((int32_t) s);
+    if (hot_count_ == 0) {
+        ::munmap(hot_arena_, (size_t) hot_cap_);
+        hot_arena_ = nullptr; hot_cap_ = 0; hot_slot_.clear();
+        note_ += "; hot tier empty";
+        return;
+    }
+    hot_used_ = packed_ ? pack_off : (uint64_t) hot_count_ * dc_slot_bytes_;
+    int64_t lru_slots = 0;
+    if (packed_ && lru_bytes > 0) {
+        lru_base_ = (pack_off + slot - 1) / slot * slot;
+        lru_slots = (int64_t) (lru_bytes / slot);
+        hot_used_ = lru_base_ + (uint64_t) lru_slots * slot;
+        dc_prev_.assign((size_t) lru_slots, -1);
+        dc_next_.assign((size_t) lru_slots, -1);
+        dc_idx_.assign((size_t) lru_slots, -1);
+        dc_epoch_.assign((size_t) lru_slots, 0);
+        dc_count_.assign((size_t) lru_slots, 0);
+        dc_free_.clear();
+        for (int64_t q = lru_slots - 1; q >= 0; --q) dc_free_.push_back((int32_t) q);
+        dc_head_ = dc_tail_ = -1;
+        // H1: exact-size slots, one pool per blob-size class, equal slot count per layer (offline: matches a
+        // traffic-weighted split, and needs no data).  Slots never straddle a CUDA registration slice.
+        if (std::getenv("STRATA_LRU_EXACT") != nullptr) {
+            std::vector<uint64_t> plen((size_t) lay.n_layers), sizes;
+            for (int64_t l = 0; l < lay.n_layers; ++l) {
+                plen[(size_t) l] = ((uint64_t) lay.blob_bytes(l) + 4095u) & ~(uint64_t) 4095u;
+                if (std::find(sizes.begin(), sizes.end(), plen[(size_t) l]) == sizes.end()) sizes.push_back(plen[(size_t) l]);
+            }
+            uint64_t sum = 0;
+            for (const uint64_t p : plen) sum += p;
+            const uint64_t region = cap - lru_base_;
+            const uint64_t slack = pack_slice > 0 ? (region / pack_slice + 2) * slot : slot;
+            const int64_t per_layer = region > slack && sum > 0 ? (int64_t) ((region - slack) / sum) : 0;
+            dc_cls_of_layer_.assign((size_t) lay.n_layers, 0);
+            for (int64_t l = 0; l < lay.n_layers; ++l)
+                dc_cls_of_layer_[(size_t) l] = (uint8_t) (std::find(sizes.begin(), sizes.end(), plen[(size_t) l]) - sizes.begin());
+            dc_freec_.assign(sizes.size(), {});
+            dc_off_.clear(); dc_cls_.clear();
+            uint64_t at = lru_base_;
+            for (int64_t j = 0; j < per_layer; ++j) {
+                for (int64_t l = 0; l < lay.n_layers; ++l) {
+                    const uint64_t p = plen[(size_t) l];
+                    if (pack_slice > 0 && at / pack_slice != (at + p - 1) / pack_slice) at = (at / pack_slice + 1) * pack_slice;
+                    if (at + p > cap) break;
+                    dc_off_.push_back(at);
+                    dc_cls_.push_back(dc_cls_of_layer_[(size_t) l]);
+                    at += p;
+                }
+            }
+            lru_slots = (int64_t) dc_off_.size();
+            hot_used_ = at;
+            dc_prev_.assign((size_t) lru_slots, -1);
+            dc_next_.assign((size_t) lru_slots, -1);
+            dc_idx_.assign((size_t) lru_slots, -1);
+            dc_epoch_.assign((size_t) lru_slots, 0);
+            dc_count_.assign((size_t) lru_slots, 0);
+            dc_free_.clear();
+            for (int64_t q = lru_slots - 1; q >= 0; --q) dc_freec_[dc_cls_[(size_t) q]].push_back((int32_t) q);
+            // H2: SEED the LRU with the profile's next-ranked blobs (count 0: the first real traffic evicts them
+            // before anything it has re-used), so a mostly-LRU tier does not start cold.
+            if (std::getenv("STRATA_LRU_NOSEED") == nullptr && file_fd_ >= 0) {
+                int64_t seeded = 0;
+                for (const auto& pr : ranked) {
+                    const int32_t l = pr.first, e = pr.second;
+                    if (l < 0 || e < 0 || l >= lay.n_layers || e >= lay.n_expert) continue;
+                    const int64_t idx = (int64_t) l * n_expert_ + (int64_t) e;
+                    if (hot_slot_[(size_t) idx] >= 0) continue;
+                    auto& fr = dc_freec_[dc_cls_of_layer_[(size_t) l]];
+                    if (fr.empty()) continue;
+                    const int32_t s = fr.back();
+                    const uint64_t len = lay.blob_bytes(l), off = lay.blob_offset(l, e);
+                    if (!direct_read_span(off, len, hot_arena_ + dc_off_[(size_t) s])) break;
+                    fr.pop_back();
+                    dc_idx_[(size_t) s] = (int32_t) idx;
+                    dc_epoch_[(size_t) s] = 0;
+                    dc_count_[(size_t) s] = 0;
+                    // rank order: earlier (hotter) seeds nearer the head
+                    dc_prev_[(size_t) s] = dc_tail_;
+                    dc_next_[(size_t) s] = -1;
+                    if (dc_tail_ >= 0) dc_next_[(size_t) dc_tail_] = s; else dc_head_ = s;
+                    dc_tail_ = s;
+                    hot_slot_[(size_t) idx] = (int64_t) dc_off_[(size_t) s];
+                    ++seeded;
+                }
+                std::fprintf(stderr, "strata: H2 seeded %lld LRU slots from the profile\n", (long long) seeded);
+            }
+            std::fprintf(stderr, "strata: H1 exact LRU: %lld slots in %zu size classes (%lld per layer), %.2f GiB\n",
+                         (long long) lru_slots, sizes.size(), (long long) per_layer,
+                         (double) (at - lru_base_) / 1073741824.0);
+        }
+    }
+    // R8: lock AFTER the fill (the R7 order this kernel accepts).  Locking the untouched mapping BEFORE
+    // filling fails with ENOMEM here (22 GiB of THP prefault under fragmentation) and the failure mode is
+    // catastrophic: the tier runs reclaimable and the kernel evicts hot-tier pages mid-generation.  mlock()
+    // sets VM_LOCKED on the whole VMA, so pages faulted LATER by an LRU admission inside the range are
+    // locked too - admissions need nothing extra.
+    hot_locked_ = (::mlock(hot_arena_, (size_t) hot_cap_) == 0);
+    if (!dynamic_tier_ && hot_used_ < hot_cap_) {   // static A/B: the free tail has no future, give it back
+        ::munmap(hot_arena_ + hot_used_, (size_t) (hot_cap_ - hot_used_));
+        hot_cap_ = hot_used_;
+        dc_slots_ = packed_ ? (int64_t) ((hot_used_ + dc_slot_bytes_ - 1) / dc_slot_bytes_) : (int64_t) hot_count_;
+    }
+    if (!dynamic_tier_) hot_locked_ = (::mlock(hot_arena_, (size_t) hot_used_) == 0);
+    // ---- R9b: REGISTER THE TIER WITH CUDA so the GPU's PCIe expert path can read it.
+    //
+    // With `--mmap-experts` the arena is a plain file mmap: `pinned_bytes_` is 0, `dev_slice_` empty, so the
+    // verify plan builder's `pinned()`/`device_alias()` gates were permanently closed and EVERY routed expert
+    // was computed on the CPU pool - measured ~330 ms of serial pool work per verify window on this box, which
+    // is the decode wall all by itself.  The tier is anonymous, mlocked and 2 MiB-page-backed - exactly what
+    // `cudaHostRegister` wants - and tier-resident blobs are 97%+ of routed traffic, so registering it turns
+    // `fetch_dma` (default --pcie-mode auto -> DMA for native packs, --pcie-frac 0.55) back on: the copy
+    // engine moves the layer's PCIe share into VRAM staging beside the CPU's own work and the grouped kernel
+    // computes it on the GPU.
+    //
+    // R22: **REGISTER IN SLICES, NOT ONE WHOLE RANGE.**  Registering pins the pages (unswappable), which is
+    // exactly the over-subscription that kills a long-horizon box at deep context (the 24 GiB tier + KV pools
+    // + desktop left no headroom: zram collapse, then cublasCreate died inside the driver - 2026-10-04/05
+    // twice).  Slices of whole slots (12 per 24 GiB tier, ~2 GiB) get their own registration so the pressure
+    // governor (`shed_pressure`) can UNREGISTER the cold-end slices first, drop their pages and put their
+    // slots back on the free list: the tier SHRINKS under pressure and refills when it passes, instead of
+    // being pinned until the OOM.  Only the direct/kernel alias form (a single whole-range `hot_dev_base_`,
+    // pcie-mode direct) is lost - the served mode is DMA (auto -> DMA for native packs), which needs only
+    // `pinned()` per blob, and slice-shaped registrations can no longer hand out a single alias pointer.
+    if (hot_locked_ && hot_arena_ != nullptr && hot_cap_ > 0 && file_map_ != nullptr) {
+        auto reg = [&](uint8_t* p, uint64_t n) {
+            return cudaHostRegister(p, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        };
+        const int64_t ideal_slices = 12;
+        if (!packed_) hot_slice_slots_ = (dc_slots_ + ideal_slices - 1) / ideal_slices;   // whole slots per ~2 GiB slice
+        const int64_t nslice = (dc_slots_ + hot_slice_slots_ - 1) / hot_slice_slots_;
+        hot_reg_ = std::vector<std::atomic<bool>>((size_t) nslice);   // each slice's flag starts false
+        hot_dev_ok_ = true;
+        hot_dev_base_ = nullptr;
+        for (int64_t i = 0; i < nslice; ++i) {
+            const int64_t s0 = i * hot_slice_slots_;
+            const uint64_t off = (uint64_t) s0 * dc_slot_bytes_;
+            const uint64_t n = std::min((uint64_t) hot_slice_slots_ * dc_slot_bytes_, hot_cap_ - off);
+            if (reg(hot_arena_ + off, n) == cudaSuccess) {
+                hot_reg_[(size_t) i].store(true, std::memory_order_relaxed);
+            } else {
+                (void) cudaGetLastError();   // a slice that cannot register loses DMA for its blobs only:
+                                             // pinned() gates per slice, and the pool computes them instead
+            }
+        }
+    }
+#endif
+    if (packed_) dc_slots_ = lru_slots;   // R27: packed = no slots; X3: except the hybrid's LRU slots
+    char buf[420];
+    std::snprintf(buf, sizeof buf,
+                  "; hot tier %.2f GiB in %lld blobs from the profile%s%s (THP %s, slot %.2f MiB, %lld slots, %lld free)",
+                  (double) hot_used_ / 1073741824.0, (long long) hot_count_,
+                  hot_locked_ ? " (mlocked)" : " (mlock FAILED - reclaimable)",
+                  dynamic_tier_ ? ", LRU adaptive" : ", static", huge ? "on" : "off",
+                  (double) dc_slot_bytes_ / 1048576.0, (long long) dc_slots_,
+                  (long long) dc_free_.size());
+    note_ += buf;
+    if (file_map_ != nullptr)
+        note_ += hot_dev_ok_ ? (hot_dev_base_ ? "; tier cudaHostRegistered+device-alias (GPU PCIe expert path ON)"
+                                              : "; tier cudaHostRegistered sliced (GPU PCIe DMA path ON)")
+                             : "; tier NOT registered (GPU PCIe expert path off)";
+}
+
+// ---- R8: the adaptive LRU tier ---------------------------------------------------------------------------
+
+// R22: THE PRESSURE GOVERNOR'S SHED.  See the header.  Called from the serve loop's line handler between
+// requests, so no decode window is active and no reads are in flight; the epoch guard still refuses a slice
+// whose slots were touched or admitted this window (a late commit or a stray caller would otherwise see
+// zero-fill memory where its bytes used to be).
+//
+// R22b AUDIT: the shed order is SCORE-BASED, not positional.  The "arena END = the coldest" assumption only
+// holds for a FRESH tier: the decode-side LRU (dc_alloc runs from begin_layer even in the static tier)
+// recycles slot CONTENT over a long session, so the tail slices hold an arbitrary mix and a positional shed
+// could drop the session's actual working set - the exact speed cliff this feature was built to avoid.  Each
+// slice is scored by its slots' frequency counts plus a freshness bonus for anything touched this or the
+// previous window (decode patterns repeat windows: `win_repeat`), and the coldest scored slice is shed
+// first.  Ties break toward the arena's end (old profile placements).
+uint64_t ArenaExpertSource::shed_pressure(uint64_t bytes_to_free) {
+    if (lru_base_ > 0) return 0;   // X3: the hybrid tier is sized up front; slices mix packed and LRU bytes
+    if (packed_) return 0;
+    if (hot_arena_ == nullptr || hot_slot_.empty() || dc_slot_bytes_ == 0 || hot_slice_slots_ <= 0) return 0;
+    const int64_t nslice = (int64_t) hot_reg_.size();
+    if (nslice <= 1) return 0;                      // never shed the tier's single (hottest) slice
+    uint64_t freed = 0;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    std::vector<int64_t> eligible_present;
+    eligible_present.clear();
+    // eligible = slices with a live registration whose slots are not part of this window's traffic
+    for (int64_t i = nslice - 1; i > 0; --i) {
+        if (!hot_reg_[(size_t) i].load(std::memory_order_relaxed)) continue;
+        const int64_t s0 = i * hot_slice_slots_;
+        bool safe = true;
+        for (int64_t s = s0; s < dc_slots_ && s < s0 + hot_slice_slots_; ++s) {
+            if (dc_idx_[(size_t) s] < 0) continue;
+            const uint32_t e = dc_epoch_[(size_t) s];
+            if (e == window_epoch_ || (e > 0 && e == window_epoch_ - 1)) { safe = false; break; }
+        }
+        if (safe) eligible_present.push_back(i);
+    }
+    while (freed < bytes_to_free && !eligible_present.empty()) {
+        // score every eligible slice: the sum of its slots' frequency credits (a 0-count slot counts 1 -
+        // never cheaper than a warm slot, since the profile placements under it have rank value), then pick
+        // the lowest score; ties break toward the higher index (the old profile tail).  Freshness is folded
+        // into eligibility above; nothing can move under dc_mu_ while we score, but the entry is re-checked
+        // by exactly the same read that built the eligibility list.
+        int64_t best_i = -1;
+        uint64_t best_score = ~0ull;
+        for (const int64_t i : eligible_present) {
+            const int64_t s0 = i * hot_slice_slots_;
+            uint64_t score = 0;
+            for (int64_t s = s0; s < dc_slots_ && s < s0 + hot_slice_slots_; ++s)
+                score += dc_count_[(size_t) s] ? (uint64_t) dc_count_[(size_t) s] : 1ull;
+            if (score < best_score || (score == best_score && i > best_i)) { best_score = score; best_i = i; }
+        }
+        if (best_i < 0) break;
+        {
+            const int64_t s0 = best_i * hot_slice_slots_;
+            const uint64_t off = (uint64_t) s0 * dc_slot_bytes_;
+            const uint64_t n = std::min((uint64_t) hot_slice_slots_ * dc_slot_bytes_, hot_cap_ - off);
+            if (n == 0) break;
+            cudaHostUnregister(hot_arena_ + off);            // the pointer must match the registration's own
+            (void) cudaGetLastError();
+            ::munlock(hot_arena_ + off, (size_t) n);        // the whole-arena mlock splits per range at munlock
+            (void) ::madvise(hot_arena_ + off, (size_t) n, MADV_DONTNEED);   // drop the pages: the RAM is given back
+            hot_reg_[(size_t) best_i].store(false, std::memory_order_release);
+            for (int64_t s = s0; s < dc_slots_ && s < s0 + hot_slice_slots_; ++s) {
+                const int64_t vi = dc_idx_[(size_t) s];
+                if (vi < 0) continue;          // already free: pushing it again would double-allocate it
+                if (vi < (int64_t) hot_slot_.size()) {
+                    hot_slot_[(size_t) vi] = -1;
+                    dc_unlink((int32_t) s);
+                }
+                dc_idx_[(size_t) s] = -1;
+                dc_count_[(size_t) s] = 0;
+                dc_epoch_[(size_t) s] = 0;
+                dc_free_.push_back((int32_t) s);
+            }
+            hot_shed_ += n;
+            freed += n;
+        }
+        {   // drop the winner from the eligible list; unregistered slices cannot be re-scored
+            std::vector<int64_t> keep;
+            keep.reserve(eligible_present.size());
+            for (const int64_t i : eligible_present) if (i != best_i) keep.push_back(i);
+            eligible_present.swap(keep);
+        }
+    }
+    return freed;
+}
+
+// R22b: THE GOVERNOR'S REGROW.  See the header.  The server sends `REGROW <bytes>` only when ITS reading of
+// MemAvailable is comfortably above the floor (>= floor + 2.5 GiB), which together with this precheck
+// (MemAvailable >= slice + 1024 MiB) gives the regrow a double hysteresis: the tier can never regrow into
+// the pressure that made it shed.
+uint64_t ArenaExpertSource::regrow_pressure(uint64_t bytes) {
+    if (lru_base_ > 0) return 0;
+    if (packed_) return 0;
+    if (hot_arena_ == nullptr || hot_reg_.empty() || dc_slot_bytes_ == 0 || hot_slice_slots_ <= 0) return 0;
+    const int64_t nslice = (int64_t) hot_reg_.size();
+    int64_t target = -1;
+    for (int64_t i = nslice - 1; i > 0; --i) {      // the arena's END slices first: the LIFO free list pops the
+        if (!hot_reg_[(size_t) i].load(std::memory_order_relaxed)) { target = i; break; }   // high slots first
+    }
+    if (target < 0) return 0;                       // nothing is shed; no regrow needed
+    const int64_t s0 = target * hot_slice_slots_;
+    const uint64_t off = (uint64_t) s0 * dc_slot_bytes_;
+    const uint64_t n = std::min((uint64_t) hot_slice_slots_ * dc_slot_bytes_, hot_cap_ - off);
+    if (n == 0) return 0;
+    if (bytes > 0 && n > bytes) return 0;           // the caller budgets per call; one slice at a time
+    const uint64_t avail = strata::platform::host_available_bytes();
+    if (avail < n + ((uint64_t) 1024 << 20)) return 0;   // the regrow faults the whole slice back at once
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    if (cudaHostRegister(hot_arena_ + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped)
+        != cudaSuccess) {
+        (void) cudaGetLastError();     // refuse the regrow rather than half-pinning: the next cycle retries
+        return 0;
+    }
+    ::mlock(hot_arena_ + off, (size_t) n);             // VM_LOCKED splits per range, as it did at pin_hot
+    hot_reg_[(size_t) target].store(true, std::memory_order_release);
+    hot_shed_ = hot_shed_ > n ? hot_shed_ - n : 0;
+    return n;
+}
+
+void ArenaExpertSource::dc_init(int64_t slot_bytes) {
+    dc_slot_bytes_ = (uint64_t) slot_bytes;
+    dc_slots_ = hot_cap_ > 0 ? (int64_t) (hot_cap_ / dc_slot_bytes_) : 0;
+    dc_prev_.assign((size_t) dc_slots_, -1);
+    dc_next_.assign((size_t) dc_slots_, -1);
+    dc_idx_.assign((size_t) dc_slots_, -1);
+    dc_epoch_.assign((size_t) dc_slots_, 0);
+    dc_count_.assign((size_t) dc_slots_, 0);
+    dc_free_.clear();
+    dc_head_ = dc_tail_ = -1;
+    dc_admit_list_.clear();
+    dc_admits_ = dc_evicts_ = dc_fallbacks_ = 0;
+}
+
+void ArenaExpertSource::dc_unlink(int32_t s) {
+    // R22: a slot in `dc_free_` is DETACHED (prev = next = -1, head != s): touching the -1 sentinels here used
+    // to set head = tail = -1 and silently collapse the LRU to one slot (the double-unlink bug the alloc
+    // comment warns about).  Shed slots join the free list, so allocations from it now hit this path: detached
+    // nodes are skipped, the list stays intact.
+    const int32_t p = dc_prev_[(size_t) s], n = dc_next_[(size_t) s];
+    if (p < 0 && n < 0 && dc_head_ != (int32_t) s) return;
+    if (p >= 0) dc_next_[(size_t) p] = n; else dc_head_ = n;
+    if (n >= 0) dc_prev_[(size_t) n] = p; else dc_tail_ = p;
+    dc_prev_[(size_t) s] = dc_next_[(size_t) s] = -1;
+}
+
+void ArenaExpertSource::dc_link_head(int32_t s) {
+    dc_prev_[(size_t) s] = -1;
+    dc_next_[(size_t) s] = dc_head_;
+    if (dc_head_ >= 0) dc_prev_[(size_t) dc_head_] = s;
+    dc_head_ = s;
+    if (dc_tail_ < 0) dc_tail_ = s;
+}
+
+void ArenaExpertSource::dc_touch(int32_t s) {
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    dc_touch_locked(s);
+}
+
+void ArenaExpertSource::dc_touch_locked(int32_t s) {
+    if (s < 0 || s >= (int32_t) dc_slots_) return;
+    if (dc_head_ != s) {
+        dc_unlink(s);
+        dc_link_head(s);
+    }
+    dc_epoch_[(size_t) s] = window_epoch_;
+    // R8.1: frequency.  A one-shot miss (a diverse generation's novel expert) stays cheap to evict; a blob
+    // the workload keeps re-referencing gets expensive to evict.  Capped so a long-lived favourite cannot
+    // become untouchable.
+    if (dc_count_[(size_t) s] < 4095) ++dc_count_[(size_t) s];
+}
+
+int32_t ArenaExpertSource::dc_alloc(int64_t idx) {
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    return dc_alloc_locked(idx);
+}
+
+int32_t ArenaExpertSource::dc_alloc_locked(int64_t idx) {
+    int32_t s;
+    if (!dc_off_.empty()) {
+        // H1: exact mode - the blob's own size class only
+        const int64_t l = idx / n_expert_;
+        if (l < 0 || l >= (int64_t) dc_cls_of_layer_.size()) return -1;
+        const uint8_t c = dc_cls_of_layer_[(size_t) l];
+        auto& fr = dc_freec_[c];
+        if (!fr.empty()) {
+            s = fr.back();
+            fr.pop_back();
+        } else {
+            int32_t best = -1;
+            uint16_t best_count = 0xffff;
+            int32_t v = dc_tail_;
+            for (int scanned = 0, walked = 0; v >= 0 && scanned < 512 && walked < 16384; ++walked, v = dc_prev_[(size_t) v]) {
+                if (dc_cls_[(size_t) v] != c) continue;
+                ++scanned;
+                if (dc_epoch_[(size_t) v] == window_epoch_) continue;
+                const uint16_t cnt = dc_count_[(size_t) v];
+                if (cnt < best_count) { best_count = cnt; best = v; if (cnt == 0) break; }
+            }
+            if (best < 0) return -1;
+            s = best;
+            const int64_t vidx = dc_idx_[(size_t) s];
+            if (vidx >= 0 && vidx < (int64_t) hot_slot_.size()) hot_slot_[(size_t) vidx] = -1;
+            ++dc_evicts_;
+        }
+        dc_idx_[(size_t) s] = (int32_t) idx;
+        dc_touch_locked(s);
+        dc_count_[(size_t) s] = 1;
+        return s;
+    }
+    if (!dc_free_.empty()) {
+        s = dc_free_.back();
+        dc_free_.pop_back();
+    } else {
+        // R8.1: EVICT BY FREQUENCY, WITH LRU AS THE TIE-BREAK.  The pure-LRU form thrashes on a diverse
+        // long generation: every miss is a one-shot (measured: 9,754 misses, 0% window-to-window repeat),
+        // so the flood admitted and evicted 15,914 blobs in one request and decode fell to 7.6 tok/s while
+        // the resident profile content - which WOULD have been hit - was flushed.  The victim is now the
+        // lowest-hit-count slot within a bounded walk from the LRU tail (LRU position breaks ties), so a
+        // one-shot flood recycles among itself and never pushes out content the workload actually re-uses.
+        s = -1;
+        int32_t best = -1;
+        uint16_t best_count = 0xffff;
+        int32_t v = dc_tail_;
+        for (int scanned = 0; v >= 0 && scanned < 512; ++scanned, v = dc_prev_[(size_t) v]) {
+            if (dc_epoch_[(size_t) v] == window_epoch_) continue;   // this window's own bytes
+            const uint16_t c = dc_count_[(size_t) v];
+            if (c < best_count) { best_count = c; best = v; if (c == 0) break; }
+        }
+        if (best < 0) return -1;   // every slot is in use by this window: fall back to the legacy ring
+        s = best;
+        const int64_t vidx = dc_idx_[(size_t) s];
+        if (vidx >= 0 && vidx < (int64_t) hot_slot_.size()) hot_slot_[(size_t) vidx] = -1;
+        ++dc_evicts_;
+        // NO explicit unlink here: `dc_touch_locked` below unlinks the victim (it is still in the list) and
+        // relinks it at the head.  Unlinking twice corrupts the intrusive list - the second unlink reads the
+        // -1 sentinels and sets head = tail = -1, which silently collapses the LRU to one slot and every
+        // later allocation evicts nothing (measured: 394 admissions against 16,671 ring fallbacks).
+    }
+    dc_idx_[(size_t) s] = (int32_t) idx;
+    dc_touch_locked(s);
+    dc_count_[(size_t) s] = 1;   // admitted: one shot of credit until the workload proves otherwise
+    return s;
+}
+
+// R8b: **PREFILL ADMISSIONS.**  See the header.  `bytes` are the staging buffer's landed copy of
+// `(layer, expert)`; a resident blob just gets its frequency touch, a miss takes a slot (evicting the
+// lowest-value victim) and memcpy's in.  Called from prefill's consume step, host thread, serialized against
+// the decode path - but NOT against prefill's own reader threads touching resident blobs, hence the lock.
+bool ArenaExpertSource::dc_stage_admit(int64_t layer, int64_t expert, const uint8_t* bytes) {
+    if (dc_slots_ <= 0 || hot_slot_.empty() || bytes == nullptr) return false;
+    if (layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return false;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0 || len > dc_slot_bytes_) return false;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    // R22: THE STATIC TIER REFILLS THE GOVERNOR'S SHED.  A static tier (STRATA_STATIC_TIER) used to refuse
+    // every runtime admission; that is still the case while all its slots are home - but after
+    // `shed_pressure` frees slots for the host's RAM, the prefill staging is exactly the path that can put
+    // the prompt's own working set back, so a static tier admits INTO THE FREE LIST only.  The check sits
+    // INSIDE the tier lock on purpose: a reader that raced the empty-check past the lock could otherwise
+    // fall into dc_alloc_locked's EVICT path (path B) and flush profile content - the one thing a static
+    // tier must never do.  The R10 flood rules (count = 0) cap it: a shed tier cannot be refilled past
+    // its own freed size.
+    if (!dynamic_tier_ && !dc_any_free()) return false;
+    if (hot_slot_[(size_t) idx] >= 0) {          // resident: this prompt's evidence of reuse
+        { const int32_t ts = slot_of_off(hot_slot_[(size_t) idx]); if (ts >= 0) dc_touch_locked(ts); }
+        return true;
+    }
+    const int32_t s = dc_alloc_locked(idx);
+    if (s < 0) return false;
+    std::memcpy(hot_arena_ + slot_off(s), bytes, (size_t) len);
+    hot_slot_[(size_t) idx] = (int64_t) slot_off(s);
+    // R10: prefill admissions enter with ZERO credit, not one.  A big prompt's sweep admits ~24k blobs
+    // against ~11.6k slots; with count=1 the flood tied the untouched profile blobs and the LRU
+    // tie-break evicted the PROFILE side (it is always older), so the decode after a prefill lost its
+    // hot set (measured: multi-topic median 7.4 tok/s with the flood, 8.4 with admissions off).  With
+    // count=0 the flood recycles among itself unless a later touch proves the blob hot - the same
+    // rule the decode ring earns its count=1 credit by.
+    dc_count_[(size_t) s] = 0;
+    ++dc_stage_admits_;
+    return true;
+}
+
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr) return nullptr;
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
     ++reads_;
-    // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
-    // this class over `FileExpertSource`.
+    ++blob_stats_.requests;
+    // R8: the hot tier is checked FIRST.  An admission is committed here in `wait_layer`, before the pass-1
+    // `blob()` calls run - and a committed blob must NOT fall through to the ring check, because its ring
+    // slot (when it has one at all) is the legacy staging buffer, not the memory its bytes were read into.
+    if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+        ++hot_lookups_;
+        ++hot_hits_;
+        ++blob_stats_.hot;
+        if (dc_slots_ > 0 && !ex_on_) { const int32_t ts = slot_of_off(hot_slot_[(size_t) idx]); if (ts >= 0) dc_touch(ts); }   // E1: begin_layer touched it
+        return hot_arena_ + hot_slot_[(size_t) idx];
+    }
+    // R5-fetch: the ring serves THIS layer's pread misses (see begin_layer); `ring_layer_` pins the validity
+    // to the layer the reads were issued for, so a later `blob()` (the profile fill, prefill's staging) can
+    // never see a previous layer's bytes.
+    if (ex_on_ && (size_t) idx < ej_of_.size() && ej_of_[(size_t) idx] >= 0) return nullptr;   // E1: still landing
+    if (layer == ring_layer_ && (int64_t) ring_of_.size() == blobs_ && ring_of_[(size_t) idx] >= 0) {
+        ++blob_stats_.ring;
+        const int64_t r = ring_of_[(size_t) idx];
+        if (r == kExPend) return nullptr;                                         // E1: not landed yet
+        if (r >= kRingSlots) return la_buf_[(size_t) (r - kRingSlots)].data();   // R27 lookahead slot
+        return ring_[(size_t) r].data();
+    }
+    // R7: the fall-through is a fault on the file mapping.  If the page is in the page cache it is a DRAM read;
+    // if not, the kernel goes to the drive for it, 4 KiB at a time.  This is the path the R5 pread ring exists
+    // to avoid, and counting it is how a run says whether it avoided it.
+    ++blob_stats_.map;
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 
+ArenaExpertSource::BlobStats ArenaExpertSource::take_blob_stats() {
+    BlobStats s = blob_stats_;
+    blob_stats_ = BlobStats{};
+    return s;
+}
+
+// R8: the stats-free core of `read_blob`, safe to call from several staging readers at once.  A tier-resident
+// blob memcpy's out of the locked arena (read-only); anything else is one whole-blob `pread` out of the file.
+int64_t ArenaExpertSource::read_blob_raw(int64_t layer, int64_t expert, void* dst) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return -1;
+    {   // R8b: the lookup, the copy and the touch hold `dc_mu_` TOGETHER, because the host thread's
+        // `dc_stage_admit` can evict this slot between the lookup and the copy - a memcpy out of a freed
+        // slot would hand the staging buffer torn bytes that reach the GPU as a plausible, wrong expert.
+        std::lock_guard<std::mutex> lk(dc_mu_);
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+            std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
+            { const int32_t ts = slot_of_off(hot_slot_[(size_t) idx]); if (ts >= 0) dc_touch_locked(ts); }
+            return (int64_t) len;
+        }
+    }
+    if (file_fd_ < 0 || file_map_ == nullptr) return -1;
+    const uint64_t off = lay.blob_offset(layer, expert);
+    if (off + len > file_map_bytes_) return -1;
+    // R13: O_DIRECT first (no page-cache alloc/copy/DONTNEED); buffered pread is the fallback arm.
+    if (direct_read_span(off, len, (uint8_t*) dst)) return (int64_t) len;
+    uint8_t* p = (uint8_t*) dst;
+    uint64_t done = 0;
+    while (done < len) {
+        const ssize_t r = ::pread(file_fd_, p + done, (size_t) (len - done), (off_t) (off + done));
+        if (r <= 0) return -1;
+        done += (uint64_t) r;
+    }
+    // R8.2: same page-cache argument as the ring reader - the staging buffer holds the bytes, the cache
+    // copy only fuels reclaim churn (see pf_worker).
+    ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
+    return (int64_t) len;
+}
+
+// R5-fetch: read one whole blob into `dst`.  The hot tier memcpy's out of the locked arena; the file-backed
+// arena issues ONE sequential `pread`, which the drive serves at its full rate - against ~340 us of latency
+// per 4 KiB page fault when the pool walks the mapping instead (see `pin_hot`'s comment for the measurement).
+int64_t ArenaExpertSource::read_blob(int64_t layer, int64_t expert, void* dst) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return -1;
+    if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+        std::memcpy(dst, hot_arena_ + hot_slot_[(size_t) idx], (size_t) len);
+        ++prefetched_;
+        return (int64_t) len;
+    }
+    const int64_t r = read_blob_raw(layer, expert, dst);
+    if (r < 0) return -1;
+    ++prefetched_;
+    ++blob_stats_.disk;
+    blob_stats_.disk_bytes += (int64_t) len;
+    return r;
+}
+
+// R5-fetch: the persistent reader threads.  The protocol is ExpertPool's (pool.cpp): a worker counts itself
+// parked BEFORE its first wait so the host's publish below can never outrun a thread that is still leaving
+// the previous batch's claim loop - a stolen or double-claimed job would make `pf_done_` overshoot the batch
+// size and the host would wait forever.  R5b: the park is a BLOCKING condvar wait, not a spin - the readers
+// idle most of each layer (the pool computes), and spinning threads on the SMT siblings measurably slow the
+// compute workers down.
+void ArenaExpertSource::pf_worker() {
+    uint32_t seen = 0;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(pf_mu_);
+            pf_parked_.fetch_add(1, std::memory_order_acq_rel);   // arrive at the park before the first wait
+            pf_cv_.wait(lk, [&] { return pf_epoch_.load(std::memory_order_acquire) != seen ||
+                                         pf_stop_.load(std::memory_order_relaxed); });
+            pf_parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
+        }
+        if (pf_stop_.load(std::memory_order_acquire)) return;
+        seen = pf_epoch_.load(std::memory_order_relaxed);
+        for (;;) {
+            const uint32_t i = pf_head_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= pf_njobs_.load(std::memory_order_acquire)) break;
+            const PfJob& j = pf_jobs_[(size_t) i];
+            // R13: the direct path first; the buffered pread + DONTNEED stays as the fallback arm.
+            bool ok = direct_read_span(j.off, j.len, j.dst);
+            if (!ok) {
+                uint64_t done = 0;
+                ok = true;
+                while (done < j.len) {
+                    const ssize_t r = ::pread(file_fd_, j.dst + done, (size_t) (j.len - done), (off_t) (j.off + done));
+                    if (r <= 0) { ok = false; break; }
+                    done += (uint64_t) r;
+                }
+                if (ok)
+                    // R8.2: **DROP THE PAGE-CACHE COPY IMMEDIATELY.**  A whole-blob `pread` leaves ~530 cached pages
+                    // behind, and on a 30 GiB box that already runs a 22 GiB mlocked tier there is no cache left to
+                    // hold them: the kernel allocates, clears, copies and then RECLAIMS every page of every miss.
+                    // perf during a diverse 300-token generation measured ~39% of the engine's CPU inside kernel
+                    // page-management on exactly this cycle.  The bytes the ring needed are in the ring; the cache
+                    // copy serves nobody (decode re-uses go through the LRU tier, prefill staging re-reads nothing).
+                    ::posix_fadvise(file_fd_, (off_t) j.off, (off_t) j.len, POSIX_FADV_DONTNEED);
+            }
+            pf_done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+}
+
+// R5-fetch.  Called with a layer's routing ids before the pool sets up its jobs.  The misses of the layer
+// (what neither the hot tier nor a previous read can answer) are read WHOLE into the ring with `pf_workers_`
+// concurrent preads - the drive streams them back-to-back at its sequential rate while the host finishes
+// dispatching, instead of the drain faulting 4 KiB at a time and waiting on each page.  The ring is one
+// layer deep: the dispatch contract has the pool block until this layer's drain is done, so the slots are
+// free the next time this runs.  Blobs beyond the ring (more unique misses than slots - not reachable with
+// this model's k=10 (+shared) and MAXT=4, but never say never) fall back to one WILLNEED each.
+void ArenaExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
+    if (base_ == nullptr || ids == nullptr || k <= 0) return;
+    if (layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers) return;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if ((int64_t) pf_seen_.size() != n_expert_) pf_seen_.assign((size_t) n_expert_, 0);
+    else std::fill(pf_seen_.begin(), pf_seen_.end(), (uint8_t) 0);
+    if (!pf_started_ && file_fd_ >= 0 && file_map_ != nullptr) {
+        // R7: the predictor is on by default; `STRATA_NO_PREDICT=1` is the A/B arm.
+        // R8: off by default (see pf_window_start); STRATA_PREDICT=1 turns it back on.
+        prefetch_predict_ = (std::getenv("STRATA_PREDICT") != nullptr);
+        ring_.assign(kRingSlots, {});
+        for (auto& r : ring_) r.resize((size_t) lay.max_blob + 512);
+        ring_of_.assign((size_t) blobs_, -1);
+        pf_jobs_.resize((size_t) kRingSlots * (size_t) kMaxChunks);
+        for (int i = 0; i < 10; ++i) pf_workers_.emplace_back([this] { pf_worker(); });
+        pf_started_ = true;
+        ex_on_ = std::getenv("STRATA_EARLY") != nullptr && dc_slots_ > 0 && direct_ok_;
+    }
+    if (!pf_started_) {
+        // resident arena or no file: nothing to fetch, but keep the dedupe+stats behaviour
+        return;
+    }
+    if (ex_on_) { ex_begin_layer(layer, ids, k); return; }   // E1
+    // R7: a new pass starts at layer 0, and the previous pass's ring is not valid any more.  Without this the
+    // `layer == ring_layer_` gate in `blob()` would serve a stale blob to anything that asks for the last
+    // decode layer's index (the prefill suffix of a KEEP request is the caller that can reach it).
+    if (layer == 0) {
+        ring_layer_ = -1;
+        pf_window_start();
+        la_win_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ring_layer_ = layer;
+    la_cur_.clear();
+    la_cur_layer_.store(layer, std::memory_order_release);
+    std::unique_lock<std::mutex> la_lk(la_mu_, std::defer_lock);
+    if (la_started_) la_lk.lock();
+    const uint32_t la_win = la_win_.load(std::memory_order_acquire);
+    if (la_started_ && !la_publish_.empty()) {   // LA2: copies that landed - now RAM-tier residents
+        for (const LaAdmit& a : la_publish_) {
+            if (a.dc < 0 || a.dc >= (int32_t) dc_slots_ || a.idx < 0 || a.idx >= (int64_t) hot_slot_.size()) continue;
+            if (dc_idx_[(size_t) a.dc] != (int32_t) a.idx || hot_slot_[(size_t) a.idx] >= 0) continue;   // re-evicted meanwhile
+            hot_slot_[(size_t) a.idx] = (int64_t) slot_off(a.dc);
+            ++la_admits_;
+        }
+        la_publish_.clear();
+    }
+    ring_waiting_ = false;
+    dc_admit_list_.clear();
+    int n = 0, njobs = 0;                  // n = blobs claimed, njobs = sub-reads published
+    int64_t miss_bytes = 0;
+    ++blob_stats_.calls;
+    for (int64_t i = 0; i < k && n < kRingSlots; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= n_expert_ || pf_seen_[(size_t) e]) continue;
+        pf_seen_[(size_t) e] = 1;
+        ++blob_stats_.entries;
+        const int64_t idx = layer * n_expert_ + e;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) {
+            // R8: a resident expert must not keep a stale ring claim from an earlier window - with the
+            // dynamic tier an expert CAN become resident between windows, and a stale `ring_of_` would both
+            // misroute it to pass 1 and (once the slot is reused by another layer) serve the WRONG BYTES.
+            ring_of_[(size_t) idx] = -1;
+            ++blob_stats_.hot_skips;
+            if (lru_base_ > 0 && (uint64_t) hot_slot_[(size_t) idx] >= lru_base_) ++lru_hits_;
+            continue;
+        }
+        if (vram_res_ != nullptr && vram_res_[idx] >= 0) {   // R27: the GPU has it in VRAM; never read it
+            ring_of_[(size_t) idx] = -1;
+            ++blob_stats_.hot_skips;
+            continue;
+        }
+        if (la_started_) {
+            // R27: the predictor already has this blob in (or on its way to) a lookahead slot
+            const int16_t ls = la_of_[(size_t) idx];
+            if (ls >= 0) {
+                LaSlot& q = la_slot_[ls];
+                const int st = q.state.load(std::memory_order_acquire);
+                if (q.idx == idx && q.layer == layer && q.win == la_win && st != 3 && st != 0) {
+                    ring_of_[(size_t) idx] = kRingSlots + ls;
+                    la_cur_.push_back(ls);
+                    ++la_stats_.used;
+                    if (st == 2) ++la_stats_.used_landed;
+                    pf_record_miss(idx);
+                    continue;
+                }
+            }
+        }
+        const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
+        if (len == 0 || off + len > file_map_bytes_) continue;
+        const int slot = n++;
+        // R8: **THE RING READ LANDS DIRECTLY IN AN LRU SLOT.**  A miss is admitted to the tier before the
+        // read is issued, so the commit in `wait_layer` is one pointer publish - not a 2.2 MB copy per miss
+        // per layer.  The LRU epoch is stamped at allocation, so a later claim in the SAME begin_layer call
+        // can never evict an earlier one, and no victim can be a blob this window is still using.
+        uint8_t* dst = ring_[(size_t) slot].data();
+        if (dc_slots_ > 0) {
+            const int32_t dc = dc_alloc(idx);
+            if (dc >= 0) {
+                dst = hot_arena_ + slot_off(dc);
+                dc_admit_list_.push_back(((int64_t) dc << 32) | (int64_t) (uint32_t) idx);
+            } else {
+                ++dc_fallbacks_;   // every slot touched this window: legacy ring, no admission
+            }
+        }
+        // kSplit 1 must be exactly one read of the whole blob - `kChunk` only caps the SPLIT case.  Getting
+        // this wrong left the engine issuing five 512 KiB reads per blob, which measured 8.5 tok/s against
+        // 10.7 for the whole-blob form.
+        const int ksplit = kSplit();
+        const uint64_t step = ksplit <= 1 ? len
+                              : std::min<uint64_t>(kChunk, (len + (uint64_t) ksplit - 1) / (uint64_t) ksplit);
+        for (uint64_t at = 0; at < len && njobs < kRingSlots * kMaxChunks; at += step) {
+            const uint64_t n = std::min<uint64_t>(step, len - at);
+            pf_jobs_[(size_t) njobs++] = {dst + at, off + at, n};
+        }
+        ring_of_[(size_t) idx] = slot;
+        pf_record_miss(idx);
+        miss_bytes += (int64_t) len;
+    }
+    if (njobs == 0) return;
+    // The rest: entries that are NOT resident and did NOT get a ring slot - i.e. a layer whose distinct
+    // non-resident experts exceed `kRingSlots`.  They get one whole-blob WILLNEED each.
+    //
+    // **R7: THE HOT-TIER GUARD BELOW IS THE FIX FOR A 6.4x READ AMPLIFICATION.**  `pf_seen_[e]` is set to 1
+    // for EVERY deduped id above, hot ones included, so this loop walked all of them; the only filter was
+    // `ring_of_[idx] >= 0`, and a HOT expert never got a ring slot, so its test passed and the engine asked
+    // the kernel to read it off the SSD into the page cache.  Measured on the IQ3_XXS pack, `--hot-ram-gib
+    // 12`, one 150-token generation: 2,880 begin_layer calls, 67,748 ids seen, 52,741 hot-skipped, **96,231
+    // blobs fetched** - against the 15,007 that were actually missed.  The 81,224 extra blobs were 176.8 GB
+    // of readahead for experts already resident in RAM, and they were the whole of the decode time (209.4 GB
+    // in 62.5 s = 3.35 GB/s, exactly the window time).  A resident expert must not be re-read from the drive,
+    // whatever the reason.
+    for (int64_t i = 0; i < k; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= n_expert_ || !pf_seen_[(size_t) e]) continue;
+        pf_seen_[(size_t) e] = 2;       // mark as handled; ring_of_ decides who is actually served
+        const int64_t idx = layer * n_expert_ + e;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;   // RESIDENT: nothing to read, ever
+        if (vram_res_ != nullptr && vram_res_[idx] >= 0) continue;          // R27: VRAM-resident likewise
+        if (ring_of_[(size_t) idx] >= 0) continue;
+        const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
+        if (len == 0 || off + len > file_map_bytes_) continue;
+        ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+        ++prefetched_;
+        ++blob_stats_.disk;
+        blob_stats_.disk_bytes += (int64_t) len;
+        pf_record_miss(idx);
+    }
+    // publish the batch; the WAIT is now `wait_layer`, so the caller can put the hot tier's own expert work in
+    // front of it.  The parked-count barrier (ExpertPool's protocol) guarantees every reader thread is parked
+    // before head_/done_/njobs_ are reset, so no thread can touch the previous batch's state while it is
+    // republished.  `pf_njobs_` is published together with `pf_pending_`, and `ring_pending` reads that flag,
+    // so no entry can be observed as "still coming" after its bytes have landed.
+    while (pf_parked_.load(std::memory_order_acquire) != (uint32_t) pf_workers_.size()) _mm_pause();
+    pf_head_.store(0, std::memory_order_relaxed);
+    pf_done_.store(0, std::memory_order_relaxed);
+    pf_jobs_active_ = njobs;
+    pf_njobs_.store((uint32_t) njobs, std::memory_order_release);
+    pf_epoch_.fetch_add(1, std::memory_order_release);
+    { std::lock_guard<std::mutex> lk(pf_mu_); pf_cv_.notify_all(); }
+    blob_stats_.disk += n;
+    blob_stats_.disk_bytes += miss_bytes;
+    ring_waiting_ = true;
+}
+
+// R7: warm the page cache for a layer's whole expert set.  Prefill calls this once per layer, with the
+// experts it is about to stage, before the first staging read.  See the header for why: prefill is QD1 and
+// measured 0.67 GB/s on a 33k-token prompt, i.e. it was latency-bound exactly like decode was.
+void ArenaExpertSource::prefetch(int64_t layer, const int32_t* experts, int64_t n) {
+    if (file_fd_ < 0 || file_map_ == nullptr || experts == nullptr || n <= 0) return;
+    if (layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers) return;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer);
+    if (len == 0) return;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t e = experts[i];
+        if (e < 0 || e >= n_expert_) continue;
+        const int64_t idx = layer * n_expert_ + e;
+        if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;   // the tier answers it from RAM
+        const uint64_t off = lay.blob_offset(layer, e);
+        if (off + len > file_map_bytes_) continue;
+        ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+        ++prefetched_;
+    }
+}
+
+// R7: the blocking half of `begin_layer`.  Same wait the old single-phase form did inline.
+// R7: a new verify window.  Score the previous window as a predictor of this one, then (optionally) ask the
+// kernel to start reading the predicted set NOW, so the per-layer `pread` finds it in the page cache instead of
+// paying the drive's QD1 latency 48 times.
+//
+// WHY THIS IS THE RIGHT LEVER.  Measured on this box's SNV2S1000G: one 2.08 MB random read costs **2.82 ms**
+// (740 MB/s) at QD1, and the same read at QD2+ costs 0.06 ms once the page is resident.  The engine needs ~1-2
+// such reads per layer and there are 48 layers, so the drive's LATENCY - not its bandwidth - sets the floor:
+// 48 x 2.9 ms = 139 ms per window.  `POSIX_FADV_WILLNEED` on the predicted blobs moves that work to the start
+// of the window where it can run at full queue depth beside the CPU, and the 106-odd syscalls cost microseconds.
+void ArenaExpertSource::pf_window_start() {
+    ++window_epoch_;
+    // R8.1: decay the frequency counts.  Half-life = one window: a blob hit last window keeps most of its
+    // credit, a blob untouched for eight windows has none, and the tier follows the workload as it moves.
+    // ~10,840 shifts per window - noise.
+    for (size_t i = 0; i < dc_count_.size(); ++i) dc_count_[i] >>= 1;
+    // R8: the fadvise predictor is OFF by default now.  With the LRU tier, a blob that misses again is
+    // ADMITTED (the ring reads it into a tier slot), so warming its page cache with WILLNEED only duplicates
+    // the read - and on a cold page cache each call costs ~2 ms of synchronous kernel work, which at ~1,600
+    // misses per adapting window was seconds per window of pure syscall.  STRATA_PREDICT=1 restores the R7
+    // behaviour for A/B.
+    if (window_epoch_ > 1 && prefetch_predict_ && file_fd_ >= 0) {
+        for (const int32_t idx : last_misses_) {
+            if (idx < 0 || idx >= blobs_) continue;
+            const int64_t l = idx / n_expert_, e = idx % n_expert_;
+            if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;
+            const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+            const uint64_t off = lay.blob_offset(l, e), len = lay.blob_bytes(l);
+            if (len == 0 || off + len > file_map_bytes_) continue;
+            ::posix_fadvise(file_fd_, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
+            ++blob_stats_.win_prefetched;
+        }
+    }
+    last_misses_.swap(cur_misses_);
+    cur_misses_.clear();
+}
+
+void ArenaExpertSource::pf_record_miss(int64_t idx) {
+    if (idx < 0 || idx >= blobs_) return;
+    if (miss_epoch_.size() != (size_t) blobs_) miss_epoch_.assign((size_t) blobs_, 0);
+    if (miss_epoch_[(size_t) idx] == window_epoch_) return;              // already recorded this window
+    if (miss_epoch_[(size_t) idx] == window_epoch_ - 1) ++blob_stats_.win_repeat;
+    miss_epoch_[(size_t) idx] = window_epoch_;
+    cur_misses_.push_back((int32_t) idx);
+    ++blob_stats_.win_misses;
+}
+
+void ArenaExpertSource::wait_layer() {
+    if (ex_on_) { ex_wait_layer(); return; }   // E1
+    if (ring_waiting_) {
+        const int n = pf_jobs_active_;
+        while (pf_done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
+        prefetched_ += n;
+        ring_waiting_ = false;
+    }
+    if (!la_cur_.empty()) {
+        // R27: the lookahead reads this layer is using; most have landed already
+        const auto t0 = std::chrono::steady_clock::now();
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        for (const int s : la_cur_) {
+            LaSlot& q = la_slot_[s];
+            int st;
+            while ((st = q.state.load(std::memory_order_acquire)) == 1) _mm_pause();
+            if (st == 3) {   // the read failed: do it here, synchronously, into the same slot
+                const int64_t l = q.idx / n_expert_, e = q.idx % n_expert_;
+                uint8_t* dst = la_buf_[(size_t) s].data();
+                const uint64_t off = lay.blob_offset(l, e), len = lay.blob_bytes(l);
+                uint64_t done = 0;
+                while (done < len) {
+                    const ssize_t r = ::pread(file_fd_, dst + done, (size_t) (len - done), (off_t) (off + done));
+                    if (r <= 0) break;
+                    done += (uint64_t) r;
+                }
+                q.state.store(2, std::memory_order_release);
+            }
+        }
+        la_stats_.late_spin_us += (int64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        static const bool la_admit = std::getenv("STRATA_LA_NOADMIT") == nullptr;
+        if (la_admit && dc_slots_ > 0) {
+            std::vector<LaAdmit> adm;
+            for (const int s : la_cur_) {
+                LaSlot& q = la_slot_[s];
+                if (q.state.load(std::memory_order_acquire) != 2) continue;
+                if (!hot_slot_.empty() && hot_slot_[(size_t) q.idx] >= 0) continue;
+                const int32_t dc = dc_alloc(q.idx);   // host thread, same epoch rules as a ring miss
+                if (dc < 0) continue;
+                q.state.store(4, std::memory_order_release);
+                adm.push_back({s, dc, q.idx});
+            }
+            if (!adm.empty()) {
+                { std::lock_guard<std::mutex> lk(la_mu_); la_admit_q_.insert(la_admit_q_.end(), adm.begin(), adm.end()); }
+                la_io_cv_.notify_all();
+            }
+        }
+    }
+    // R8: commit this layer's admissions.  The reads are confirmed landed, so publishing the slot offsets
+    // now turns every one of them into a RAM hit for the rest of the session - and every `blob()` after
+    // this point (the pass-1 dispatch) serves the tier copy, never the ring.
+    if (!dc_admit_list_.empty()) {
+        for (const int64_t v : dc_admit_list_) {
+            const int32_t s = (int32_t) ((uint64_t) v >> 32);
+            const int64_t idx = (int64_t) (int32_t) ((uint64_t) v & 0xffffffffu);
+            if (s < 0 || s >= (int32_t) dc_slots_ || idx < 0 || idx >= (int64_t) hot_slot_.size()) continue;
+            hot_slot_[(size_t) idx] = (int64_t) slot_off(s);
+            ++dc_admits_;
+        }
+        dc_admit_list_.clear();
+    }
+}
+
+// R7: is `(layer, expert)`'s blob one of the reads this layer submitted to the ring?
+//
+// **THIS MUST NOT TEST `ring_waiting_`.**  That flag means "wait_layer has not run yet", and it is cleared
+// *between* dispatch pass 0 and pass 1 - so a version of this predicate that checked it made every pass-1
+// entry look like a pass-0 entry, pass 1 skipped all of them, and **~19% of this model's expert
+// contributions were silently dropped**: measured on the IQ3_XXS pack, 97 windows, 78,855 routed ids,
+// 63,930 blob() calls - exactly the hot-tier count, i.e. not one miss was ever dispatched.  The model still
+// produced fluent English, which is precisely why it had to be found in the counters rather than in the
+// output; it is also the likely source of the capability eval's arithmetic misses.  A blob is "pending"
+// when it was claimed for THIS layer, whatever stage of the two-pass handoff it is at.
+bool ArenaExpertSource::ring_pending(int64_t layer, int64_t expert) const {
+    if (layer != ring_layer_) return false;
+    if (expert < 0 || expert >= n_expert_) return false;
+    if (ex_on_) {   // E1: marked by this call's begin_layer; stays set through pass 1 (after the commit)
+        const int64_t i = layer * n_expert_ + expert;
+        return i >= 0 && i < blobs_ && (int64_t) ring_of_.size() == blobs_ && ring_of_[(size_t) i] == kExPend;
+    }
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_ || (int64_t) ring_of_.size() != blobs_) return false;
+    return ring_of_[(size_t) idx] >= 0;
+}
+
+}  // namespace strata::core
+
+// ================================================================================================================
+// R27: cross-layer LOOKAHEAD prefetch.  See the header.  Three moving parts:
+//   * `lookahead(L, x)` (host thread, right after begin_layer(L)) copies layer L's router input into a mailbox;
+//   * the predictor thread runs router(L+1) . x on the CPU (AVX-512 BF16), takes the union of each position's
+//     top-k, and claims an LA slot + queues a read for every predicted blob the host tier does not hold;
+//   * reader threads pull the queue FIFO and pread (O_DIRECT) straight into the slot.
+// `begin_layer(L+1)` then serves any miss whose blob is in a slot for (L+1, this window) from that slot instead
+// of issuing a read, and `wait_layer` waits only for those slots still in flight.  Slots are never reused while
+// they belong to the current layer or a later one of the current window.
+// ================================================================================================================
+namespace strata::core {
+
+void ArenaExpertSource::set_router_host(std::vector<uint16_t> w, int64_t n_layers, int64_t n_embd) {
+    if (std::getenv("STRATA_LA") == nullptr) return;   // R27: measured a net loss (21% precision); opt-in
+    if ((int64_t) w.size() != n_layers * n_expert_ * n_embd || n_embd % 32 != 0) return;
+    la_router_ = std::move(w);
+    la_layers_ = n_layers;
+    la_n_embd_ = n_embd;
+    if (const char* e = std::getenv("STRATA_LA_K")) la_k_ = std::max(1, std::min(64, std::atoi(e)));
+    if (const char* e = std::getenv("STRATA_LA_DEPTH")) la_depth_ = std::max(1, std::min(4, std::atoi(e)));
+}
+
+void ArenaExpertSource::la_start() {
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    la_buf_.assign(kLaSlots, {});
+    for (auto& b : la_buf_) b.resize((size_t) lay.max_blob + 512);
+    la_slot_.reset(new LaSlot[kLaSlots]);
+    la_of_.assign((size_t) blobs_, (int16_t) -1);
+    int readers = 6;
+    if (const char* e = std::getenv("STRATA_LA_READERS")) readers = std::max(1, std::min(32, std::atoi(e)));
+    la_threads_.emplace_back([this] { la_predictor(); });
+    for (int i = 0; i < readers; ++i) la_threads_.emplace_back([this] { la_reader(); });
+    la_started_ = true;
+    std::fprintf(stderr, "strata: R27 lookahead prefetch on (k=%d, depth %d, %d readers, %d slots)\n", la_k_, la_depth_, readers, kLaSlots);
+}
+
+void ArenaExpertSource::lookahead(int64_t layer, const float* x_f, int64_t n_tok, int64_t n_embd) {
+    if (la_router_.empty() || x_f == nullptr || n_tok <= 0 || n_embd != la_n_embd_) return;
+    if (layer + 1 >= la_layers_ || !pf_started_ || !direct_ok_) return;
+    if (!la_started_) la_start();
+    {
+        std::lock_guard<std::mutex> lk(la_mu_);
+        la_x_.assign(x_f, x_f + n_tok * n_embd);
+        la_req_layer_ = layer;
+        la_req_ntok_ = n_tok;
+        la_req_ = true;
+    }
+    la_cv_.notify_one();
+}
+
+__attribute__((target("avx512f,avx512bw,avx512bf16")))
+static void la_router_logits(const uint16_t* w, const uint16_t* xb, int64_t n_tok, int64_t n_embd, int64_t n_exp,
+                             float* out) {
+    // out[t * n_exp + e] = sum_i w[e][i] * x[t][i]
+    for (int64_t e = 0; e < n_exp; ++e) {
+        const uint16_t* we = w + e * n_embd;
+        __m512 acc[16];
+        for (int64_t t = 0; t < n_tok; ++t) acc[t] = _mm512_setzero_ps();
+        for (int64_t i = 0; i < n_embd; i += 32) {
+            const __m512bh a = (__m512bh) _mm512_loadu_si512((const void*) (we + i));
+            for (int64_t t = 0; t < n_tok; ++t)
+                acc[t] = _mm512_dpbf16_ps(acc[t], a, (__m512bh) _mm512_loadu_si512((const void*) (xb + t * n_embd + i)));
+        }
+        for (int64_t t = 0; t < n_tok; ++t) out[t * n_exp + e] = _mm512_reduce_add_ps(acc[t]);
+    }
+}
+
+void ArenaExpertSource::la_predictor() {
+    std::vector<float> x;
+    std::vector<uint16_t> xb;
+    std::vector<float> logits;
+    std::vector<int> order((size_t) n_expert_);
+    std::vector<uint8_t> want((size_t) n_expert_);
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    for (;;) {
+        int64_t layer, n_tok;
+        {
+            std::unique_lock<std::mutex> lk(la_mu_);
+            la_cv_.wait(lk, [&] { return la_req_ || la_stop_; });
+            if (la_stop_) return;
+            x.swap(la_x_);
+            layer = la_req_layer_;
+            n_tok = std::min<int64_t>(la_req_ntok_, 16);
+            la_req_ = false;
+        }
+        const int64_t N = la_n_embd_;
+        xb.resize((size_t) (n_tok * N));
+        for (int64_t i = 0; i < n_tok * N; ++i) {   // f32 -> bf16, round to nearest even (the GPU router's input)
+            uint32_t u;
+            std::memcpy(&u, &x[(size_t) i], 4);
+            u += 0x7fffu + ((u >> 16) & 1u);
+            xb[(size_t) i] = (uint16_t) (u >> 16);
+        }
+        for (int64_t tgt = layer + 1; tgt <= layer + la_depth_ && tgt < la_layers_; ++tgt) {
+        logits.resize((size_t) (n_tok * n_expert_));
+        la_router_logits(la_router_.data() + (size_t) tgt * (size_t) n_expert_ * (size_t) N, xb.data(), n_tok, N,
+                         n_expert_, logits.data());
+        std::fill(want.begin(), want.end(), (uint8_t) 0);
+        for (int64_t t = 0; t < n_tok; ++t) {
+            const float* lg = logits.data() + t * n_expert_;
+            for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int) e;
+            const int k = (int) std::min<int64_t>(la_k_, n_expert_);
+            std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                              [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+            for (int i = 0; i < k; ++i) want[(size_t) order[(size_t) i]] = 1;
+        }
+        const uint64_t len = lay.blob_bytes(tgt);
+        int queued = 0;
+        {
+            std::lock_guard<std::mutex> lk(la_mu_);
+            const int64_t cur = la_cur_layer_.load(std::memory_order_acquire);
+            const uint32_t win = la_win_.load(std::memory_order_acquire);
+            if (cur >= tgt) continue;   // too late: the host is already on (or past) the target layer
+            for (int64_t e = 0; e < n_expert_; ++e) {
+                if (!want[(size_t) e]) continue;
+                const int64_t idx = tgt * n_expert_ + e;
+                la_pred_.fetch_add(1, std::memory_order_relaxed);
+                if (!hot_slot_.empty() && hot_slot_[(size_t) idx] >= 0) continue;
+                if (vram_res_ != nullptr && vram_res_[idx] >= 0) continue;
+                const uint64_t off = lay.blob_offset(tgt, e);
+                if (len == 0 || off + len > file_map_bytes_) continue;
+                const int16_t have = la_of_[(size_t) idx];
+                if (have >= 0) {
+                    LaSlot& h = la_slot_[have];
+                    if (h.idx == idx && h.win == win && h.layer == tgt && h.state.load() != 3) continue;
+                }
+                int s = -1;
+                for (int j = 0; j < kLaSlots; ++j) {
+                    const int c = (la_rr_ + j) % kLaSlots;
+                    LaSlot& q = la_slot_[c];
+                    { const int qs = q.state.load(std::memory_order_acquire); if (qs == 1 || qs == 4) continue; }
+                    if (q.idx >= 0 && q.win == win && q.layer >= cur) continue;
+                    s = c;
+                    break;
+                }
+                if (s < 0) break;
+                la_rr_ = (s + 1) % kLaSlots;
+                LaSlot& q = la_slot_[s];
+                if (q.idx >= 0 && la_of_[(size_t) q.idx] == s) la_of_[(size_t) q.idx] = -1;
+                q.idx = idx;
+                q.layer = tgt;
+                q.win = win;
+                q.state.store(1, std::memory_order_release);
+                la_of_[(size_t) idx] = (int16_t) s;
+                la_io_q_.push_back(s);
+                ++queued;
+            }
+        }
+        if (queued) {
+            la_issued_.fetch_add(queued, std::memory_order_relaxed);
+            la_io_cv_.notify_all();
+        }
+        }
+    }
+}
+
+void ArenaExpertSource::la_reader() {
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    for (;;) {
+        int s;
+        int64_t idx;
+        LaAdmit job{-1, -1, -1};
+        {
+            std::unique_lock<std::mutex> lk(la_mu_);
+            la_io_cv_.wait(lk, [&] { return !la_io_q_.empty() || !la_admit_q_.empty() || la_stop_; });
+            if (la_stop_) return;
+            if (la_io_q_.empty()) {
+                job = la_admit_q_.back();
+                la_admit_q_.pop_back();
+            } else {
+                s = la_io_q_.front();
+                la_io_q_.erase(la_io_q_.begin());
+                idx = la_slot_[s].idx;
+            }
+        }
+        if (job.ls >= 0) {   // LA2: copy a used lookahead blob into its LRU slot
+            const int64_t l = job.idx / n_expert_;
+            std::memcpy(hot_arena_ + slot_off(job.dc), la_buf_[(size_t) job.ls].data(), lay.blob_bytes(l));
+            la_slot_[job.ls].state.store(2, std::memory_order_release);
+            std::lock_guard<std::mutex> lk(la_mu_);
+            la_publish_.push_back(job);
+            continue;
+        }
+        const int64_t l = idx / n_expert_, e = idx % n_expert_;
+        const bool ok = direct_read_span(lay.blob_offset(l, e), lay.blob_bytes(l), la_buf_[(size_t) s].data());
+        la_slot_[s].state.store(ok ? 2 : 3, std::memory_order_release);
+    }
+}
+
+}  // namespace strata::core
+
+// ================================================================================================================
+// E1: EARLY ISSUE.  See the header.  Lock order: ex_mu_ -> dc_mu_ (dc_alloc / dc_touch) -> ejq_mu_.
+// ================================================================================================================
+namespace strata::core {
+
+void ArenaExpertSource::ex_start() {
+    ej_.reset(new EJob[kEJobs]);
+    ej_free_.clear();
+    for (int i = kEJobs - 1; i >= 0; --i) ej_free_.push_back(i);
+    ej_of_.assign((size_t) blobs_, (int16_t) -1);
+    int readers = 10;
+    if (const char* e = std::getenv("STRATA_EARLY_READERS")) readers = std::max(1, std::min(32, std::atoi(e)));
+    for (int i = 0; i < readers; ++i) ej_thr_.emplace_back([this] { ex_reader(); });
+    ex_started_ = true;
+    std::fprintf(stderr, "strata: E1 early issue on (%d readers, %d jobs)\n", readers, kEJobs);
+}
+
+void ArenaExpertSource::ex_reader() {
+    for (;;) {
+        int j;
+        {
+            std::unique_lock<std::mutex> lk(ejq_mu_);
+            ejq_cv_.wait(lk, [&] { return !ejq_.empty() || ejq_stop_; });
+            if (ejq_stop_) return;
+            j = ejq_.front();
+            ejq_.pop_front();
+        }
+        // E1c: the queue holds (job << 4 | chunk); a blob is split into ex_chunks() reads issued side by side (a lone
+        // 2 MB read is ~1 ms at QD1 on this drive, ~4.2 GB/s only with depth); the last chunk completes the job
+        const int c = j & 15;
+        j >>= 4;
+        EJob& q = ej_[(size_t) j];
+        const int nc = ex_chunks();
+        const uint64_t step = ((q.len + (uint64_t) nc - 1) / (uint64_t) nc + 4095) & ~4095ull;
+        const uint64_t at = (uint64_t) c * step;
+        bool ok = true;
+        if (at < q.len) ok = direct_read_span(q.off + at, std::min<uint64_t>(step, q.len - at), q.dst + at);
+        if (!ok) q.bad.store(1, std::memory_order_relaxed);
+        if (q.left.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            q.st.store(q.bad.load(std::memory_order_relaxed) ? 3 : 2, std::memory_order_release);
+    }
+}
+
+// a job for blob (layer, e): the existing one, or a new read into a fresh LRU slot; -1 when no slot/job is free
+int ArenaExpertSource::ex_claim_locked(int64_t layer, int64_t e, bool* fresh) {
+    const int64_t idx = layer * n_expert_ + e;
+    *fresh = false;
+    if (ej_of_[(size_t) idx] >= 0) return ej_of_[(size_t) idx];
+    if (ej_free_.empty() || dc_slots_ <= 0) return -1;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t len = lay.blob_bytes(layer), off = lay.blob_offset(layer, e);
+    if (len == 0 || off + len > file_map_bytes_) return -1;
+    const int32_t dc = dc_alloc(idx);
+    if (dc < 0) return -1;
+    const int j = ej_free_.back();
+    ej_free_.pop_back();
+    EJob& q = ej_[(size_t) j];
+    q.dst = hot_arena_ + slot_off(dc);
+    q.off = off;
+    q.len = len;
+    q.idx = idx;
+    q.dc = dc;
+    const int nc = ex_chunks();
+    q.left.store(nc, std::memory_order_relaxed);
+    q.bad.store(0, std::memory_order_relaxed);
+    q.st.store(1, std::memory_order_release);
+    ej_of_[(size_t) idx] = (int16_t) j;
+    {
+        std::lock_guard<std::mutex> lk(ejq_mu_);
+        for (int c = 0; c < nc; ++c) ejq_.push_back((j << 4) | c);
+    }
+    if (nc > 1) ejq_cv_.notify_all(); else ejq_cv_.notify_one();
+    *fresh = true;
+    return j;
+}
+
+// commit every outstanding job (a window that ended early, or an issue for a call that never came)
+void ArenaExpertSource::ex_drain_locked() {
+    for (int j = 0; j < kEJobs; ++j) {
+        EJob& q = ej_[(size_t) j];
+        int st = q.st.load(std::memory_order_acquire);
+        if (st == 0) continue;
+        while ((st = q.st.load(std::memory_order_acquire)) == 1) _mm_pause();
+        if (st == 2 && q.idx >= 0 && dc_idx_[(size_t) q.dc] == (int32_t) q.idx) hot_slot_[(size_t) q.idx] = (int64_t) slot_off(q.dc);
+        if (q.idx >= 0) ej_of_[(size_t) q.idx] = -1;
+        q.idx = -1;
+        q.st.store(0, std::memory_order_release);
+        ej_free_.push_back(j);
+    }
+}
+
+void ArenaExpertSource::early_issue(int64_t layer, const int32_t* ids, int64_t k) {
+    if (!ex_on_ || !ex_started_ || ids == nullptr || k <= 0) return;
+    if (layer < 0 || layer >= strata::kernels::cpu::expert_layout().n_layers) return;
+    std::lock_guard<std::mutex> lk(ex_mu_);
+    int32_t miss[128];
+    int nm = 0;
+    for (int64_t i = 0; i < k && i < 128; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= n_expert_) continue;
+        bool dup = false;
+        for (int64_t j = 0; j < i; ++j) if (ids[j] == e) { dup = true; break; }
+        if (dup) continue;
+        const int64_t idx = layer * n_expert_ + e;
+        if (hot_slot_[(size_t) idx] >= 0) {   // touch first: none of this call's hits may be evicted for its misses
+            const int32_t ts = slot_of_off(hot_slot_[(size_t) idx]);
+            if (ts >= 0) dc_touch(ts);
+            continue;
+        }
+        if (vram_res_ != nullptr && vram_res_[idx] >= 0) continue;
+        miss[nm++] = (int32_t) e;
+    }
+    for (int i = 0; i < nm; ++i) {
+        bool fresh = false;
+        ex_claim_locked(layer, miss[i], &fresh);
+        if (fresh) ex_early_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void ArenaExpertSource::ex_begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (!ex_started_) ex_start();
+    std::lock_guard<std::mutex> lk(ex_mu_);
+    if (layer == 0 && ring_layer_ != 0) {     // the window's first call (group B's layer 0 is not a new window)
+        ex_drain_locked();
+        pf_window_start();
+        la_win_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ring_layer_ = layer;
+    ex_cur_.clear();
+    ++blob_stats_.calls;
+    int32_t miss[128];
+    int nm = 0;
+    for (int64_t i = 0; i < k && i < 128; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= n_expert_) continue;
+        bool dup = false;
+        for (int64_t j = 0; j < i; ++j) if (ids[j] == e) { dup = true; break; }
+        if (dup) continue;
+        ++blob_stats_.entries;
+        const int64_t idx = layer * n_expert_ + e;
+        ring_of_[(size_t) idx] = -1;
+        if (hot_slot_[(size_t) idx] >= 0) {
+            ++blob_stats_.hot_skips;
+            if (lru_base_ > 0 && (uint64_t) hot_slot_[(size_t) idx] >= lru_base_) ++lru_hits_;
+            const int32_t ts = slot_of_off(hot_slot_[(size_t) idx]);
+            if (ts >= 0) dc_touch(ts);
+            continue;
+        }
+        if (vram_res_ != nullptr && vram_res_[idx] >= 0) { ++blob_stats_.hot_skips; continue; }
+        miss[nm++] = (int32_t) e;
+    }
+    int nring = 0;
+    for (int i = 0; i < nm; ++i) {
+        const int64_t e = miss[i], idx = layer * n_expert_ + e;
+        bool fresh = false;
+        const int j = ex_claim_locked(layer, e, &fresh);
+        pf_record_miss(idx);
+        ++blob_stats_.disk;
+        blob_stats_.disk_bytes += (int64_t) lay.blob_bytes(layer);
+        if (j >= 0) {
+            if (!fresh) {
+                ex_early_used_.fetch_add(1, std::memory_order_relaxed);
+                if (ej_[(size_t) j].st.load(std::memory_order_acquire) == 2) ex_early_landed_.fetch_add(1, std::memory_order_relaxed);
+            }
+            bool have = false;
+            for (const int c : ex_cur_) if (c == j) { have = true; break; }
+            if (!have) ex_cur_.push_back(j);
+            ring_of_[(size_t) idx] = kExPend;
+            continue;
+        }
+        // no slot or job: the legacy ring slot, read synchronously (rare: every slot is this window's)
+        if (nring >= kRingSlots) continue;
+        const int r = nring++;
+        if (direct_read_span(lay.blob_offset(layer, e), lay.blob_bytes(layer), ring_[(size_t) r].data())) {
+            ring_of_[(size_t) idx] = r;
+            ++dc_fallbacks_;
+        }
+    }
+}
+
+void ArenaExpertSource::ex_wait_layer() {
+    if (ex_cur_.empty()) return;
+    for (const int j : ex_cur_) {
+        EJob& q = ej_[(size_t) j];
+        int st;
+        while ((st = q.st.load(std::memory_order_acquire)) == 1) _mm_pause();
+        if (st == 3) {   // the direct read failed: buffered, synchronously, into the same slot
+            uint64_t done = 0;
+            while (done < q.len) {
+                const ssize_t r = ::pread(file_fd_, q.dst + done, (size_t) (q.len - done), (off_t) (q.off + done));
+                if (r <= 0) break;
+                done += (uint64_t) r;
+            }
+            q.st.store(2, std::memory_order_release);
+        }
+    }
+    std::lock_guard<std::mutex> lk(ex_mu_);
+    for (const int j : ex_cur_) {
+        EJob& q = ej_[(size_t) j];
+        if (q.idx < 0) continue;
+        hot_slot_[(size_t) q.idx] = (int64_t) slot_off(q.dc);
+        ++dc_admits_;
+        ej_of_[(size_t) q.idx] = -1;
+        q.idx = -1;
+        q.st.store(0, std::memory_order_release);
+        ej_free_.push_back(j);
+    }
+    ex_cur_.clear();
+}
+
+}  // namespace strata::core
+
+namespace strata::core {
+int32_t ArenaExpertSource::adapt_reserve(int64_t layer, int64_t expert, uint8_t** dst) {
+    if (dc_slots_ <= 0 || hot_slot_.empty() || layer < 0 || expert < 0 || expert >= n_expert_) return -1;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx >= blobs_) return -1;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    if (hot_slot_[(size_t) idx] >= 0) return -2;
+    const int32_t s = dc_alloc_locked(idx);
+    if (s < 0) return -1;
+    *dst = hot_arena_ + slot_off(s);
+    return s;
+}
+
+void ArenaExpertSource::adapt_publish(int64_t layer, int64_t expert, int32_t s) {
+    const int64_t idx = layer * n_expert_ + expert;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    if (s < 0 || s >= (int32_t) dc_slots_ || dc_idx_[(size_t) s] != (int32_t) idx) return;
+    hot_slot_[(size_t) idx] = (int64_t) slot_off(s);
+    dc_count_[(size_t) s] = 1;
+}
+}  // namespace strata::core
+
+namespace strata::core {
+bool ArenaExpertSource::adapt_relabel(int64_t layer, int64_t in, int64_t out) {
+    const int64_t a = layer * n_expert_ + in, b = layer * n_expert_ + out;
+    std::lock_guard<std::mutex> lk(dc_mu_);
+    if (a < 0 || b < 0 || a >= blobs_ || b >= blobs_ || hot_slot_[(size_t) a] < 0 || hot_slot_[(size_t) b] >= 0) return false;
+    const int64_t off = hot_slot_[(size_t) a];
+    const int32_t s = slot_of_off(off);
+    if (s >= 0) dc_idx_[(size_t) s] = (int32_t) b;   // a static (profile) placement has no LRU slot: the offset moves alone
+    hot_slot_[(size_t) b] = off;
+    hot_slot_[(size_t) a] = -1;
+    return true;
+}
 }  // namespace strata::core

@@ -1,0 +1,22 @@
+{
+ "tag": "res2",
+ "cfg": "hill/cfg-res2.json",
+ "agg": 16.734213622695776,
+ "rows": [
+  {
+   "name": "code-py",
+   "rep": 0,
+   "gen": 256,
+   "ms": 15298,
+   "tps": 16.7,
+   "tpw": 3.3,
+   "acc": 56.0,
+   "disk_per_tok": 75.0,
+   "disk_gbs": 2.56,
+   "ringwait": 100.8,
+   "verwait": 17.7,
+   "pool": 138.9,
+   "mspw": 168.1
+  }
+ ]
+}

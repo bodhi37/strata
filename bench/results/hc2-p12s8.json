@@ -1,0 +1,73 @@
+{
+ "tag": "p12s8",
+ "cfg": "hill/cfg-p12s8.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 11.804568767547607,
+     "prefill_tok_s": 356.30272336274373,
+     "decode_tok_s": 29.975390466517588,
+     "wall_s": 18.176462411880493,
+     "sample": "The"
+    },
+    {
+     "i": 1,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.41405582427978516,
+     "prefill_tok_s": 10158.050565563179,
+     "decode_tok_s": 22.587558714150898,
+     "wall_s": 8.870038270950317,
+     "sample": "The"
+    },
+    {
+     "i": 2,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.4203455448150635,
+     "prefill_tok_s": 10006.053476433264,
+     "decode_tok_s": 23.06710953544704,
+     "wall_s": 8.700533390045166,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 23.06710953544704,
+   "decode_min": 22.587558714150898,
+   "decode_max": 29.975390466517588,
+   "prefill_med": 10006.053476433264,
+   "telemetry": {
+    "mtp_windows": 72,
+    "tok_per_win": 3.44,
+    "accept_pct": 48.4,
+    "ms_per_win": 115.6,
+    "req_per_tok": 317.3,
+    "hot": 56340,
+    "ring": 4569,
+    "disk_blobs": 9317,
+    "disk_gb": 19.0,
+    "disk_gbs": 2.28,
+    "ver_wait": 19.3,
+    "ver_pool": 88.8,
+    "ver_host": 2.7,
+    "commit": 0.8,
+    "plan": 5.2,
+    "actq": 0.5,
+    "jobs": 83.1,
+    "run": 17.9,
+    "ringwait": 145.7,
+    "drain": 69.1,
+    "gu": 45.5,
+    "down": 23.2,
+    "gen_ms": 8326,
+    "gen_tok": 192,
+    "gen_tps": 23.1,
+    "ring_per_tok": 23.796875,
+    "miss_blobs_per_tok": 48.526041666666664
+   }
+  }
+ }
+}

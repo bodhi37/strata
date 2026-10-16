@@ -196,11 +196,18 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
     ap.add_argument("--base", help="optional: a Q2_0 canonical pack whose dense.bin holds the shared float tensors")
+    ap.add_argument("--layer-experts-override", help="optional JSON from tools/append_expert_tensor.py: per-layer "
+                                     "absolute offsets + shard for layers whose experts straddle shards")
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-experts", action="store_true", help="rewrite the index only")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
     a = ap.parse_args()
+    override = {}
+    if a.layer_experts_override:
+        import json as _json
+        override = _json.loads(pathlib.Path(a.layer_experts_override).read_text())
+        print("layer-experts override: %s" % sorted(override))
     src = pathlib.Path(a.gguf).resolve()
     base = pathlib.Path(a.base).resolve() if a.base else None
     out = pathlib.Path(a.out)
@@ -243,6 +250,13 @@ def main() -> int:
                  % (N_EXPERT, offset, src.name))
         for l, gt, dt, off, blob, ts in layout:
             ws = [model.where[t.name] for t in ts]
+            ov = override.get(str(l))
+            if ov is not None:
+                # a straddling layer consolidated by tools/append_expert_tensor.py: absolute offsets
+                # in the ONE named shard; the three tensors' formats were checked above
+                line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, ov["gate"], ov["up"], ov["down"])
+                fo.write(line + ("" if ov["shard"] == src.name else " " + ov["shard"]) + "\n")
+                continue
             if len({w[3] for w in ws}) != 1:
                 print("layer %d: its gate/up/down tensors are in different shards" % l)
                 return 1

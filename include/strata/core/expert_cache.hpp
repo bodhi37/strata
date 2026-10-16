@@ -69,6 +69,11 @@ public:
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// X5: LAYERED slots.  Layer `l` owns `count[l]` contiguous slots of exactly `bytes[l]` (256-aligned), so a
+    /// per-layer tier wastes nothing on the largest layer's blob size (IQ3_S: 2.66 MB max vs 2.05 MB mean, +30%
+    /// experts in the same VRAM).  Adapt swaps stay inside a layer, so a slot never changes size.
+    bool open_layered(const std::vector<int64_t>& count, const std::vector<int64_t>& bytes, int64_t n_layers,
+                      int64_t n_expert, std::string& err);
     /// Byte offset of each slot in the arena (null for uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
     void close();
@@ -149,6 +154,7 @@ private:
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
+    std::vector<int64_t> layer_lo_, layer_hi_;   ///< X5: per-layer slot ranges when layered
     int64_t admitted_ = 0;
 };
 

@@ -28,21 +28,21 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     const int rg = threadIdx.y;           // 0..3
     const int tid = rg * S + col;
     const int qh = head % h_k;
-    if (tid < S) { sk[tid] = k[qh * S + tid]; sq[tid] = q[qh * S + tid]; }
+    if (tid < S) { sk[tid] = __ldg(&k[qh * S + tid]); sq[tid] = __ldg(&q[qh * S + tid]); }
     float s[RPG];
     float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
     __syncthreads();
-    const float g = __expf(gate[head]);
+    const float g = __expf(__ldg(&gate[head]));
     float kv = 0.0f;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
     red[rg][col] = kv;
     __syncthreads();
     const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
-    const float delta = (v[head * S + col] - g * kv_col) * beta[head];
+    const float delta = (__ldg(&v[head * S + col]) - g * kv_col) * __ldg(&beta[head]);
     float o = 0.0f;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) {
@@ -65,8 +65,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     if (rg == 0) {
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = rsqrtf(ss / (float) S + eps);
-        const float zz = z[head * S + col];
-        y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        const float zz = __ldg(&z[head * S + col]);
+        y[head * S + col] = oc * scale * __ldg(&gamma[col]) * (1.0f / (1.0f + __expf(-zz)));
     }
 }
 
@@ -75,8 +75,8 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
                                                         int qk_heads, float eps) {
     __shared__ float part[S / 32];
     const int c = blockIdx.x * S + threadIdx.x;
-    const float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2], x = qkv[c];
-    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
+    const float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2], x = __ldg(&qkv[c]);
+    float sum = v0 * __ldg(&w[c * 4]) + v1 * __ldg(&w[c * 4 + 1]) + v2 * __ldg(&w[c * 4 + 2]) + x * __ldg(&w[c * 4 + 3]);
     hist[c * 3] = v1;
     hist[c * 3 + 1] = v2;
     hist[c * 3 + 2] = x;
@@ -104,8 +104,8 @@ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x
     float acc = 0.0f;
     for (int j = lane; j < n / 8; j += 32) {
         const uint4 wv = __ldg(w4 + j);
-        const float4 xa = *reinterpret_cast<const float4*>(x + j * 8);
-        const float4 xb = *reinterpret_cast<const float4*>(x + j * 8 + 4);
+        const float4 xa = __ldg(reinterpret_cast<const float4*>(x + j * 8));
+        const float4 xb = __ldg(reinterpret_cast<const float4*>(x + j * 8 + 4));
         acc = fmaf(__uint_as_float(wv.x << 16), xa.x, acc); acc = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, acc);
         acc = fmaf(__uint_as_float(wv.y << 16), xa.z, acc); acc = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, acc);
         acc = fmaf(__uint_as_float(wv.z << 16), xb.x, acc); acc = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, acc);
@@ -116,9 +116,9 @@ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x
     if (is_beta) {
         beta[r] = 1.0f / (1.0f + __expf(-acc));
     } else {
-        const float v = acc + dt[r];
+        const float v = acc + __ldg(&dt[r]);
         const float sp = v > 20.0f ? v : log1pf(__expf(v));
-        gate[r] = sp * ssm_a[r];
+        gate[r] = sp * __ldg(&ssm_a[r]);
     }
 }
 

@@ -1,0 +1,53 @@
+{
+ "tag": "r27",
+ "cfg": "hill/cfg-r27.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 10.026796340942383,
+     "prefill_tok_s": 419.47595792144045,
+     "decode_tok_s": 26.75478538082564,
+     "wall_s": 17.165706157684326,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 26.75478538082564,
+   "decode_min": 26.75478538082564,
+   "decode_max": 26.75478538082564,
+   "prefill_med": 419.47595792144045,
+   "telemetry": {
+    "mtp_windows": 93,
+    "tok_per_win": 2.35,
+    "accept_pct": 45.2,
+    "ms_per_win": 77.2,
+    "req_per_tok": 338.9,
+    "hot": 60050,
+    "ring": 3670,
+    "disk_blobs": 2041,
+    "disk_gb": 4.28,
+    "disk_gbs": 0.6,
+    "ver_wait": 23.9,
+    "ver_pool": 41.8,
+    "ver_host": 6.5,
+    "commit": 0.7,
+    "plan": 6.4,
+    "actq": 0.4,
+    "jobs": 35.0,
+    "run": 16.7,
+    "ringwait": 17.2,
+    "drain": 18.1,
+    "gu": 11.6,
+    "down": 6.4,
+    "gen_ms": 7184,
+    "gen_tok": 192,
+    "gen_tps": 26.7,
+    "ring_per_tok": 19.114583333333332,
+    "miss_blobs_per_tok": 10.630208333333334
+   }
+  }
+ }
+}

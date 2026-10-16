@@ -1,0 +1,63 @@
+{
+ "tag": "r27vp",
+ "cfg": "hill/cfg-r27vp.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 9.894423961639404,
+     "prefill_tok_s": 425.08790974660326,
+     "decode_tok_s": 30.493790376257483,
+     "wall_s": 16.157994270324707,
+     "sample": "The"
+    },
+    {
+     "i": 1,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.13631129264831543,
+     "prefill_tok_s": 30855.844136490763,
+     "decode_tok_s": 31.61192894932346,
+     "wall_s": 6.1783342361450195,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 31.05285966279047,
+   "decode_min": 30.493790376257483,
+   "decode_max": 31.61192894932346,
+   "prefill_med": 15640.466023118683,
+   "telemetry": {
+    "mtp_windows": 82,
+    "tok_per_win": 2.62,
+    "accept_pct": 52.1,
+    "ms_per_win": 74.0,
+    "req_per_tok": 301.4,
+    "hot": 51670,
+    "ring": 6165,
+    "disk_blobs": 3934,
+    "disk_gb": 7.98,
+    "disk_gbs": 1.31,
+    "ver_wait": 23.2,
+    "ver_pool": 42.7,
+    "ver_host": 3.5,
+    "commit": 0.7,
+    "plan": 3.7,
+    "actq": 0.4,
+    "jobs": 38.6,
+    "run": 14.8,
+    "ringwait": 40.4,
+    "drain": 35.8,
+    "gu": 23.4,
+    "down": 12.1,
+    "gen_ms": 6071,
+    "gen_tok": 192,
+    "gen_tps": 31.6,
+    "ring_per_tok": 32.109375,
+    "miss_blobs_per_tok": 20.489583333333332
+   }
+  }
+ }
+}

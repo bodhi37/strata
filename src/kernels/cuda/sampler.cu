@@ -87,7 +87,7 @@ __device__ __forceinline__ float apply_penalties(float logit, int count, const S
 /// ascending with `if (s > bv)`, so the LOWEST index wins a tie.  Each thread keeps that rule over its own
 /// strided subset and the reduction resolves two candidates by taking the larger value and, on equality, the
 /// SMALLER index - the same total order, so `sampler_parity` and C1 see no change.
-__global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vocab,
+__global__ void __launch_bounds__(1024) sampler_greedy_kernel(const float* __restrict__ logits, int n_vocab,
                                       const int* __restrict__ history, int history_len, const SamplerParams p,
                                       int pmin, int plen, int* __restrict__ out) {
     const int t = blockIdx.x;
@@ -109,15 +109,41 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     extern __shared__ unsigned int penal_bits[];
     const int bits_words = (int) ((n_vocab + 31) / 32);
     const bool use_bits = hrow != nullptr && bits_words > 0;
+    // Unique-count cache: one O(hlen^2) build per block instead of O(n_vocab*hlen) rescans.
+    // hrow's window is tiny (tens of entries); the per-candidate hit_count below then scans at most
+    // nunique (<= hlen) shared entries.  Bit-identical counts to history_count(hrow, hlen, v).
+    __shared__ int uniq_vals[256];
+    __shared__ int uniq_cnts[256];
+    __shared__ int nunique;
     if (use_bits) {
         for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
         __syncthreads();
         for (int i = threadIdx.x; i < hlen; i += blockDim.x)
             if (hrow[i] >= 0) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
         __syncthreads();
+        if (threadIdx.x == 0) {
+            int nu = 0;
+            for (int i = 0; i < hlen && nu < 256; ++i) {
+                const int v = hrow[i];
+                if (v < 0) continue;
+                bool seen = false;
+                for (int j = 0; j < nu; ++j)
+                    if (uniq_vals[j] == v) { seen = true; break; }
+                if (!seen) {
+                    uniq_vals[nu] = v;
+                    uniq_cnts[nu] = history_count(hrow, hlen, v);
+                    ++nu;
+                }
+            }
+            nunique = nu;
+        }
+        __syncthreads();
     }
     auto hit_count = [&](int v) -> int {
         if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        for (int j = 0; j < nunique; ++j)
+            if (uniq_vals[j] == v) return uniq_cnts[j];
+        // Window larger than the cache (hlen > 256 unique): fall back to the exact scan.
         return history_count(hrow, hlen, v);
     };
 
@@ -166,9 +192,10 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
 /// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
-__global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
+template <bool kLegacy>
+__global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
-                               int* __restrict__ out) {
+                               int* __restrict__ out, int* cand_n, int* cand_id, float* cand_p) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     const float* l = logits + (size_t) t * n_vocab;
@@ -191,15 +218,37 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     extern __shared__ unsigned int penal_bits[];
     const int bits_words = (int) ((n_vocab + 31) / 32);
     const bool use_bits = hrow != nullptr && bits_words > 0;
+    __shared__ int uniq_vals[256];
+    __shared__ int uniq_cnts[256];
+    __shared__ int nunique;
     if (use_bits) {
         for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
         __syncthreads();
         for (int i = threadIdx.x; i < hlen; i += blockDim.x)
             if (hrow[i] >= 0) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
         __syncthreads();
+        if (threadIdx.x == 0) {
+            int nu = 0;
+            for (int i = 0; i < hlen && nu < 256; ++i) {
+                const int v = hrow[i];
+                if (v < 0) continue;
+                bool seen = false;
+                for (int j = 0; j < nu; ++j)
+                    if (uniq_vals[j] == v) { seen = true; break; }
+                if (!seen) {
+                    uniq_vals[nu] = v;
+                    uniq_cnts[nu] = history_count(hrow, hlen, v);
+                    ++nu;
+                }
+            }
+            nunique = nu;
+        }
+        __syncthreads();
     }
     auto hit_count = [&](int v) -> int {
         if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        for (int j = 0; j < nunique; ++j)
+            if (uniq_vals[j] == v) return uniq_cnts[j];
         return history_count(hrow, hlen, v);
     };
 
@@ -212,45 +261,138 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         return;   // leave out[t] unwritten rather than returning an uninitialised token
     }
 
-    // ---- top_k: k rounds of a block argmax over the not-yet-taken.  `sel_*` holds the kept ids and their
-    // raw logits in selection order: descending by value, ties to the lower index, which is the order the
-    // top_p cut below is defined over.
+    // ---- top_k.  S1: an exact RADIX SELECT replaces the k rounds of block argmax (each round re-scanned the whole
+    // vocabulary AND checked every element against all earlier picks: ~2.2 ms per window at top_k 20-64 on the
+    // 248k vocabulary, on the window's critical path).  Same result by construction: the serial rounds take the
+    // k largest penalized logits, ties to the LOWER index, -inf/NaN never; the select finds the k-th largest key
+    // exactly, takes everything above it and the lowest-index ties at it, then sorts (value desc, index asc).
+    // A pathological tie flood (> 256 equal at the cut) falls back to the rounds.  STRATA_SAMPLER_OLD=1 forces them.
     __shared__ int sel_ids[KMAX];
     __shared__ float sel_logit[KMAX];
     __shared__ float sv[32];
     __shared__ int si[32];
-    for (int i = 0; i < k; ++i) {
-        // `n_vocab` is the "no candidate" index: it loses every comparison to a real one (same convention as
-        // the greedy kernel, whose tie rule this reduction shares).
-        float bv = __int_as_float(0xff800000);   // -inf
-        int best = n_vocab;
-        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-            bool taken = false;
-            for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
-            if (taken) continue;
-            const float s = apply_penalties(l[v], hit_count(v), p);
-            if (s > bv) { bv = s; best = v; }
-        }
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
-            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
-            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
-        }
-        const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
-        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
-        __syncthreads();
-        if (warp == 0) {
-            const int nw = (int) ((blockDim.x + 31) >> 5);
-            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
-            int wi = lane < nw ? si[lane] : n_vocab;
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
-                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
-                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+    __shared__ unsigned int rs_hist[256];
+    __shared__ uint32_t rs_prefix, rs_mask;
+    __shared__ int rs_remaining, rs_short, rs_ngt, rs_neq;
+    __shared__ int rs_gt[KMAX];
+    __shared__ int rs_eq[256];
+    auto key_of = [&](int v) -> uint32_t {
+        float x = apply_penalties(l[v], hit_count(v), p);
+        if (!(x > __int_as_float(0xff800000))) return 0u;         // -inf / NaN: the rounds never take them
+        if (x == 0.0f) x = 0.0f;                                  // -0 == +0 for the rounds: one key
+        const uint32_t u = __float_as_uint(x);
+        return (u & 0x80000000u) ? ~u : (u | 0x80000000u);        // monotone in x, never 0 for a real value
+    };
+    bool legacy = kLegacy;
+    if (!legacy) {
+        if (threadIdx.x == 0) { rs_prefix = 0u; rs_mask = 0u; rs_remaining = k; rs_short = 0; rs_ngt = 0; rs_neq = 0; }
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (int b = threadIdx.x; b < 256; b += blockDim.x) rs_hist[b] = 0u;
+            __syncthreads();
+            if (!rs_short) {
+                const uint32_t pre = rs_prefix, msk = rs_mask;
+                for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+                    const uint32_t key = key_of(v);
+                    if (key != 0u && (key & msk) == pre) atomicAdd(&rs_hist[(key >> shift) & 255u], 1u);
+                }
             }
-            if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
+            __syncthreads();
+            if (threadIdx.x == 0 && !rs_short) {
+                int cum = 0, b = 255;
+                for (; b >= 0; --b) {
+                    if (cum + (int) rs_hist[b] >= rs_remaining) break;
+                    cum += (int) rs_hist[b];
+                }
+                if (b < 0) {                                       // fewer real candidates than k: take them all
+                    rs_short = 1;
+                    rs_prefix = 0u;
+                    rs_remaining = 0;
+                } else {
+                    rs_prefix |= (uint32_t) b << shift;
+                    rs_mask |= 255u << shift;
+                    rs_remaining -= cum;
+                }
+            }
+            __syncthreads();
+        }
+        // rs_prefix is the k-th largest key (or 0 when short); take every key above it and the ties at it
+        const uint32_t kth = rs_prefix;
+        const bool shortk = rs_short != 0;
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const uint32_t key = key_of(v);
+            if (key == 0u) continue;
+            if (key > kth) {
+                const int i = atomicAdd(&rs_ngt, 1);
+                if (i < KMAX) rs_gt[i] = v;
+            } else if (!shortk && key == kth) {
+                const int i = atomicAdd(&rs_neq, 1);
+                if (i < 256) rs_eq[i] = v;
+            }
         }
         __syncthreads();
+        if (rs_neq > 256 || rs_ngt > KMAX) legacy = true;          // uniform across the block
+        if (!legacy && threadIdx.x == 0) {
+            const int need = shortk ? 0 : rs_remaining;
+            const int neq = rs_neq;
+            for (int i = 1; i < neq; ++i) {                        // ties: lowest indices first
+                const int x = rs_eq[i];
+                int j = i - 1;
+                while (j >= 0 && rs_eq[j] > x) { rs_eq[j + 1] = rs_eq[j]; --j; }
+                rs_eq[j + 1] = x;
+            }
+            int n = rs_ngt;
+            for (int i = 0; i < need && n < KMAX; ++i) rs_gt[n++] = rs_eq[i];
+            uint32_t kk[KMAX];
+            for (int i = 0; i < n; ++i) kk[i] = key_of(rs_gt[i]);
+            for (int i = 1; i < n; ++i) {                          // key desc, index asc
+                const int xv = rs_gt[i];
+                const uint32_t xk = kk[i];
+                int j = i - 1;
+                while (j >= 0 && (kk[j] < xk || (kk[j] == xk && rs_gt[j] > xv))) { rs_gt[j + 1] = rs_gt[j]; kk[j + 1] = kk[j]; --j; }
+                rs_gt[j + 1] = xv;
+                kk[j + 1] = xk;
+            }
+            for (int i = 0; i < k; ++i) {
+                if (i < n) { sel_ids[i] = rs_gt[i]; sel_logit[i] = apply_penalties(l[rs_gt[i]], hit_count(rs_gt[i]), p); }
+                else { sel_ids[i] = 0; sel_logit[i] = __int_as_float(0xff800000); }
+            }
+        }
+        __syncthreads();
+    }
+    if (legacy) {
+        for (int i = 0; i < k; ++i) {
+            // `n_vocab` is the "no candidate" index: it loses every comparison to a real one (same convention as
+            // the greedy kernel, whose tie rule this reduction shares).
+            float bv = __int_as_float(0xff800000);   // -inf
+            int best = n_vocab;
+            for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+                bool taken = false;
+                for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
+                if (taken) continue;
+                const float s = apply_penalties(l[v], hit_count(v), p);
+                if (s > bv) { bv = s; best = v; }
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+                const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+                if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+            }
+            const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+            if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+            __syncthreads();
+            if (warp == 0) {
+                const int nw = (int) ((blockDim.x + 31) >> 5);
+                float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+                int wi = lane < nw ? si[lane] : n_vocab;
+                for (int off = 16; off > 0; off >>= 1) {
+                    const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+                    const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+                    if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+                }
+                if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
+            }
+            __syncthreads();
+        }
     }
 
     // ---- min_p: keep the descending prefix whose probability is at least `min_p` of the top token's.  The
@@ -297,10 +439,40 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         cum += exp((double) scaled(i) - (double) smx) / sum;
         if ((double) u < cum) { pick = sel_ids[i]; break; }
     }
-    if (threadIdx.x == 0) out[t] = pick;
+    if (threadIdx.x == 0) {
+        out[t] = pick;
+        // H3: the row's final distribution (the kept candidates and their probabilities), for speculative
+        // sampling's accept / residual step on the host
+        if (cand_n != nullptr) {
+            cand_n[t] = n_keep;
+            for (int i = 0; i < n_keep; ++i) {
+                cand_id[t * 64 + i] = sel_ids[i];
+                cand_p[t * 64 + i] = (float) (exp((double) scaled(i) - (double) smx) / sum);
+            }
+        }
+    }
+}
+
+bool sampler_old() {
+    static const bool v = std::getenv("STRATA_SAMPLER_OLD") != nullptr;
+    return v;
 }
 
 }  // namespace
+
+void sample_tokens_cand(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, int* out, int* cand_n, int* cand_id, float* cand_p, void* stream) {
+    if (n_tokens <= 0 || n_vocab <= 0) return;
+    const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
+                               ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned) : 0;
+    (sampler_old() ? sampler_kernel<true> : sampler_kernel<false>)<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+        logits, n_vocab, n_tokens, history, history_len, p, out, cand_n, cand_id, cand_p);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "sample_tokens_cand launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
@@ -321,8 +493,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
+        (sampler_old() ? sampler_kernel<true> : sampler_kernel<false>)<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+            logits, n_vocab, n_tokens, history, history_len, p, out, nullptr, nullptr, nullptr);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

@@ -4,7 +4,11 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -185,12 +189,54 @@ void DirectFile::wake() {
 
 #else
 // ------------------------------------------------------------------------------------------------ POSIX
-// Phase L replaces this with io_uring. Until then a read completes inside `submit`, which is correct and
-// keeps the tree compiling on Linux (plan v0.3 section 5.1 rule 4).
+// A1: ASYNC ON LINUX.  The old form completed every read inside `submit` (a synchronous pread), so the PLE
+// table's ~16 random 4 KiB rows per token were read at QD1, serially, on the token thread: measured ~6.6 ms of
+// GPU-idle host time per verify window (112 rows at ~60 us).  Reads now go to a small pool of reader threads
+// (pread on the O_DIRECT fd) and complete into a queue that `wait` drains, so up to `kThreads` are in flight.
 struct DirectFile::Impl {
     int fd = -1;
     uint64_t size = 0;
+    struct Req { uint64_t off; void* buf; uint32_t len; uint64_t tag; };
+    std::mutex mu;
+    std::condition_variable cv_req, cv_done;
+    std::deque<Req> reqs;
     std::deque<Completion> done;
+    std::vector<std::thread> thr;
+    bool stop = false;
+    static int threads() {
+        static const int n = [] { const char* e = std::getenv("STRATA_DIRECT_THREADS"); return e ? std::max(1, std::atoi(e)) : 32; }();
+        return n;
+    }
+    void loop() {
+        for (;;) {
+            Req r;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv_req.wait(lk, [&] { return stop || !reqs.empty(); });
+                if (stop) return;
+                r = reqs.front();
+                reqs.pop_front();
+            }
+            const ssize_t got = pread(fd, r.buf, r.len, (off_t) r.off);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                done.push_back(Completion{r.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+            }
+            cv_done.notify_all();
+        }
+    }
+    void start() {
+        stop = false;
+        for (int i = 0; i < threads(); ++i) thr.emplace_back([this] { loop(); });
+    }
+    void halt() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; }
+        cv_req.notify_all();
+        for (auto& t : thr) t.join();
+        thr.clear();
+        reqs.clear();
+        done.clear();
+    }
 };
 
 DirectFile::DirectFile() : impl_(new Impl) {}
@@ -203,14 +249,15 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
+    impl_->start();
     return true;
 }
 
 void DirectFile::close() {
+    if (!impl_->thr.empty()) impl_->halt();
     if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
     impl_->size = 0;
-    impl_->done.clear();
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
@@ -221,14 +268,28 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
         err = "DirectFile: unaligned request";
         return false;
     }
-    const ssize_t got = pread(impl_->fd, buffer, length, (off_t) offset);
-    impl_->done.push_back(Completion{tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->reqs.push_back(Impl::Req{offset, buffer, length, tag});
+    }
+    impl_->cv_req.notify_one();
     return true;
 }
 
-void DirectFile::wake() {}   // reads complete inside submit; nothing ever blocks in wait
+void DirectFile::wake() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->done.push_back(Completion{WAKE_TAG, 0u, true});
+    }
+    impl_->cv_done.notify_all();
+}
 
-int DirectFile::wait(Completion* out, int max, int) {
+int DirectFile::wait(Completion* out, int max, int timeout_ms) {
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    if (impl_->done.empty() && timeout_ms != 0) {
+        if (timeout_ms < 0) impl_->cv_done.wait(lk, [&] { return !impl_->done.empty(); });
+        else impl_->cv_done.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return !impl_->done.empty(); });
+    }
     int n = 0;
     while (n < max && !impl_->done.empty()) {
         out[n++] = impl_->done.front();

@@ -73,6 +73,17 @@ public:
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
+    /// H3: SPECULATIVE SAMPLING (`STRATA_SPEC_SAMPLE`).  Drafts are sampled from the draft head's top-kq at the
+    /// request's temperature (set before each round; <= 0 = greedy argmax), and each draft's candidate list
+    /// (full-vocab ids + q) is kept for the verifier's accept / residual step.
+    bool spec_sample() const { return spec_sample_; }
+    void reseed(uint64_t s) { rng_ = s * 0x2545F4914F6CDD1Dull + 0x9E3779B97F4A7C15ull; }
+    void set_temperature(float t) { if (h_temp_) *(volatile float*) h_temp_ = t; temp_ = t; }
+    /// draft j's q-candidates from the last draft()/draft_first(): count, ids, probabilities
+    int cand_n(int j) const { return j >= 0 && j < (int) cn_.size() ? cn_[(size_t) j] : 0; }
+    const int32_t* cand_id(int j) const { return cid_.data() + (size_t) j * 32; }
+    const float* cand_q(int j) const { return cq_.data() + (size_t) j * 32; }
+
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
@@ -118,6 +129,21 @@ private:
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;
+    // H3
+    bool spec_sample_ = false;
+    int kq_ = 16;
+    float temp_ = 0.0f;
+    uint64_t rng_ = 0x9E3779B97F4A7C15ull;
+    float *h_u_ = nullptr, *m_u_ = nullptr, *h_temp_ = nullptr, *m_temp_ = nullptr;
+    int32_t *h_cn_ = nullptr, *m_cn_ = nullptr, *h_cid_ = nullptr, *m_cid_ = nullptr;
+    float *h_cq_ = nullptr, *m_cq_ = nullptr;
+    int32_t *dcn_ = nullptr, *dcid_ = nullptr;
+    float* dcq_ = nullptr;
+    std::vector<int32_t> cn_, cid_;
+    std::vector<float> cq_;
+    float next_u();
+    void stage_u(int n);
+    void take_cand(int n);
     // device
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;

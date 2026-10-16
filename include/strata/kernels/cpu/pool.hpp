@@ -139,19 +139,10 @@ public:
         repark = ms_repark_;
     }
 
-    /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's
-    /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends
-    /// keeps every worker's core at 100% while the engine waits for a request - issue #4, "CPU 50% even when
-    /// doing nothing" (7 of the 5700X's 16 threads).  Inside a request the gaps between batches are far below
-    /// this, so the token path still never sleeps; between requests the workers block on `sleep_cv_`.
-    static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
-
 private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch);
     void run_phase(int mode, int n_tasks);
-    /// Bump `epoch_`, and wake the workers that went to sleep.  Every publish goes through here.
-    void publish();
 
     int n_ = 0;
     bool host_works_ = true;
@@ -181,11 +172,28 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
-    // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
-    // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
-    alignas(64) std::atomic<uint32_t> sleepers_{0};
-    std::mutex sleep_mu_;
-    std::condition_variable sleep_cv_;
+    // R9a: the park is a HYBRID.  The pure `_mm_pause` spin measured 100% of every worker's CPU on a 24-thread
+    // box (perf: ExpertPool::worker = every sample) - 12-16 cores busy-waiting through the GPU's attention
+    // phases, the ring waits and the MTP draft, starving the reader threads' futex wakeups and the desktop.
+    // Each worker now spins briefly (kParkSpin pauses, ~150 us - the phases inside one layer are that close)
+    // and then blocks on the condvar.  `parked_` semantics are unchanged: it counts a worker from the moment
+    // it enters the wait (spin or blocked) until it observes a new epoch, so the publisher barrier holds.
+    std::mutex park_mu_;
+    std::condition_variable park_cv_;
+    // R10: the park spin is TUNABLE at runtime (STRATA_PARK_SPIN_US, microseconds, default 2500).  The R9a
+    // fixed 150 us was sized for the 6-core upstream box whose intra-layer phases sit ~150 us apart; on the
+    // 9900X a decode window's phases are ~0.5-2.5 ms apart, so every worker BLOCKED between phases and each
+    // publish paid a staggered futex wake while the first workers to wake ate the whole task queue - the
+    // drain ran at a fraction of its threads' capacity (measured 13.5 GB/s aggregate vs a 6.2 GB/s
+    // single-thread kernel rate on 17 claimants).  A spin that covers the intra-window gaps keeps workers
+    // hot through a window; they still block between requests.  The futex-starvation concern that motivated
+    // the block (ring readers, desktop) is bounded by leaving 8 SMT siblings unclaimed by the pool.
+    int park_spin_iters_();   // pause-iteration cap per park; ~143 pauses/us on Zen 5
+    static int park_spin_iters();   // cached env read, thread-safe via function-local static
+    // R10: tasks per thread per phase (STRATA_POOL_TASKS, default 3).  51 tiny tasks per layer-phase was
+    // granularity-starved against wake jitter; with a hot spin 2-3 per thread balances tails well.
+    static int tasks_per_thread();
+    std::thread::id host_thread_{};   // R9a: diagnostics
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts

@@ -1,0 +1,73 @@
+{
+ "tag": "dynrs2",
+ "cfg": "hill/cfg-dynrs2.json",
+ "ctxs": {
+  "4096": {
+   "rows": [
+    {
+     "i": 0,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 11.64019513130188,
+     "prefill_tok_s": 361.3341488313681,
+     "decode_tok_s": 24.16277702888339,
+     "wall_s": 19.544915676116943,
+     "sample": "The"
+    },
+    {
+     "i": 1,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.3766520023345947,
+     "prefill_tok_s": 11166.806425905166,
+     "decode_tok_s": 23.4121782992745,
+     "wall_s": 8.534799337387085,
+     "sample": "The"
+    },
+    {
+     "i": 2,
+     "prompt_tokens": 4206,
+     "completion_tokens": 192,
+     "ttft_s": 0.41092991828918457,
+     "prefill_tok_s": 10235.321919393815,
+     "decode_tok_s": 23.650044133193177,
+     "wall_s": 8.487024784088135,
+     "sample": "The"
+    }
+   ],
+   "decode_med": 23.650044133193177,
+   "decode_min": 23.4121782992745,
+   "decode_max": 24.16277702888339,
+   "prefill_med": 10235.321919393815,
+   "telemetry": {
+    "mtp_windows": 85,
+    "tok_per_win": 2.51,
+    "accept_pct": 50.2,
+    "ms_per_win": 95.4,
+    "req_per_tok": 297.3,
+    "hot": 52712,
+    "ring": 4366,
+    "disk_blobs": 8425,
+    "disk_gb": 17.19,
+    "disk_gbs": 2.12,
+    "ver_wait": 17.6,
+    "ver_pool": 73.2,
+    "ver_host": 0.6,
+    "commit": 0.7,
+    "plan": 4.2,
+    "actq": 0.4,
+    "jobs": 68.5,
+    "run": 13.5,
+    "ringwait": 148.3,
+    "drain": 55.4,
+    "gu": 36.6,
+    "down": 18.5,
+    "gen_ms": 8111,
+    "gen_tok": 192,
+    "gen_tps": 23.7,
+    "ring_per_tok": 22.739583333333332,
+    "miss_blobs_per_tok": 43.880208333333336
+   }
+  }
+ }
+}

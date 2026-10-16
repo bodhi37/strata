@@ -44,7 +44,7 @@ constexpr int QK8_0 = 32;
 // first run.  Three copies of a converter whose failure mode is silent wrong bits was two copies too many.
 
 
-__global__ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
+__global__ void __launch_bounds__(1024) quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
                                      long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
@@ -52,7 +52,7 @@ __global__ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __res
     uint8_t* out = blocks + b * 34;                 // { fp16 d ; int8 qs[32] }
 
     float amax = 0.0f;
-    for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(xb[i]));
+    for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(__ldg(&xb[i])));
     if (amax == 0.0f) {
         // ggml leaves the block zeroed: d = 0 and every q = 0.  Writing the fp16 zero explicitly rather than
         // skipping keeps the block layout deterministic for the byte comparison.
@@ -69,7 +69,7 @@ __global__ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __res
 
     // double division, matching the reference exactly (subtlety 2)
     for (int i = 0; i < QK8_0; ++i) {
-        double q = rint((double) xb[i] / (double) d32);
+        double q = rint((double) __ldg(&xb[i]) / (double) d32);
         if (q > 127.0) q = 127.0;
         if (q < -128.0) q = -128.0;
         out[2 + i] = (uint8_t) (int8_t) q;
@@ -97,7 +97,7 @@ __global__ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __res
 /// `moe_hit_parity`.  This function's job is different: it must match **this engine's own CPU reference**,
 /// because a hit and a miss for the same expert on the same layer have to produce the same number.  The CPU
 /// path is the reference - C1 passes on it - so the hit path is brought to it, not the reverse.
-__global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
+__global__ void __launch_bounds__(1024) quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
                                             float* __restrict__ scales, long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
@@ -105,7 +105,7 @@ __global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t
     uint8_t* out = blocks + b * 34;
 
     float amax = 0.0f;
-    for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(xb[i]));
+    for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(__ldg(&xb[i])));
     // VERBATIM from `cpu/expert.cpp:144-145`, including the `amax > 0` guard, so the fp32 value written here
     // is bit-identical to the `s` the CPU path used.
     const float s = amax > 0.f ? amax / 127.f : 0.f;
@@ -118,7 +118,7 @@ __global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t
     for (int i = 0; i < QK8_0; ++i) {
         // VERBATIM from `cpu/expert.cpp:159-162`: reciprocal multiply, then `t + copysign(0.5, t)` truncated
         // toward zero, which is `lround`'s rule - round half away from zero.
-        const float t = xb[i] * inv;
+        const float t = __ldg(&xb[i]) * inv;
         const float r = t + (t >= 0.f ? 0.5f : -0.5f);
         int v = (int) r;
         v = v < -127 ? -127 : (v > 127 ? 127 : v);
@@ -126,7 +126,7 @@ __global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t
     }
 }
 
-__global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
+__global__ void __launch_bounds__(1024) dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
                                     long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
@@ -158,7 +158,7 @@ __device__ __forceinline__ int nearest_int_dev(float fval) {
     return (i & 0x007fffff) - 0x00400000;
 }
 
-__global__ void quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
+__global__ void __launch_bounds__(1024) quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
                                      long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
@@ -172,7 +172,7 @@ __global__ void quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __res
     // so a tie keeps the FIRST maximum - which is what `np.argmax` does in the reference transcription too.
     float max = 0.0f, amax = 0.0f;
     for (int j = 0; j < QK_K; ++j) {
-        const float ax = fabsf(xb[j]);
+        const float ax = fabsf(__ldg(&xb[j]));
         if (ax > amax) {
             amax = ax;
             max = xb[j];
@@ -196,7 +196,7 @@ __global__ void quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __res
         // wherever the true product sits just off a .5 boundary.  The first version of this kernel differed
         // from the reference in 1 element of 524,288 for exactly this reason, and `__fmul_rn` pins the
         // rounding step the source actually performs.
-        const int v = nearest_int_dev(__fmul_rn(iscale, xb[j]));
+        const int v = nearest_int_dev(__fmul_rn(iscale, __ldg(&xb[j])));
         qs[j] = (int8_t) min(127, v);            // MIN only - the source has no lower clamp
     }
     for (int j = 0; j < QK_K / 16; ++j) {
@@ -207,7 +207,7 @@ __global__ void quantize_q8_K_kernel(const float* __restrict__ x, uint8_t* __res
     *d = 1.0f / iscale;
 }
 
-__global__ void dequant_q8_K_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
+__global__ void __launch_bounds__(1024) dequant_q8_K_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
                                     long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;

@@ -137,7 +137,7 @@ __device__ __forceinline__ float warp_max(float x) {
 }
 
 __launch_bounds__(QUANT_THREADS, 1)
-__global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
+__global__ void __launch_bounds__(1024) native_quantize_q8_1_kernel(const float* __restrict__ x,
                                            Q81Block* __restrict__ y, int n_in) {
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
@@ -217,7 +217,7 @@ __device__ __forceinline__ float q5_q8_dot(const Q5KBlock* __restrict__ bq5,
 // eight weight blocks per K iteration, warp-ascending shared sum, then XOR tree.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -239,7 +239,7 @@ __global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -285,7 +285,7 @@ __device__ __forceinline__ float q2_q8_dot(const Q20Block* __restrict__ w,
 // Preserve the same outer accumulation and cross-warp reduction as the oracle.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -305,7 +305,7 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -325,8 +325,8 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
 // Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
     const auto* x = static_cast<const uint16_t*>(ptr);
-    int value = x[2 * i32] << 0;
-    value |= x[2 * i32 + 1] << 16;
+    int value = __ldg(&x[2 * i32]) << 0;
+    value |= __ldg(&x[2 * i32 + 1]) << 16;
     return value;
 }
 
@@ -373,7 +373,7 @@ __device__ __forceinline__ float q3_q8_dot(const Q3KBlock* __restrict__ w,
 // Q3_K generic MMVQ: QK=256, QI=16, VDR=1, eight blocks per iteration.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q3_k_mmvq_kernel(const Q3KBlock* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_q3_k_mmvq_kernel(const Q3KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -393,7 +393,7 @@ __global__ void native_q3_k_mmvq_kernel(const Q3KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -454,7 +454,7 @@ __device__ __forceinline__ float iq4_xs_q8_dot(const IQ4XSBlock* __restrict__ w,
 // IQ4_XS generic MMVQ: QK=256, QI=32, VDR=4,16 blocks per iteration.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
                                          const Q81Block* __restrict__ x,
                                          float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -474,7 +474,7 @@ __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -549,7 +549,7 @@ __device__ __forceinline__ float q4_q8_dot(const Q4KBlock* __restrict__ bq4,
 // eight weight blocks per K iteration, warp-ascending shared sum, then XOR tree.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -571,7 +571,7 @@ __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -624,7 +624,7 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
 // Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
 template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -644,7 +644,7 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -736,7 +736,7 @@ __device__ __forceinline__ float small_q8_dot(const IQ4NLBlock* __restrict__ w,
 // the pinned 64/32-block iteration and 2048/1024-element small-K thresholds.
 template<typename Weight, int Qi, bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
-__global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_small_mmvq_kernel(const Weight* __restrict__ w,
                                          const Q81Block* __restrict__ x,
                                          float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
@@ -755,7 +755,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
             }
         }
     }
-    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    __shared__ float partial[WARPS - 1][ROWS][WARP + 1];  // +1 pad: kills 3-way bank conflict on ROWS=1 (stride 32 -> 33)
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
@@ -997,7 +997,7 @@ bool g_multi_exact = true;   // until the upstream layout is timed on an idle GP
 
 template<typename F, int NCOLS, int NW, int ROWS>
 __launch_bounds__(NW * WARP, 1)
-__global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
+__global__ void __launch_bounds__(1024) native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
                                          const Q81Block* __restrict__ x,
                                          float* __restrict__ y, int n_in, int n_out) {
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count

@@ -28,17 +28,17 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
                                                                         int64_t max_blocks, float* __restrict__ out) {
     const int64_t qi = blockIdx.y;
     const int32_t* st = steps + qi * kStepCount;
-    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    const int64_t n_kv = __ldg(&st[kStepNKv]), n_bid = __ldg(&st[kStepNBid]);
     const int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5);
     if (b > n_bid || b >= max_blocks) return;
     const int lane = threadIdx.x & 31;
     const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
-    const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
+    const float4 k4 = __ldg(reinterpret_cast<const float4*>(key + lane * 4));
     const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
     float score = 0.0f;
 #pragma unroll
     for (int h = 0; h < IDX_HEADS; ++h) {
-        const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
+        const float4 q4 = __ldg(reinterpret_cast<const float4*>(q + h * IDX_DIM));
         float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     __shared__ int s_digit, s_above;
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
-    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    const int64_t n_kv = __ldg(&st[kStepNKv]), n_bid = __ldg(&st[kStepNBid]), width = __ldg(&st[kStepWidth]);
     int32_t* out = ids + qi * cap;
     const int t = threadIdx.x;
     if (n_kv <= width) {                               // everything is selected: the identity, ascending
@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
         for (int64_t b = b0; b < b1; ++b) {
             const int w = weight(b);
             if (w == 0) continue;
-            const uint32_t k = order_key(sc[b]);
+            const uint32_t k = order_key(__ldg(&sc[b]));
             if ((k & hi_mask) == (prefix & hi_mask)) atomicAdd(&hist[(k >> shift) & 255], w);
         }
         __syncthreads();
@@ -105,7 +105,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     for (int64_t b = b0; b < b1; ++b) {
         const int w = weight(b);
         if (w == 0) continue;
-        const uint32_t k = order_key(sc[b]);
+        const uint32_t k = order_key(__ldg(&sc[b]));
         if (k > thr) gt += w;
         else if (k == thr) eq += w;
     }
@@ -139,7 +139,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     for (int64_t b = b0; b < b1; ++b) {
         const int w = weight(b);
         if (w == 0) continue;
-        const uint32_t k = order_key(sc[b]);
+        const uint32_t k = order_key(__ldg(&sc[b]));
         if (k > thr) {
             for (int c = 0; c < w; ++c) out[wpos++] = (int32_t) (b * R + c);
         } else if (k == thr) {

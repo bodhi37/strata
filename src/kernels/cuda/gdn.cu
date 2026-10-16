@@ -40,7 +40,7 @@ __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf
 /// `ks`/`qs` stage `k[idx[h]]` and `q[idx[h]]` for the block's heads.  Within a warp h is constant and j
 /// varies, so the staged row is read with a single broadcast - which is also why the GLOBAL loads of
 /// `q`/`k` are done once per block into shared instead of once per thread.
-__global__ void gdn_step_kernel(float* __restrict__ state, const float* __restrict__ q,
+__global__ void __launch_bounds__(1024) gdn_step_kernel(float* __restrict__ state, const float* __restrict__ q,
                                 const float* __restrict__ k, const float* __restrict__ v,
                                 const float* __restrict__ gate, const float* __restrict__ beta,
                                 float* __restrict__ o, int S, int h_k, int h_v) {
@@ -96,7 +96,7 @@ __global__ void gdn_step_kernel(float* __restrict__ state, const float* __restri
 
 /// `ggml_ssm_conv`: out[c] = sum_i inp[i][c] * kW[c*d_conv + i], inp = [conv_state | x], and the state slides.
 /// One thread per channel; d_conv is 4, so the serial work per thread is a 4-tap dot and an unrolled shift.
-__global__ void gdn_conv_kernel(float* __restrict__ cs, const float* __restrict__ x,
+__global__ void __launch_bounds__(1024) gdn_conv_kernel(float* __restrict__ cs, const float* __restrict__ x,
                                 const float* __restrict__ kW, float* __restrict__ out, int C, int dc) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -115,7 +115,7 @@ __global__ void gdn_conv_kernel(float* __restrict__ cs, const float* __restrict_
 /// The sum is accumulated in DOUBLE, as `ref/gdn.py` does (`l2_norm(q.astype(np.float64), eps)`), because the
 /// reference deliberately computes this one in float64 and then casts - so matching its precision is part of
 /// transcribing it.
-__global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
+__global__ void __launch_bounds__(1024) gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
     const int row = blockIdx.x;
     float* p = x + (size_t) row * cols;
     double acc = 0.0;
@@ -130,7 +130,7 @@ __global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
 }
 
 /// y = rms_norm(o, eps) * ssm_norm * sigmoid(z), one warp per head, norm over that head's S values.
-__global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
+__global__ void __launch_bounds__(1024) gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
                                     const float* __restrict__ ssm_norm, float* __restrict__ y, int S,
                                     float eps) {
     const int h = blockIdx.x;
@@ -214,7 +214,7 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
 /// the glue between the projection and the kernel was wrong, and `ref/gdn.py` (`beta = sigmoid(wbeta @ x)`) and
 /// `ref/model.py` (`beta = G.sigmoid(proj(...))`) both get it right - so the two transcriptions agreed with
 /// each other and neither was ever compared against the C++ that actually runs.
-__global__ void gdn_beta_gate_kernel(float* __restrict__ beta, int n) {
+__global__ void __launch_bounds__(1024) gdn_beta_gate_kernel(float* __restrict__ beta, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) beta[i] = sigmoid_f(beta[i]);
 }

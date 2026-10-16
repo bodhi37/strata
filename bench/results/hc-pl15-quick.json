@@ -1,0 +1,20 @@
+[
+ {
+  "target": 1024,
+  "prompt_tokens": 1099,
+  "completion_tokens": 192,
+  "ttft_s": 7.500294208526611,
+  "prefill_tok_s": 146.52758537799974,
+  "decode_tok_s": 25.461324668159172,
+  "wall_s": 15.001867771148682
+ },
+ {
+  "target": 4096,
+  "prompt_tokens": 4206,
+  "completion_tokens": 192,
+  "ttft_s": 9.808239698410034,
+  "prefill_tok_s": 428.8231251813528,
+  "decode_tok_s": 24.199745820403436,
+  "wall_s": 17.700884580612183
+ }
+]

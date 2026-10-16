@@ -32,6 +32,11 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    // R8: where a chunk's time goes.  `ms_moe` is host time inside the MoE section; `ms_moe_rd_wait` is
+    // the part waiting for READER threads (starved reads), `ms_moe_used_wait` the part waiting for the GPU
+    // to free a staging slot (device-bound).  The balance says whether to add readers or fix the device side.
+    double ms_moe = 0, ms_moe_rd_wait = 0, ms_moe_used_wait = 0;
+    double ms_qsa = 0, ms_gdn = 0;
 };
 
 class Prefill {
@@ -54,6 +59,12 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// R10: allocate/free the chunk-sized device scratch.  `run` allocates on entry and frees on exit
+    /// (every exit), so a resident server's DECODE is not starved by an idle prefill's gigabytes
+    /// (measured: 16384-token chunk at 359 tok/s, then decode died with 'sample_tokens: out of memory').
+    bool alloc_all(std::string& err);
+    void free_all();
+    bool init_readers();
 
     const PrefillStats& stats() const { return stats_; }
 

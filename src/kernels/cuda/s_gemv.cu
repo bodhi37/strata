@@ -88,7 +88,7 @@ __device__ __forceinline__ float q8_0_at(const uint8_t* __restrict__ x, long lon
 /// differs (`uint16_t*` vs `uint8_t*`) and a templated pointer would need a cast at every call site - which is
 /// where a wrong stride would hide.
 template <int CODE_BITS>
-__global__ void s_gemv_q8k_kernel(const uint8_t* __restrict__ x, const uint8_t* __restrict__ codes,
+__global__ void __launch_bounds__(1024) s_gemv_q8k_kernel(const uint8_t* __restrict__ x, const uint8_t* __restrict__ codes,
                                   const float* __restrict__ scales, const float* __restrict__ offset,
                                   float* __restrict__ y, long long n_in, long long n_out, int bias,
                                   int codebook, int group_elems, int has_offset) {
@@ -140,7 +140,7 @@ __global__ void s_gemv_q8k_kernel(const uint8_t* __restrict__ x, const uint8_t* 
 /// different loader would be a second thing to get wrong, and the only difference IS the loader - the weight
 /// decode, the quad loop, the shared codebook and the reduction are identical.
 template <int CODE_BITS, bool Q8K>
-__global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint8_t* __restrict__ codes,
+__global__ void __launch_bounds__(1024) s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint8_t* __restrict__ codes,
                                         const float* __restrict__ scales, const float* __restrict__ offset,
                                         float* __restrict__ y, long long n_in, long long n_out, int bias,
                                         int codebook, int group_shift, int has_offset) {
@@ -293,7 +293,7 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
 }
 
 template <int CODE_BITS>
-__global__ void s_gemv_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+__global__ void __launch_bounds__(1024) s_gemv_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
                               const float* __restrict__ scales, const float* __restrict__ offset,
                               float* __restrict__ y, long long n_in, long long n_out, int bias, int codebook,
                               int group_elems, int has_offset) {
@@ -392,11 +392,12 @@ namespace {
 // divisor is passed as its logarithm and the division becomes a shift.  The host wrapper refuses a
 // non-power-of-two group rather than silently computing a wrong index.
 template <int CODE_BITS>
-__global__ void s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
-                                    const float* __restrict__ scales, const float* __restrict__ offset,
-                                    float* __restrict__ y, long long n_in, long long n_out, int bias,
-                                    int codebook, int group_elems, int group_shift, int has_offset,
-                                    int threads_per_row) {
+__global__ void __launch_bounds__(256)
+s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_t* __restrict__ codes,
+                    const float* __restrict__ scales, const float* __restrict__ offset,
+                    float* __restrict__ y, long long n_in, long long n_out, int bias,
+                    int codebook, int group_elems, int group_shift, int has_offset,
+                    int threads_per_row) {
     extern __shared__ float partial[];
     // THE CODEBOOK, IN SHARED MEMORY - 16 bytes, loaded once per block.  See the note on `kIq4Nl`.
     // THE LOAD AND THE BARRIER COME BEFORE THE EARLY RETURN: `o` is per-THREAD in this kernel, so a thread
@@ -430,11 +431,16 @@ __global__ void s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_
     constexpr int QB = QE * CODE_BITS / 8;             // 1 for S2, 2 for S4, 4 for S8
     constexpr unsigned MASK = (1u << CODE_BITS) - 1u;
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    long long cached_g = -1;
+    float d = 0.0f, b = 0.0f;
     long long i = (long long) tid * QE;
     for (; i + QE <= n_in; i += (long long) threads_per_row * QE) {
         const long long g = i >> group_shift;
-        const float d = s[g];
-        const float b = off ? off[g] : 0.0f;
+        if (g != cached_g) {
+            d = __ldg(&s[g]);
+            b = off ? __ldg(&off[g]) : 0.0f;
+            cached_g = g;
+        }
         const uint8_t* cp = c + i / PER_BYTE;
         unsigned v;
         if (QB == 1) v = cp[0];

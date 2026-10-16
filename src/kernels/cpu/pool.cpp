@@ -5,9 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
-
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <immintrin.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -15,9 +16,28 @@
 #else
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 namespace strata::kernels::cpu {
+
+// R10: runtime-tunable park spin and task granularity.  See pool.hpp for why these exist.
+int ExpertPool::park_spin_iters() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PARK_SPIN_US");
+        const int us = e ? std::max(1, std::atoi(e)) : 2500;
+        return us * 143;   // ~7 ns per _mm_pause on Zen 5 at ~5 GHz
+    }();
+    return v;
+}
+
+int ExpertPool::tasks_per_thread() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_POOL_TASKS");
+        return e ? std::max(1, std::atoi(e)) : 3;
+    }();
+    return v;
+}
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
@@ -47,11 +67,33 @@ std::vector<int> physical_cores(bool skip_first) {
         }
     }
 #else
+    // R9a: ONE LOGICAL CPU PER PHYSICAL CORE (the first thread of each sibling set), followed by the SMT
+    // siblings in core order.  The old form listed every logical CPU the affinity mask allows and then took
+    // them in index order, so 12 workers on a 12C/24T 9900X landed as {1,2,3,...,16}: cores 0-7 each got TWO
+    // workers (both running AVX-512 drains at ~60% speed against each other) while cores 9-11 sat idle, and
+    // nothing ever ran on the siblings except by accident.  With this order the first 11 workers are alone on
+    // their cores, worker 12+ takes a sibling, and the readers/server/GPU threads have 12 siblings to land on.
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof set, &set) == 0) {
-        for (int i = 0; i < CPU_SETSIZE; ++i)
-            if (CPU_ISSET(i, &set)) cores.push_back(i);
+        const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        std::vector<int> phys, sib;
+        for (long i = 0; i < ncpu && i < CPU_SETSIZE; ++i) {
+            if (!CPU_ISSET((int) i, &set)) continue;
+            char path[128];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            std::ifstream f(path);
+            long first = i;
+            if (f) {
+                std::string line;
+                std::getline(f, line);
+                first = strtol(line.c_str(), nullptr, 10);
+            }
+            if (first == i) phys.push_back((int) i);
+            else sib.push_back((int) i);
+        }
+        for (int c : phys) cores.push_back(c);
+        for (int c : sib) cores.push_back(c);
     } else {
         for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
     }
@@ -128,21 +170,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
 ExpertPool::~ExpertPool() {
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    publish();
+    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }
+    park_cv_.notify_all();
     for (auto& t : threads_) t.join();
-}
-
-void ExpertPool::publish() {
-    // Both sides are seq_cst, and that is the whole lost-wakeup argument: a worker going to sleep does
-    // `sleepers_++` and then reads `epoch_`, the host does `epoch_++` and then reads `sleepers_`.  In one total
-    // order at least one of them sees the other's write - the worker sees the new epoch and does not sleep, or
-    // the host sees the sleeper and notifies under the mutex the worker holds until it is inside `wait`.
-    // On x86 the fetch_add is a locked xadd either way, so this costs the token path nothing.
-    epoch_.fetch_add(1, std::memory_order_seq_cst);
-    if (sleepers_.load(std::memory_order_seq_cst) != 0) {
-        std::lock_guard<std::mutex> lk(sleep_mu_);
-        sleep_cv_.notify_all();
-    }
 }
 
 void ExpertPool::worker(int id) {
@@ -153,30 +183,24 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
-        // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
-        // iterations are spent here with nothing to do.
-        //
-        // **AND NOTHING ELSE HAPPENS IN HERE.**  This loop used to do `pauses_.fetch_add(1)` on every iteration
-        // - a locked read-modify-write, five workers against one cache line - so the workers spent their wait
-        // invalidating each other's caches and the very line the host writes to publish work.  The counter was
-        // diagnostic and nothing branched on it.  See the note on the atomics in pool.hpp.
-        //
-        // After `kSpinBeforeSleep` with no work the worker sleeps instead (issue #4).  The clock is read once
-        // every 1024 pauses, so the spin itself is unchanged.
-        const auto parked_at = std::chrono::steady_clock::now();
-        uint32_t spins = 0;
-        while (epoch_.load(std::memory_order_acquire) == seen) {
+        // R9a/R10: HYBRID PARK with a RUNTIME-TUNED spin.  Spin `park_spin_iters()` pauses (default ~2.5 ms,
+        // which covers every intra-window gap: attention, router, act-quant, MTP draft), then block on the
+        // condvar - so a worker stays hot on its core through a whole generation window and only sleeps
+        // between requests.  `parked_` still counts this worker from entry into the wait (spin or blocked)
+        // until it observes the new epoch, so the publisher barrier is unchanged.
+        const int spin_cap = park_spin_iters();
+        for (int spun = 0; epoch_.load(std::memory_order_acquire) == seen; ++spun) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
-            if (std::chrono::steady_clock::now() - parked_at < kSpinBeforeSleep) continue;
-            std::unique_lock<std::mutex> lk(sleep_mu_);
-            sleepers_.fetch_add(1, std::memory_order_seq_cst);
-            sleep_cv_.wait(lk, [&] {
-                return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed);
-            });
-            sleepers_.fetch_sub(1, std::memory_order_relaxed);
+            if (spun < spin_cap) {
+                _mm_pause();
+                continue;
+            }
+            std::unique_lock<std::mutex> lk(park_mu_);
+            if (epoch_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed))
+                park_cv_.wait(lk, [&] {
+                    return epoch_.load(std::memory_order_acquire) != seen ||
+                           stop_.load(std::memory_order_relaxed);
+                });
         }
         if (stop_.load(std::memory_order_acquire)) return;
         seen = epoch_.load(std::memory_order_relaxed);
@@ -189,7 +213,37 @@ void ExpertPool::worker(int id) {
     }
 }
 
+static bool pool_sticky() {
+    static const bool v = std::getenv("STRATA_STICKY") != nullptr;
+    return v;
+}
+
 void ExpertPool::drain(int id, ExpertScratch& scratch) {
+    if (mode_ >= 5 && pool_sticky() && nfmt_->gu_type != 42 && nfmt_->d_type != 42) {
+        // L1: STICKY ROWS.  Every expert's rows are cut into `threads` fixed chunks and chunk c always goes to
+        // thread c, so a blob re-read by the next pool call (a split window's group B re-uses ~40% of group A's
+        // experts at the same layer) finds its bytes in the same core's L2/L3 instead of DRAM.  Static balance:
+        // run it with one thread per physical core.
+        const int threads = (int) n_ + (host_works_ ? 1 : 0);
+        const int c = id < 0 ? (int) n_ : id;
+        const int per = mode_ == 5 ? FF : H;
+        const int r0 = per * c / threads, r1 = per * (c + 1) / threads;
+        const int nb = (int) (mrows_ / per);
+        for (int e = 0; e < nb && r0 < r1; ++e) {
+            SplitBufMulti& sb = split_multi_[(size_t) e];
+            if (mode_ == 5) {
+                float* ff[MAXT];
+                for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+                native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+            } else {
+                const void* hq[MAXT];
+                for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+                native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+            }
+        }
+        done_.fetch_add(1, std::memory_order_release);
+        return;
+    }
     (void) id;
     for (;;) {
         const uint32_t i = head_.fetch_add(1, std::memory_order_relaxed);
@@ -272,7 +326,8 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     njobs_ = n_tasks;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    publish();
+    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }
+    park_cv_.notify_all();
     if (host_works_) drain(-1, host_scratch_);
     while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) _mm_pause();
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
@@ -314,7 +369,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
     const int threads = n_ + (host_works_ ? 1 : 0);
-    mtasks_ = 3 * threads;
+    mtasks_ = tasks_per_thread() * threads;
     mrows_ = (int64_t) n * FF;
     run_phase(3, mtasks_);
     const auto t1 = std::chrono::steady_clock::now();
@@ -342,7 +397,8 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
+        mtasks_ = tasks_per_thread() * threads;
+        if (pool_sticky() && f.gu_type != 42 && f.d_type != 42) mtasks_ = threads;   // L1: one fixed chunk per thread
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
@@ -383,7 +439,8 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     mode_ = 0;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    publish();   // a release (seq_cst): jobs_/njobs_ are visible before the bump
+    { std::lock_guard<std::mutex> lk(park_mu_); epoch_.fetch_add(1, std::memory_order_release); }   // release: jobs_/njobs_ visible before the bump
+    park_cv_.notify_all();
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //

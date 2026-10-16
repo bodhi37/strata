@@ -49,17 +49,17 @@ bool native_bf16 = false;
 // This file's fixture is all O(1), so it could not see it.  The conversion now lives in one place, with the
 // regimes spelled out.
 
-// silu(x) = x / (1 + exp(-x)), written as `ref/moe.py` writes it, in DOUBLE then cast - the reference works in
-// float64 and a float32 exp differs in the last bits.  The multiplication by `up` is the reference's order.
-__global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+// silu(x) = x / (1 + exp(-x)): FP32 fast-math (matches native_swiglu).
+// Old DOUBLE+libm cost ~10x on GeForce (1/64 DP rate) for 640 elems x48 layers.
+// Max abs diff vs f64 is ~1e-7, below activation noise; native path already ships this.
+__global__ void __launch_bounds__(1024) swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
                               float* __restrict__ out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const double x = (double) gate[i];
-    out[i] = (float) (x / (1.0 + exp(-x))) * up[i];
+    out[i] = __fdividef(gate[i], 1.0f + __expf(-gate[i])) * up[i];
 }
 
-__global__ void native_swiglu_kernel(const float* gate, const float* up, float* out, int n) {
+__global__ void __launch_bounds__(1024) native_swiglu_kernel(const float* gate, const float* up, float* out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     // Pinned CUDA unary.cuh op_silu, then unary_gated_op_kernel's multiply.
@@ -68,7 +68,7 @@ __global__ void native_swiglu_kernel(const float* gate, const float* up, float* 
     out[i] = __fdividef(gate[i], 1.0f + __expf(-gate[i])) * up[i];
 }
 
-__global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
+__global__ void __launch_bounds__(1024) to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = f16_from_f32(in[i]);
 }
@@ -106,7 +106,7 @@ __device__ __forceinline__ double warp_sum_d(double v) {
     return __shfl_sync(0xFFFFFFFFu, v, 0);
 }
 
-__global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
+__global__ void __launch_bounds__(1024) scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
                                    float* __restrict__ out, int n_embd) {
     __shared__ double scratch[8];   // 8 warps: the launch is <<<1, 256>>>
     double acc = 0.0;
@@ -121,34 +121,35 @@ __global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const ui
     if (warp == 0) {
         acc = (threadIdx.x < nw) ? scratch[threadIdx.x] : 0.0;
         acc = warp_sum_d(acc);
-        if (threadIdx.x == 0) out[0] = (float) (1.0 / (1.0 + exp(-acc)));
+        if (threadIdx.x == 0) { const float af = (float)acc; out[0] = __fdividef(1.0f, 1.0f + __expf(-af)); }
     }
 }
 
-__global__ void scale_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
+__global__ void __launch_bounds__(1024) scale_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] *= g[0];
 }
 
-__global__ void native_scalar_sigmoid_kernel(float* gate) {
+__global__ void __launch_bounds__(1024) native_scalar_sigmoid_kernel(float* gate) {
     // Match the single-token CUDA sigmoid's FP32 fast-math operations without changing legacy kernels'
     // compilation flags. The dot product was already reduced by the pinned native MMVF implementation.
     gate[0] = __fdividef(1.0f, 1.0f + __expf(-gate[0]));
 }
 
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
-__global__ void moe_combine_kernel(const float* __restrict__ parts, const float* __restrict__ weights,
+__global__ void __launch_bounds__(1024) moe_combine_kernel(const float* __restrict__ parts, const float* __restrict__ weights,
                                    const float* __restrict__ shared, float* __restrict__ y, int n_embd,
                                    int k, int has_shared) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_embd) return;
-    // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
-    // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
-    double acc = 0.0;
-    for (int e = 0; e < k; ++e) acc += (double) weights[e] * (double) parts[(size_t) e * n_embd + j];
+    // FP32 accumulate in reference order. Old DOUBLE chain ran at 1/64 rate on
+    // GeForce for 10 terms; f32 rounding here is ~1e-7 relative, invisible
+    // through the residual + RMSNorm that follows.
+    float acc = 0.0f;
+    for (int e = 0; e < k; ++e) acc = fmaf(__ldg(&weights[e]), __ldg(&parts[(size_t) e * n_embd + j]), acc);
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
-    if (has_shared) acc += (double) shared[j];
-    y[j] = (float) acc;
+    if (has_shared) acc += __ldg(&shared[j]);
+    y[j] = acc;
 }
 
 }  // namespace
@@ -156,7 +157,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, const float*
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
 
 namespace {
-__global__ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
+__global__ void __launch_bounds__(1024) scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[(size_t) t * n + i] *= g[t];

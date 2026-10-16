@@ -22,7 +22,7 @@ void check(const char* what) {
 
 // Fast Walsh-Hadamard Transform for N = 256: one warp per row, 8 values per lane in registers.
 // Orthonormal (scale 1/sqrt(256) = 1/16), so it is its own inverse.
-__global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n_rows, float scale) {
+__global__ void __launch_bounds__(1024) fwht256_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n_rows, float scale) {
     constexpr int warp_size = 32;
     constexpr int N = 256;
     constexpr int el_w = N / warp_size;   // 8
@@ -98,7 +98,7 @@ __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, in
 
 // One block = one 32-value group of one KV head of K (blockIdx.z = 0) or V (1); 32 threads. KV streaming: the VRAM
 // page only if the block is resident (table >= 0), the host copy always (identity layout) when there is one.
-__global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+__global__ void __launch_bounds__(1024) kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur,
                                     int kv_heads, int head_dim, int page_size, KvHostPools host) {
@@ -116,7 +116,7 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
 }
 
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
-__global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+__global__ void __launch_bounds__(1024) kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                           const int32_t* __restrict__ table, int64_t pos0,
                                           const float* __restrict__ K, const float* __restrict__ V,
                                           int kv_heads, int head_dim, int page_size, int is_v_grid, KvHostPools host,
@@ -136,7 +136,7 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
 }
 
 // Gather step[kStepWidth] cells into FP16 scratch (the non-fused attention paths)
-__global__ void kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint8_t* __restrict__ v_q4,
+__global__ void __launch_bounds__(1024) kv_gather_q4_kernel(const uint8_t* __restrict__ k_q4, const uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
                                     const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
                                     uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {

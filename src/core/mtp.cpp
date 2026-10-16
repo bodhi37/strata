@@ -193,6 +193,20 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_);
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
+    spec_sample_ = std::getenv("STRATA_SPEC_SAMPLE") != nullptr;
+    if (const char* e = std::getenv("STRATA_SPEC_KQ")) kq_ = std::max(1, std::min(32, std::atoi(e)));
+    if (spec_sample_) {
+        ok = mapped(T * 4 + 64, (void**) &h_u_, (void**) &m_u_) && mapped(64, (void**) &h_temp_, (void**) &m_temp_) &&
+             mapped(T * 4 + 64, (void**) &h_cn_, (void**) &m_cn_) &&
+             mapped(T * 32 * 4 + 64, (void**) &h_cid_, (void**) &m_cid_) &&
+             mapped(T * 32 * 4 + 64, (void**) &h_cq_, (void**) &m_cq_) &&
+             cudaMalloc((void**) &dcn_, (T + 4) * 4) == cudaSuccess &&
+             cudaMalloc((void**) &dcid_, (T + 4) * 32 * 4) == cudaSuccess &&
+             cudaMalloc((void**) &dcq_, (T + 4) * 32 * 4) == cudaSuccess;
+        if (!ok) { err = "mtp: H3 spec-sampling buffers failed"; return false; }
+        cn_.assign((size_t) T, 0); cid_.assign((size_t) T * 32, 0); cq_.assign((size_t) T * 32, 0.0f);
+        std::fprintf(stderr, "strata mtp: H3 speculative sampling ON (draft top-%d)\n", kq_);
+    }
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
         ident_ = b.take<int32_t>(T * (uint64_t) cap_);
@@ -424,11 +438,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
-        SamplerParams sp;
-        sp.greedy = true;
-        sp.temperature = 0.0f;
-        sample_tokens(head_logits_, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
-        row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
+        if (spec_sample_) {
+            draft_sample(head_logits_, T, (int) nv, sub ? dvocab_ : nullptr, m_u_, m_temp_, kq_, out_ids_, probs_, dcn_,
+                         dcid_, dcq_, cs);
+        } else {
+            SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            sample_tokens(head_logits_, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
+            row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
+        }
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
@@ -492,6 +511,7 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
         ok = record_forward(1, ra, cs_, err);
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok && spec_sample_) copy_cand(dcn_, dcid_, dcq_, row_ + 1, m_cn_, m_cid_, m_cq_, 0, cs_);
     return finish_capture(cs_, ok, round_exec_[T], "round", err);
 }
 
@@ -507,6 +527,7 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
     bool ok = record_forward(1, row, cs_, err);
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && spec_sample_) copy_cand(dcn_, dcid_, dcq_, row_ + 1, m_cn_, m_cid_, m_cq_, j, cs_);
     return finish_capture(cs_, ok, step_exec_[j], "step", err);
 }
 
@@ -569,6 +590,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     put(2 * max_t_ - 1, p + a);
     h_row_[0] = a;
     h_row_[1] = 0;
+    if (spec_sample_) stage_u(T);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -582,6 +604,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 1; j < std::min(max_t_ - 1, max_drafts_) && pj >= min_p; ++j) {
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
+        if (spec_sample_) stage_u(1);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
@@ -594,6 +617,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (spec_sample_) take_cand(n);
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
@@ -611,6 +635,32 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
         }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+}
+
+// ---- H3: speculative sampling helpers -----------------------------------------------------------------------
+float MtpDrafter::next_u() {
+    // splitmix64 -> [0, 1)
+    uint64_t z = (rng_ += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return (float) ((double) (z >> 40) / (double) (1ull << 24));
+}
+
+void MtpDrafter::stage_u(int n) {
+    for (int i = 0; i < n && i < max_t_; ++i) ((volatile float*) h_u_)[i] = next_u();
+}
+
+void MtpDrafter::take_cand(int n) {
+    for (int j = 0; j < n && j < max_t_; ++j) {
+        const int c = ((volatile int32_t*) h_cn_)[j];
+        cn_[(size_t) j] = c < 0 ? 0 : (c > 32 ? 32 : c);
+        for (int i = 0; i < 32; ++i) {
+            cid_[(size_t) j * 32 + i] = ((volatile int32_t*) h_cid_)[j * 32 + i];
+            cq_[(size_t) j * 32 + i] = ((volatile float*) h_cq_)[j * 32 + i];
+        }
+    }
+    for (int j = n; j < max_t_; ++j) cn_[(size_t) j] = 0;
 }
 
 }  // namespace strata::core

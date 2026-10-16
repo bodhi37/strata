@@ -69,6 +69,14 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
+/// H3: sample each row's draft from top-`kq` (<= 32) of the draft head at the mapped temperature (greedy when <= 0),
+/// with the host-staged uniforms `u[row]`; candidates (full-vocab ids, q) to `cand_*[row * 32 + i]`.
+void draft_sample(const float* logits, int n_rows, int n_vocab, const int32_t* dvocab, const float* u,
+                  const float* temp, int kq, int32_t* ids, float* probs_top, int32_t* cand_n, int32_t* cand_id,
+                  float* cand_q, void* stream);
+/// H3: the selected row's candidates to the mapped per-draft slot `j`.
+void copy_cand(const int32_t* cand_n, const int32_t* cand_id, const float* cand_q, const int32_t* row_dev,
+               int32_t* m_n, int32_t* m_id, float* m_q, int j, void* stream);
 /// probs[t] = softmax(logits[t])[ids[t]] for n_rows rows of n_vocab (the probability of each row's argmax).
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).

@@ -51,13 +51,13 @@ __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int i = t * 4; i < D; i += THREADS * 4) {
         const int c = i / N, d = i - c * N;
-        float4 r = *reinterpret_cast<const float4*>(a.R + i);
+        float4 r = __ldg(reinterpret_cast<const float4*>(a.R + i));
         if (a.apply) {
             const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + d);
             r.x = fmaf(b.x, gw[c], r.x); r.y = fmaf(b.y, gw[c], r.y);
             r.z = fmaf(b.z, gw[c], r.z); r.w = fmaf(b.w, gw[c], r.w);
         }
-        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + i);
+        const float4 g = __ldg(reinterpret_cast<const float4*>(a.w_norm + i));
         float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
 #pragma unroll
         for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;
@@ -112,7 +112,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
         if (lane < LR / 8 - 32) acc += dot8(__ldg(w4 + 32 + lane), lo + (32 + lane) * 8);
         acc = warp_sum(acc);
         if (lane == 0) {
-            float rv = a.R[i];
+            float rv = __ldg(&a.R[i]);
             if (a.apply) {
                 rv = fmaf(a.bo_prev[d0 + dd], 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC), rv);
                 a.R_out[i] = rv;                       // this block owns column d0+dd of every stream
@@ -150,13 +150,13 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
     float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int i = t * 4; i < D; i += THREADS * 4) {
         const int c = i / N, d = i - c * N;
-        float4 r = *reinterpret_cast<const float4*>(a.R + i);
+        float4 r = __ldg(reinterpret_cast<const float4*>(a.R + i));
         if (a.apply) {
             const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + d);
             r.x = fmaf(b.x, gw[c], r.x); r.y = fmaf(b.y, gw[c], r.y);
             r.z = fmaf(b.z, gw[c], r.z); r.w = fmaf(b.w, gw[c], r.w);
         }
-        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + i);
+        const float4 g = __ldg(reinterpret_cast<const float4*>(a.w_norm + i));
         float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
 #pragma unroll
         for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;

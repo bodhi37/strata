@@ -36,6 +36,10 @@ struct SamplerParams {
 //
 // `history` is (n_tokens, history_len) int32, the most recent tokens for each row with any unused slots set to
 // -1; only the last `p.penalty_last_n` of each row are counted.  Pass nullptr and 0 when no penalties apply.
+/// H3: the sampled path (temperature > 0), also writing each row's kept candidates (<= 64: ids + final
+/// probabilities, row-major [t * 64 + i]) and their count.  The pointers are device-visible (mapped is fine).
+void sample_tokens_cand(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, int* out, int* cand_n, int* cand_id, float* cand_p, void* stream);
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
