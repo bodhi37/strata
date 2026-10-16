@@ -57,15 +57,14 @@ std::vector<std::string> split(const std::string& s) {
 void make_blob(const cpu::NativeFmt& f, uint8_t* blob, std::mt19937& rng) {
     std::normal_distribution<float> nd(0.f, 0.02f);
     std::vector<float> row((size_t) std::max(kH, kFF));
-    const auto* tg = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
-    const auto* td = ggml_get_type_traits_cpu((ggml_type) f.d_type);
+    // ggml_quantize_chunk, not the CPU traits' from_float: the i-quants have no from_float (null - the old crash)
     for (int64_t r = 0; r < 2 * kFF; ++r) {
         for (int64_t i = 0; i < kH; ++i) row[(size_t) i] = nd(rng);
-        tg->from_float(row.data(), blob + (size_t) r * f.gu_row, kH);
+        ggml_quantize_chunk((ggml_type) f.gu_type, row.data(), blob + (size_t) r * f.gu_row, 0, 1, kH, nullptr);
     }
     for (int64_t r = 0; r < kH; ++r) {
         for (int64_t i = 0; i < kFF; ++i) row[(size_t) i] = nd(rng);
-        td->from_float(row.data(), blob + f.down_off + (size_t) r * f.d_row, kFF);
+        ggml_quantize_chunk((ggml_type) f.d_type, row.data(), blob + f.down_off + (size_t) r * f.d_row, 0, 1, kFF, nullptr);
     }
 }
 

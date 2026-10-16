@@ -187,6 +187,7 @@ public:
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
+    int64_t multi_calls = 0, multi_experts = 0, multi_tok = 0;   // unify: per-call shape telemetry
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
     /// atomics below.  It was a LOCKED read-modify-write in the park loop, so measuring the contention added to
@@ -295,6 +296,15 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    // unify F-POOL (mode 7): gate/up and down in ONE batch.  The gate/up tasks come first; the worker that finishes an
+    // expert's last gate/up rows quantizes its H and stamps fready_[e] with the batch's epoch, and a down task waits
+    // only on the stamps of experts whose gate/up tasks were all claimed before it (no deadlock: claims are in order)
+    int mtg_ = 0;           // gate/up tasks of the fused batch (the rest are down tasks)
+    int64_t mrows_d_ = 0;   // the down rows of the fused batch
+    int mtd_ = 0;           // its down tasks
+    uint32_t fepoch_ = 0;
+    std::unique_ptr<std::atomic<int32_t>[]> fgu_done_;   // gate/up rows finished, per expert of the batch
+    std::unique_ptr<std::atomic<uint32_t>[]> fready_;    // = fepoch_ once the expert's H is quantized
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

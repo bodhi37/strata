@@ -13325,11 +13325,23 @@ int main(int argc, char** argv) {
                     ver.ms_launch = 0; ver.ms_tail = 0;
                     double wp = 0, dr = 0, rp = 0;
                     pool.phase_ms(wp, dr, rp);
+                    // unify: per-request deltas (the pool's counters run for the engine's life)
+                    static double p_wp = 0, p_dr = 0, p_rp = 0, p_gu = 0, p_q = 0, p_dn = 0;
+                    static int64_t p_by = 0, p_ca = 0, p_ex = 0, p_tk = 0;
+                    const double gu_ms = pool.ms_multi_gu - p_gu, dn_ms = pool.ms_multi_down - p_dn;
+                    const int64_t by = pool.multi_bytes - p_by, ca = pool.multi_calls - p_ca,
+                                  ex = pool.multi_experts - p_ex, tk = pool.multi_tok - p_tk;
                     std::fprintf(stderr,
                                  "strata serve: pool/win ms: wait_park %.1f drain %.1f repark %.1f | native "
-                                 "gu %.1f q %.1f down %.1f\n",
-                                 wp * per, dr * per, rp * per, pool.ms_multi_gu * per, pool.ms_multi_q * per,
-                                 pool.ms_multi_down * per);
+                                 "gu %.1f q %.1f down %.1f | %.2f GB/win, %.1f GB/s in gu+down, %.1f calls/win, "
+                                 "%.1f experts/call, %.2f tok/expert\n",
+                                 (wp - p_wp) * per, (dr - p_dr) * per, (rp - p_rp) * per, gu_ms * per,
+                                 (pool.ms_multi_q - p_q) * per, dn_ms * per, by * per / 1e9,
+                                 gu_ms + dn_ms > 0 ? by / 1e6 / (gu_ms + dn_ms) : 0.0, ca * per,
+                                 ca > 0 ? (double) ex / ca : 0.0, ex > 0 ? (double) tk / ex : 0.0);
+                    p_wp = wp; p_dr = dr; p_rp = rp; p_gu = pool.ms_multi_gu; p_q = pool.ms_multi_q;
+                    p_dn = pool.ms_multi_down; p_by = pool.multi_bytes; p_ca = pool.multi_calls;
+                    p_ex = pool.multi_experts; p_tk = pool.multi_tok;
                 }
             }
             // R7: re-dump the routing histogram after every request.  A resident engine that is killed rather
