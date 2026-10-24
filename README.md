@@ -1,11 +1,12 @@
 ## Why this exists
 
-Strata requires 64GB RAM + 12GB VRAM minimum. This fork adds custom NVME offloading & tonne of architectural improvements, allowing just 32GB RAM + 12GB RAM + an SSD to run Qwen3.8-Flash-Next GSQ-RCO IQ3_S qt 131k ctx.
+Strata requires 64GB RAM + 12GB VRAM minimum. This fork adds custom NVME offloading & tonne of architectural improvements, allowing just 32GB RAM + 12GB RAM + an SSD to run Qwen3.8-Flash-Next.
 
 ## Performance (Qwen3.8-Flash-Next GSQ-RCO IQ3_S @ 131 ctx)
 
-| decode tok/s | cold prefill tok/s | prefix hit, 65K context |
-| **48.4** | **1350-1450** | **18.8K tok/s effective** |
+| Decode tok/s | Cold prefill tok/s | Prefix hit |
+| --- | --- | --- |
+| **48.4** | **1350–1450** | **18.8K tok/s effective** |
 
 ## Fork changes
 
