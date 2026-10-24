@@ -1,40 +1,13 @@
-> [!NOTE]
-> This is my fork of [Strata](https://github.com/Niko1221/Strata). The `unify` branch is the current one: upstream
-> v0.1.44.1 with all of my `orca-port` work merged on top. `orca-port` is kept as it was, for reference.
-> Upstream's own README starts [further down](#strata-upstream).
+## Why this exists
 
-## What this fork is for
+Strata requires 64GB RAM + 12GB VRAM minimum. This fork adds custom NVME offloading & tonne of architectural improvements, allowing just 32GB RAM + 12GB RAM + an SSD to run Qwen3.8-Flash-Next GSQ-RCO IQ3_S qt 131k ctx.
 
-Upstream Strata assumes 64 GB of RAM. My box has 30 GB (Ryzen 9 9900X, DDR5-6200, RTX 4070 Super 12 GB, one NVMe
-drive), and the IQ3_S experts alone are 50 GB. So most of this work is about running the model when it doesn't fit:
-keeping the right experts in VRAM and RAM, reading the rest from disk fast enough, and hiding as much of that as
-possible behind GPU work.
+## Performance (Qwen3.8-Flash-Next GSQ-RCO IQ3_S @ 131 ctx)
 
-One rule for all of it: the output has to match the stock IQ3_S quant. No dropping experts, no requantizing cold ones
-to save bandwidth. I tried a couple of lossy shortcuts along the way (dropping low-rank misses was worth +5 to +30%)
-and threw them out because the quality hit wasn't worth it.
+| decode tok/s | cold prefill tok/s | prefix hit, 65K context |
+| **48.4** | **1350-1450** | **18.8K tok/s effective** |
 
-## Where it ended up
-
-All numbers are from my box, sampling at temperature 1.0 on 20 held-out prompts (`hill/xb.py --big`). Greedy decoding
-gives flattering numbers on this setup, so I only use it to check that outputs are identical.
-
-| | decode tok/s | cold prefill tok/s | prefix hit, 65K context |
-| --- | ---: | ---: | ---: |
-| `orca-port` (Oct 16) | 43.2 | ~775 | 13.2K tok/s effective |
-| `unify` | **48.4** | **1350-1450** | **18.8K tok/s effective** |
-
-Both rows come from the same session, back to back. Decode on `orca-port` went from 24.5 to 43.5 tok/s over the last
-two days of tuning before the merge (more on that below).
-
-## How `unify` was put together
-
-`orca-port` forked from upstream v0.1.8, and by v0.1.44.1 upstream had made big changes to the prompt
-path, the arena and the server. Rebasing 40-odd commits across all that wasn't realistic, so I re-parented a snapshot of `orca-port` onto
-v0.1.8 and did one three-way merge against v0.1.44.1, then fixed what didn't build. After that I ported my prefill and
-pool work onto upstream's newer code instead of keeping my old versions of those files.
-
-What changed on top of the merge:
+## Fork changes
 
 - **Fused CPU expert pool.** Gate/up and down used to run as two phases with a barrier and a host-side quantize in
   between. Now each expert has its own ready stamp and the last gate/up worker quantizes H, so down starts as soon as
@@ -49,11 +22,6 @@ What changed on top of the merge:
 - **O_DIRECT for the prompt stager** and parallel refill of lent arena slots.
 - Telemetry: per-request pool stats (GB per window, GB/s, experts per call), a per-call trace
   (`STRATA_CALL_TRACE`, `hill/ctan.py`), prefill chunk budgets (`STRATA_PF_SIZES=1`).
-
-## The `orca-port` work (all carried into `unify`)
-
-### Expert tiering for a small-RAM box
-
 - Three tiers: a VRAM slice, an mlocked hot set in RAM, and NVMe reads through a `pread` ring with a parked reader
   pool. The VRAM slice takes the next part of the routing profile after the hot tier, so the two never hold the same
   expert.
@@ -109,17 +77,6 @@ What changed on top of the merge:
 - 300 s watchdog; requests wait for a restarting engine instead of failing; stale engine output can't leak into the
   next request.
 - 61 contract tests in `serve/`.
-
-## Things that didn't work
-
-Written down so nobody (me included) tries them again: transparent huge pages for the tier, different prefetch
-distances, router lookahead (52% recall, 21% precision, a net loss), ghost/LFU tier admission, per-layer LRU
-allocation, speculative sampling of MTP drafts (better acceptance but each extra window row costs ~13.6 ms of fresh
-experts), and rewriting the IQ4_NL kernel on the default path. The CPU pool is already DRAM-bound at ~55-58 GB/s.
-
-Where the time goes now: about 550 MB of expert reads from RAM per accepted token, ~27% of host time waiting on the
-disk ring, and the SSD tops out around 135K random 4K IOPS. On the GPU side, kernels plus ~5 ms of host work per window
-would cap decode somewhere around 90-100 tok/s even with free CPU.
 
 ## Running it
 
