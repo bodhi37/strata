@@ -8,6 +8,8 @@ Strata requires 64GB RAM + 12GB VRAM minimum. This fork adds custom NVME offload
 | --- | --- | --- |
 | **48.4** | **1350–1450** | **18.8K tok/s effective** |
 
+Hardware: Ryzen 9 9900X, RTX 4070S 12GB, 32GB DDR5, NVME SSD
+
 ## Fork changes
 
 - **Fused CPU expert pool.** Gate/up and down used to run as two phases with a barrier and a host-side quantize in
